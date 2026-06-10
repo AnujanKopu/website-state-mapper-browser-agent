@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pricing - FlowState Demo</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    nav a { margin-right: 1rem; }
+    .plans { display: flex; gap: 2rem; }
+    .plan { border: 1px solid #ccc; padding: 1.5rem; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <nav aria-label="Main">
+    <a id="nav-home" href="index.html">Home</a>
+    <a id="nav-pricing" href="pricing.html">Pricing</a>
+    <a id="nav-docs" href="docs.html">Docs</a>
+  </nav>
+
+  <h1>Simple pricing</h1>
+  <div class="plans">
+    <div class="plan">
+      <h2>Free</h2>
+      <p>$0/month</p>
+      <a id="plan-docs-link" href="docs.html">Read the docs</a>
+    </div>
+    <div class="plan">
+      <h2>Pro</h2>
+      <p>$29/month</p>
+      <a id="checkout-link" href="checkout.html">Checkout</a>
+    </div>
+  </div>
+
+  <a id="pricing-sales" href="mailto:sales@flowstate.test">Contact sales</a>
+</body>
+</html>

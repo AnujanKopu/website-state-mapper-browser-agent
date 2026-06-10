@@ -7,27 +7,36 @@ replayable user action ("Clicked 'Start free trial'").
 
 ## Status
 
-Milestone **M0** — runnable foundation. The engine can capture a single URL as a state:
-screenshot, DOM snapshot, visible text, interactable elements, identity fingerprint, and
-database records.
+Milestone **M1** — core state-mapping engine. The explorer drives a real browser through a
+site using priority best-first search: it discovers and ranks actions, refuses risky ones,
+deduplicates resulting states, and exports the graph as JSON.
 
-Upcoming milestones: exploration loop + state dedup (M1), LLM labeling/ranking via LiteLLM (M2),
-FastAPI + React Flow UI with live graph (M3), path replay + demo polish (M4).
+Upcoming milestones: LLM labeling/ranking via LiteLLM (M2), FastAPI + React Flow UI with live
+graph (M3), path replay + demo polish (M4).
 
 ## Architecture
 
 ```
 engine/
-├── __main__.py        CLI entrypoint (python -m engine)
+├── __main__.py        CLI entrypoint (python -m engine capture|explore)
 ├── config.py          Env settings + run-config YAML loading
-├── schemas.py         Pydantic domain models (RunConfig, Interactable, CapturedState, ...)
-├── identity.py        URL normalization + content hashing -> state fingerprints
+├── schemas.py         Pydantic domain models (RunConfig, Interactable, Observation, ...)
+├── identity.py        State identity: URL normalization, DOM skeleton hash, text simhash,
+│                      screenshot dHash, action signature, and the IdentityIndex match rule
+├── safety.py          Rule engine: deny payment/destructive/communication/publish/legal
+│                      actions, external origins, downloads, and form submissions
+├── ranking.py         Heuristic action scoring (flow keywords, nav placement, novelty)
+│                      + sibling collapse (explore 1 of N structurally identical elements)
+├── classify.py        State classification: modal / auth wall / paywall / dead end /
+│                      risky terminal, from page signals + safety verdicts
+├── explorer.py        Frontier loop: budgets, path replay navigation, dedup, edges
+├── capture.py         observe_page / persist_state split (dedup before writing artifacts)
+├── export.py          Graph -> JSON document (the future API/UI contract)
 ├── storage.py         StorageBackend protocol + LocalStorage (S3/R2 drop-in later)
-├── capture.py         State capture orchestration (reused by the explorer loop in M1)
 ├── browser/
 │   ├── session.py     Playwright lifecycle + page guards (dialogs, downloads)
-│   ├── snapshot.py    Page stabilization + observation (text, HTML, screenshot)
-│   └── actions.py     Interactive element discovery (single in-page script)
+│   ├── snapshot.py    Stabilization + snapshot + DOM skeleton + page signals
+│   └── actions.py     Interactable discovery + consent-banner dismissal
 └── db/
     ├── models.py      SQLAlchemy tables: runs, state_nodes, edges
     └── session.py     Async engine/session factory (SQLite default, Postgres-ready)
@@ -35,13 +44,20 @@ engine/
 
 Design notes:
 
+- **States are not URLs.** Identity = normalized URL + modal flag + DOM skeleton hash +
+  action signature, with a fuzzy simhash/dHash fallback for structural noise. Modals, tabs,
+  and dropdown-open views become first-class nodes; timestamp/counter changes never do.
+  LLMs are never in the identity loop.
+- **Safety as a feature.** Denied actions (pay, delete, send, publish, accept, upload,
+  logout, external) are recorded on the state as `denied_actions`; a state with only risky
+  actions becomes a `risky_terminal` node -- the agent maps the payment wall, never crosses it.
+- **Graph stays clean.** Sibling collapse groups repeated cards/rows into one representative
+  edge (`collapsed_count`), top-K ranked actions per state cap fanout, no-op clicks are
+  dropped instead of becoming self-loops.
 - **Storage-agnostic artifacts.** Screenshots/DOM snapshots are addressed by relative keys
   through a `StorageBackend` protocol; local disk today, S3/R2 later without touching callers.
 - **Database-agnostic persistence.** Plain String/JSON columns via async SQLAlchemy; switching
   SQLite -> Postgres is a `FLOWSTATE_DATABASE_URL` change.
-- **Heuristics-first identity.** Fingerprints come from normalized URL + visible-text hash
-  (DOM skeleton hash, simhash, and screenshot pHash layer in during M1). LLMs are never in the
-  identity loop.
 - **Config over code.** Run behavior lives in `config/default_run.yaml`; LLM provider routing
   (M2) lives in `config/models.yaml` with per-role LiteLLM model strings.
 
@@ -58,20 +74,24 @@ Optional: copy `.env.example` to `.env` to override the database URL or data dir
 
 ## Usage
 
-Capture a single URL:
+Explore a site and build its state graph:
+
+```bash
+uv run python -m engine explore https://example.com
+```
+
+Useful flags: `--headed` (watch the browser), `--max-states N`, `--max-actions N`,
+`--max-depth N`, `--out graph.json`.
+
+Output: live event log in the terminal, per-state screenshots + DOM snapshots under
+`data/runs/<run_id>/`, graph rows in `data/flowstate.db`, and a `graph.json` export with
+all states (type, flags, replay path, CTAs) and action edges.
+
+Capture a single URL as one state:
 
 ```bash
 uv run python -m engine capture https://example.com
 ```
-
-Watch the browser while it works:
-
-```bash
-uv run python -m engine capture https://example.com --headed
-```
-
-Output: a run summary in the terminal, a screenshot + DOM snapshot under
-`data/runs/<run_id>/`, and `runs` / `state_nodes` rows in `data/flowstate.db`.
 
 ## Tests
 
@@ -79,5 +99,9 @@ Output: a run summary in the terminal, a screenshot + DOM snapshot under
 uv run pytest
 ```
 
-`tests/test_capture.py` drives real Chromium against the offline fixture site in
-`tests/fixtures/demo_site/` and asserts on artifacts, visibility filtering, and database state.
+- `tests/test_identity.py` -- dedup match rule, simhash/dHash thresholds, URL normalization
+- `tests/test_safety.py` -- deny-rule coverage (payment, destructive, external, forms, ...)
+- `tests/test_ranking.py` -- action scoring and sibling collapse
+- `tests/test_capture.py` / `tests/test_explore.py` -- real Chromium against the offline
+  fixture site in `tests/fixtures/demo_site/` (pages, modal, tabs, dropdown, contact form,
+  payment-like checkout terminal, dead end, external/logout traps)

@@ -16,26 +16,24 @@ from engine.config import Settings
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory
 from engine.storage import LocalStorage
+from tests.conftest import FIXTURE_SITE
 
-FIXTURE = Path(__file__).parent / "fixtures" / "demo_site" / "index.html"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    return Settings(
-        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
-        data_dir=tmp_path / "artifacts",
-        run_config_path=tmp_path / "missing.yaml",  # falls back to RunConfig defaults
-    )
-
-
 async def test_single_capture_end_to_end(settings: Settings):
-    state = await run_single_capture(FIXTURE.as_uri(), settings)
+    state = await run_single_capture((FIXTURE_SITE / "index.html").as_uri(), settings)
 
     # --- identity ---
     assert state.title == "FlowState Demo Site"
     assert len(state.fingerprint) == 16
+    assert state.skeleton_hash
+    assert state.action_sig
+
+    # --- page signals ---
+    assert state.signals.modal_open is False
+    assert state.signals.form_count >= 1
+    assert state.state_type.value == "page"
 
     # --- visible text (hidden elements must be excluded) ---
     assert "FlowState Demo" in state.visible_text
@@ -51,8 +49,12 @@ async def test_single_capture_end_to_end(settings: Settings):
     assert "Close" not in labels  # inside the closed modal
 
     pricing = next(i for i in state.interactables if i.label == "Pricing")
-    assert pricing.href == "/pricing"
+    assert pricing.href and pricing.href.endswith("pricing.html")  # resolved absolute
+    assert pricing.in_nav
     assert pricing.bounding_box.width > 0
+
+    submit = next(i for i in state.interactables if i.label == "Send message")
+    assert submit.in_form
 
     # --- artifacts on disk ---
     store = LocalStorage(settings.data_dir)
@@ -76,6 +78,7 @@ async def test_single_capture_end_to_end(settings: Settings):
         node = rows[0]
         assert node.fingerprint == state.fingerprint
         assert node.state_type == "page"
+        assert node.dom_skeleton_hash == state.skeleton_hash
         assert any(i["text"] == "Sign up" for i in node.interactables)
     await engine.dispose()
 

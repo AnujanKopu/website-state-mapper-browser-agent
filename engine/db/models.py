@@ -62,6 +62,9 @@ class StateNode(Base):
     dom_snapshot_path: Mapped[str] = mapped_column(Text)
 
     text_hash: Mapped[str] = mapped_column(String(40))
+    dom_skeleton_hash: Mapped[str] = mapped_column(String(40), default="")
+    text_simhash: Mapped[str] = mapped_column(String(16), default="")
+    screenshot_dhash: Mapped[str] = mapped_column(String(16), default="")
     interactables: Mapped[list[Any]] = mapped_column(default=list)
     detected_flags: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
@@ -92,4 +95,6 @@ class Edge(Base):
     selector_strategy: Mapped[str] = mapped_column(String(8), default="css")
     element_text: Mapped[str | None] = mapped_column(Text, default=None)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    # >1 when this edge represents a group of collapsed sibling elements.
+    collapsed_count: Mapped[int] = mapped_column(default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

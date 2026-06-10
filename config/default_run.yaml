@@ -18,10 +18,14 @@ capture:
   # Visible text beyond this length is truncated before hashing/storage.
   max_visible_text_chars: 20000
 
-# Exploration budgets. Unused in single-capture mode (M0); the explorer
-# loop (M1) enforces them.
+# Exploration budgets; whichever exhausts first stops the run.
 budgets:
   max_states: 60
   max_actions: 150
   max_depth: 4
   max_wall_seconds: 300
+
+exploration:
+  # Out-edges enqueued per state (top-K after ranking); keeps the graph clean.
+  max_actions_per_state: 12
+  action_timeout_ms: 5000
