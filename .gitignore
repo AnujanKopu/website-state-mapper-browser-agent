@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment
+.env
+
+# Runtime artifacts (sqlite db, screenshots, DOM snapshots)
+data/
+
+# Node (UI, added in a later milestone)
+node_modules/
+dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db

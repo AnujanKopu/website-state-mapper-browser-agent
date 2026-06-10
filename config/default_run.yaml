@@ -1,0 +1,27 @@
+# Default run configuration. Values here are validated against
+# engine.schemas.RunConfig -- unknown keys are rejected.
+
+browser:
+  headless: true
+  viewport:
+    width: 1366
+    height: 900
+  # null -> use Playwright's default user agent for the bundled Chromium.
+  user_agent: null
+  navigation_timeout_ms: 20000
+  # How long the page must stay quiet (after load) before we snapshot it.
+  stabilize_quiet_ms: 500
+
+capture:
+  full_page_screenshot: true
+  max_interactables: 100
+  # Visible text beyond this length is truncated before hashing/storage.
+  max_visible_text_chars: 20000
+
+# Exploration budgets. Unused in single-capture mode (M0); the explorer
+# loop (M1) enforces them.
+budgets:
+  max_states: 60
+  max_actions: 150
+  max_depth: 4
+  max_wall_seconds: 300

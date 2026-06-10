@@ -1,0 +1,21 @@
+# LLM role -> model routing (consumed from milestone M2 onward via LiteLLM).
+#
+# Each agent role maps to any LiteLLM-compatible model string, so providers
+# can be swapped here without code changes. Examples:
+#   openai/gpt-4o-mini
+#   anthropic/claude-3-5-haiku-latest
+#   ollama/llama3.2
+#
+# Roles:
+#   state_labeler  - vision model; batched screenshot + text labeling of states
+#   action_ranker  - cheap text model; tie-breaks ambiguous action rankings
+#   safety_judge   - cheap text model; classifies actions the rule engine
+#                    cannot confidently allow or deny
+
+roles:
+  state_labeler: openai/gpt-4o-mini
+  action_ranker: openai/gpt-4o-mini
+  safety_judge: openai/gpt-4o-mini
+
+limits:
+  max_llm_calls_per_run: 40

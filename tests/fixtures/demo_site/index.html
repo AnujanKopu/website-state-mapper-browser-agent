@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>FlowState Demo Site</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    nav a { margin-right: 1rem; }
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); }
+    .modal.open { display: flex; align-items: center; justify-content: center; }
+    .modal-card { background: white; padding: 2rem; border-radius: 8px; }
+    .hidden-link { display: none; }
+  </style>
+</head>
+<body>
+  <nav aria-label="Main">
+    <a id="nav-home" href="/">Home</a>
+    <a id="nav-pricing" href="/pricing">Pricing</a>
+    <a id="nav-docs" href="/docs">Docs</a>
+    <a class="hidden-link" href="/secret">Hidden link</a>
+  </nav>
+
+  <h1>FlowState Demo</h1>
+  <p>A tiny fixture site used to verify state capture.</p>
+
+  <button id="open-signup" onclick="document.getElementById('signup-modal').classList.add('open')">
+    Sign up
+  </button>
+  <button id="disabled-cta" disabled>Disabled button</button>
+
+  <form id="contact-form" action="/contact" method="post">
+    <label>Email <input type="email" name="email" /></label>
+    <input id="contact-submit" type="submit" value="Send message" />
+  </form>
+
+  <div id="signup-modal" class="modal" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h2>Create your account</h2>
+      <button id="close-signup"
+              onclick="document.getElementById('signup-modal').classList.remove('open')">
+        Close
+      </button>
+    </div>
+  </div>
+</body>
+</html>
