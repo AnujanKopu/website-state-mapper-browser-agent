@@ -22,7 +22,6 @@ from engine.explorer import Explorer, ExplorerEvent
 from engine.export import export_graph, write_graph_json
 from engine.storage import LocalStorage
 
-
 _URL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
 
 

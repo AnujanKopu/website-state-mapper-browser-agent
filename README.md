@@ -7,16 +7,26 @@ replayable user action ("Clicked 'Start free trial'").
 
 ## Status
 
-Milestone **M1** — core state-mapping engine. The explorer drives a real browser through a
-site using priority best-first search: it discovers and ranks actions, refuses risky ones,
-deduplicates resulting states, and exports the graph as JSON.
+Milestone **M2** — backend API and live run events. A FastAPI service starts and tracks
+explorations, serves the graph JSON, exports results, and streams run progress over
+Server-Sent Events (node/edge events appear as the agent works). The engine runs entirely
+through the API; the CLI remains for local/offline use.
 
-Upcoming milestones: LLM labeling/ranking via LiteLLM (M2), FastAPI + React Flow UI with live
-graph (M3), path replay + demo polish (M4).
+Built so far: M1 core state-mapping engine (priority best-first explorer with ranking, safety,
+dedup, sibling collapse, JSON export).
+
+Upcoming milestones: LLM labeling/ranking via LiteLLM, React Flow UI with the live graph,
+path replay + demo polish.
 
 ## Architecture
 
 ```
+api/
+├── main.py            FastAPI app factory: lifespan, CORS, static artifacts
+├── routes.py          Thin HTTP + SSE routes; delegate to engine services
+├── manager.py         Run lifecycle + per-run event pub/sub (replay buffer -> SSE)
+└── schemas.py         Typed request/response models
+
 engine/
 ├── __main__.py        CLI entrypoint (python -m engine capture|explore)
 ├── config.py          Env settings + run-config YAML loading
@@ -93,6 +103,43 @@ Capture a single URL as one state:
 uv run python -m engine capture https://example.com
 ```
 
+## API
+
+Start the server:
+
+```bash
+uv run uvicorn api.main:app --reload --port 8077
+```
+
+Endpoints (all under `/api`):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/runs` | Start an exploration; returns `run_id` immediately (202) |
+| `GET`  | `/runs/{id}` | Run status + stats (live handle merged with the persisted row) |
+| `GET`  | `/runs/{id}/graph` | Full state graph (states + edges) as JSON |
+| `GET`  | `/runs/{id}/export` | Same graph as a downloadable JSON attachment |
+| `GET`  | `/runs/{id}/events` | Server-Sent Events stream of run progress |
+
+`POST /runs` accepts `{ "url": "...", "headless": bool?, "max_states": N?, "max_actions": N?,
+"max_depth": N?, "max_wall_seconds": N? }`; budget fields override `config/default_run.yaml`.
+The SSE stream buffers and replays history, so subscribing at any time yields the complete
+event sequence (`run_started`, `state_new`, `edge_created`, `actions_blocked`, `state_deduped`,
+`run_finished`, ...). Screenshots referenced by graph nodes are served from `/artifacts/...`.
+
+Example (start a run, then watch nodes/edges stream live):
+
+```bash
+curl -s -X POST http://127.0.0.1:8077/api/runs \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","max_depth":1,"max_actions":10}'
+# -> {"run_id":"<id>", "events_url":"/api/runs/<id>/events", ...}
+
+curl -N http://127.0.0.1:8077/api/runs/<id>/events     # live SSE stream
+curl -s http://127.0.0.1:8077/api/runs/<id>            # status + stats
+curl -s http://127.0.0.1:8077/api/runs/<id>/graph      # full graph JSON
+```
+
 ## Tests
 
 ```bash
@@ -105,3 +152,4 @@ uv run pytest
 - `tests/test_capture.py` / `tests/test_explore.py` -- real Chromium against the offline
   fixture site in `tests/fixtures/demo_site/` (pages, modal, tabs, dropdown, contact form,
   payment-like checkout terminal, dead end, external/logout traps)
+- `tests/test_api.py` -- run lifecycle, graph/export, and SSE streaming via the ASGI app

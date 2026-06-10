@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -20,7 +21,10 @@ from engine.db.models import Base
 
 def create_db_engine(database_url: str) -> AsyncEngine:
     _ensure_sqlite_directory(database_url)
-    return create_async_engine(database_url)
+    engine = create_async_engine(database_url)
+    if make_url(database_url).get_backend_name() == "sqlite":
+        _enable_sqlite_concurrency(engine)
+    return engine
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
@@ -39,3 +43,15 @@ def _ensure_sqlite_directory(database_url: str) -> None:
     url = make_url(database_url)
     if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
         Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _enable_sqlite_concurrency(engine: AsyncEngine) -> None:
+    """WAL journaling lets the API read the graph while the explorer writes
+    it; busy_timeout avoids spurious 'database is locked' under contention."""
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()

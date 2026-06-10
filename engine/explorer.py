@@ -131,9 +131,13 @@ class Explorer:
         self._config = config
         self._emit: EventSink = on_event or (lambda event: None)
 
-    async def run(self, url: str) -> str:
-        """Explore `url` until budgets exhaust; returns the run id."""
-        self._run_id = new_id()
+    async def run(self, url: str, *, run_id: str | None = None) -> str:
+        """Explore `url` until budgets exhaust; returns the run id.
+
+        A `run_id` may be supplied so a caller (e.g. the API) can register
+        and return the id before exploration starts.
+        """
+        self._run_id = run_id or new_id()
         self._root_url = url
         self._budget = Budget(self._config.budgets)
         self._frontier = Frontier()
