@@ -1,6 +1,6 @@
 """Unit tests for action ranking and sibling collapse."""
 
-from engine.ranking import ActionCandidate, collapse_siblings, score_action
+from engine.ranking import ActionCandidate, collapse_siblings, is_auth_entry, score_action
 from engine.schemas import BoundingBox, Interactable
 
 
@@ -90,3 +90,10 @@ class TestScoreAction:
         privacy = _item("#p", text="Privacy policy", href="https://demo.test/privacy")
         feature = _item("#f", text="Latest updates", href="https://demo.test/updates")
         assert _score(privacy) < _score(feature)
+
+    def test_auth_entry_detected_and_scored_high(self):
+        sign_in = _item("#login", text="Sign in", href="https://demo.test/login", in_nav=True)
+        generic = _item("#games", text="Top Games", href="https://demo.test/games", in_nav=True)
+        assert is_auth_entry(ActionCandidate(interactable=sign_in))
+        assert not is_auth_entry(ActionCandidate(interactable=generic))
+        assert _score(sign_in) > _score(generic)

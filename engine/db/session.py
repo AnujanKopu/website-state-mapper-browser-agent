@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import event
-from sqlalchemy.engine import make_url
+from sqlalchemy import event, inspect, text
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,11 +31,39 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
+# Columns added after early v1 databases were created; patched in place for SQLite.
+_SQLITE_COLUMN_PATCHES: dict[str, list[str]] = {
+    "state_nodes": [
+        "parent_state_id VARCHAR(32)",
+        "exploration JSON DEFAULT '{}'",
+    ],
+    "edges": [
+        "via VARCHAR(12) DEFAULT 'performed'",
+        "surface_item_id VARCHAR(16)",
+    ],
+}
+
+
+def _patch_sqlite_schema(connection: Connection) -> None:
+    """Add columns missing from older local SQLite files."""
+    inspector = inspect(connection)
+    for table, column_defs in _SQLITE_COLUMN_PATCHES.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        for col_def in column_defs:
+            col_name = col_def.split()[0]
+            if col_name not in existing:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_def}"))
+
+
 async def init_db(engine: AsyncEngine) -> None:
     """Create tables if they don't exist. (Alembic migrations can replace
     this once the schema needs to evolve in place.)"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if make_url(engine.url).get_backend_name() == "sqlite":
+            await conn.run_sync(_patch_sqlite_schema)
 
 
 def _ensure_sqlite_directory(database_url: str) -> None:

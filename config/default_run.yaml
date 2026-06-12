@@ -17,6 +17,12 @@ capture:
   max_interactables: 100
   # Visible text beyond this length is truncated before hashing/storage.
   max_visible_text_chars: 20000
+  # Persist raw DOM HTML snapshots. Disable for UI-driven runs that only
+  # consume screenshots + graph JSON.
+  save_dom_snapshots: true
+  # Viewport-grounded discovery scrolls the page in ~90%-viewport steps so
+  # below-the-fold affordances are found (0 = current viewport only).
+  max_scroll_steps: 4
 
 # Exploration budgets; whichever exhausts first stops the run.
 budgets:
@@ -29,3 +35,6 @@ exploration:
   # Out-edges enqueued per state (top-K after ranking); keeps the graph clean.
   max_actions_per_state: 12
   action_timeout_ms: 5000
+  # Distinct states kept per loose URL family (e.g. /post/#); further siblings
+  # fold into the family representative as skipped items + inferred edges.
+  url_family_cap: 3

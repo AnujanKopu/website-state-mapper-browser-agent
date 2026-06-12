@@ -68,6 +68,15 @@ class StateNode(Base):
     interactables: Mapped[list[Any]] = mapped_column(default=list)
     detected_flags: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
+    # Same-URL sub-states (modal / tab / dropdown / form) hang off the page
+    # they were opened from; null for top-level URL pages and the root.
+    parent_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("state_nodes.id"), default=None, index=True
+    )
+    # Per-state coverage summary written at run end: surface-item status
+    # counts plus a visit_status (fully_explored | partially_explored).
+    exploration: Mapped[dict[str, Any]] = mapped_column(default=dict)
+
     # Ordered action steps from the run's root state (replay path, M1+).
     path: Mapped[list[Any]] = mapped_column(default=list)
     depth: Mapped[int] = mapped_column(default=0)
@@ -97,4 +106,10 @@ class Edge(Base):
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     # >1 when this edge represents a group of collapsed sibling elements.
     collapsed_count: Mapped[int] = mapped_column(default=1)
+    # How the edge was established: "performed" (the agent clicked it),
+    # "inferred" (a same-origin <a href> pointing at an already-known state,
+    # recorded without spending a click), or "user" (manual auth, later).
+    via: Mapped[str] = mapped_column(String(12), default="performed")
+    # The surface item (Interactable.item_id) this edge originated from.
+    surface_item_id: Mapped[str | None] = mapped_column(String(16), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

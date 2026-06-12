@@ -38,7 +38,9 @@ async def observe_page(page: Page, config: RunConfig) -> Observation:
     """Stabilize and observe the current page; compute all identity signals."""
     await stabilize(page, config.browser.stabilize_quiet_ms)
     snapshot = await take_snapshot(page, config.capture)
-    interactables = await discover_interactables(page, config.capture.max_interactables)
+    interactables = await discover_interactables(
+        page, config.capture.max_interactables, config.capture.max_scroll_steps
+    )
 
     url_normalized = identity.normalize_url(snapshot.url)
     skeleton_hash = identity.dom_skeleton_hash(snapshot.dom_skeleton)
@@ -71,13 +73,22 @@ def persist_state(
     depth: int,
     path: list[ActionStep],
     store: StorageBackend,
+    save_dom: bool = True,
 ) -> CapturedState:
-    """Write artifacts for an observation that is being kept as a new state."""
+    """Write artifacts for an observation that is being kept as a new state.
+
+    When `save_dom` is False, the raw DOM HTML is not persisted (the screenshot
+    and all graph metadata are still written).
+    """
     snapshot = observation.snapshot
     screenshot_path = store.save_bytes(
         storage.screenshot_key(run_id, state_id), snapshot.screenshot_png
     )
-    dom_snapshot_path = store.save_text(storage.dom_snapshot_key(run_id, state_id), snapshot.html)
+    dom_snapshot_path = (
+        store.save_text(storage.dom_snapshot_key(run_id, state_id), snapshot.html)
+        if save_dom
+        else ""
+    )
 
     return CapturedState(
         state_id=state_id,

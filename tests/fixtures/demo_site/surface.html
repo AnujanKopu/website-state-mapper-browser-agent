@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Surface Discovery Fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    nav a { margin-right: 1rem; }
+    main { padding: 2rem; }
+    /* Pushes the footer far below the initial viewport fold. */
+    .spacer { height: 1600px; }
+    /* Present in the DOM but not rendered: must never be discovered. */
+    .hidden { display: none; }
+    /* Painted off the left edge of the page: outside the viewport. */
+    .offscreen { position: absolute; left: -9999px; top: 0; }
+    /* A button fully covered by an opaque overlay (occlusion test). */
+    .cover-wrap { position: relative; width: 200px; height: 40px; margin: 1rem 0; }
+    #covered-button { position: absolute; inset: 0; }
+    #cover { position: absolute; inset: 0; background: #222; z-index: 5; }
+    footer { border-top: 1px solid #ccc; padding: 2rem; }
+  </style>
+</head>
+<body>
+  <nav aria-label="Main">
+    <a id="nav-home" href="index.html">Home</a>
+    <a id="nav-features" href="features.html">Features</a>
+  </nav>
+
+  <main>
+    <h1>Surface discovery</h1>
+    <button id="primary-cta">Get started</button>
+
+    <a class="hidden" id="hidden-link" href="secret.html">Hidden link</a>
+    <a class="offscreen" id="offscreen-link" href="offscreen.html">Offscreen link</a>
+
+    <!-- A link wrapping a button: the pair must collapse to one surface item. -->
+    <a id="wrap-link" href="wrapped.html"><button id="wrapped-button">Wrapped action</button></a>
+
+    <!-- Structurally identical sibling cards: same group, distinct selectors. -->
+    <ul id="cards">
+      <li><a class="card-link" href="item1.html">Open item 1</a></li>
+      <li><a class="card-link" href="item2.html">Open item 2</a></li>
+      <li><a class="card-link" href="item3.html">Open item 3</a></li>
+    </ul>
+
+    <!-- An interactive control hidden under an opaque overlay. -->
+    <div class="cover-wrap">
+      <button id="covered-button">Behind overlay</button>
+      <div id="cover"></div>
+    </div>
+
+    <div class="spacer"></div>
+  </main>
+
+  <footer>
+    <a id="footer-link" href="contact.html">Contact us</a>
+  </footer>
+</body>
+</html>

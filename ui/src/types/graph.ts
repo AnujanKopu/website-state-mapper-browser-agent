@@ -1,0 +1,140 @@
+// Mirrors the backend graph export (engine/export.py) and run schemas.
+
+export type StateType =
+  | "page"
+  | "modal"
+  | "form"
+  | "auth_wall"
+  | "paywall"
+  | "dropdown"
+  | "tab"
+  | "wizard_step"
+  | "error"
+  | "dead_end"
+  | "risky_terminal"
+  | "external";
+
+export interface DeniedAction {
+  label: string;
+  category: string | null;
+  reason: string;
+}
+
+export interface StateFlags {
+  modal_open?: boolean;
+  auth_required?: boolean;
+  payment_required?: boolean;
+  form_count?: number;
+  dead_end?: boolean;
+  risky_terminal?: boolean;
+  denied_actions?: DeniedAction[];
+  [key: string]: unknown;
+}
+
+export interface ActionStep {
+  kind: string;
+  url?: string | null;
+  selector?: string | null;
+  label?: string | null;
+}
+
+export type SurfaceStatus = "pending" | "explored" | "blocked" | "noop" | "skipped_duplicate";
+
+export interface SurfaceItem {
+  item_id: string | null;
+  label: string;
+  kind: string | null;
+  region: string | null;
+  fold: number;
+  group_id: string | null;
+  status: SurfaceStatus;
+  href?: string | null;
+  in_nav?: boolean;
+  in_form?: boolean;
+  in_modal?: boolean;
+}
+
+export interface ExplorationSummary {
+  explored?: number;
+  pending?: number;
+  blocked?: number;
+  noop?: number;
+  skipped_duplicate?: number;
+  visit_status?: "fully_explored" | "partially_explored";
+}
+
+export interface GraphState {
+  id: string;
+  type: StateType;
+  index?: number;
+  url: string;
+  url_normalized: string;
+  title: string;
+  label: string | null;
+  summary: string | null;
+  fingerprint: string;
+  depth: number;
+  parent_state_id?: string | null;
+  screenshot: string;
+  dom_snapshot: string;
+  visible_ctas: string[];
+  surface_items?: SurfaceItem[];
+  exploration?: ExplorationSummary;
+  flags: StateFlags;
+  path: ActionStep[];
+}
+
+export interface GraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  action: string;
+  label: string;
+  selector: string;
+  element_text: string | null;
+  confidence: number;
+  collapsed_count: number;
+  via?: string;
+  surface_item_id?: string | null;
+}
+
+export interface RunInfo {
+  id: string;
+  url: string;
+  status: string;
+  stats: Record<string, unknown> | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface GraphDocument {
+  run: RunInfo;
+  states: GraphState[];
+  edges: GraphEdge[];
+}
+
+export interface CreateRunResponse {
+  run_id: string;
+  url: string;
+  status: string;
+  events_url: string;
+  graph_url: string;
+}
+
+export interface RunStatusResponse {
+  run_id: string;
+  url: string;
+  status: string;
+  error: string | null;
+  stats: Record<string, unknown> | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface CreateRunInput {
+  url: string;
+  max_states?: number;
+  max_actions?: number;
+  max_depth?: number;
+  save_dom_snapshots?: boolean;
+}

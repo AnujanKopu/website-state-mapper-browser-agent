@@ -83,6 +83,48 @@ async def test_single_capture_end_to_end(settings: Settings):
     await engine.dispose()
 
 
+async def test_viewport_grounded_surface_discovery(settings: Settings):
+    state = await run_single_capture((FIXTURE_SITE / "surface.html").as_uri(), settings)
+    items = state.interactables
+    by_label = {i.label: i for i in items}
+    labels = set(by_label)
+
+    # --- on-screen, unoccluded affordances are discovered ---
+    assert {"Get started", "Home", "Features", "Open item 1", "Contact us"} <= labels
+
+    # --- hidden / offscreen / occluded elements are never discovered ---
+    assert "Hidden link" not in labels  # display: none
+    assert "Offscreen link" not in labels  # painted off the viewport
+    assert "Behind overlay" not in labels  # covered by an opaque overlay
+
+    # --- a link wrapping a button collapses to a single surface item ---
+    wrapped = [i for i in items if i.label == "Wrapped action"]
+    assert len(wrapped) == 1
+    assert wrapped[0].tag == "button"
+
+    # --- regions are tagged from the surrounding landmark ---
+    assert by_label["Home"].region == "nav"
+    assert by_label["Get started"].region == "main"
+    assert by_label["Contact us"].region == "footer"
+
+    # --- below-the-fold items are found via the scroll sweep, tagged fold>0 ---
+    footer = by_label["Contact us"]
+    assert footer.fold > 0
+    assert footer.page_box is not None and footer.page_box.y > 900
+
+    cta = by_label["Get started"]
+    assert cta.fold == 0
+    assert cta.page_box is not None
+
+    # --- structurally identical siblings share one group id ---
+    cards = [i for i in items if i.label.startswith("Open item")]
+    assert len(cards) == 3
+    assert len({c.group_id for c in cards}) == 1
+
+    # --- every surface item carries a stable id and absolute geometry ---
+    assert all(i.item_id and i.page_box is not None for i in items)
+
+
 async def test_failed_navigation_marks_run_failed(settings: Settings, tmp_path: Path):
     bad_url = (tmp_path / "does_not_exist.html").as_uri()
     with pytest.raises(PlaywrightError):

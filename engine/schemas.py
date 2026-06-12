@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSED = "paused"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -64,6 +65,14 @@ class CaptureConfig(StrictModel):
     full_page_screenshot: bool = True
     max_interactables: int = 100
     max_visible_text_chars: int = 20_000
+    # When False, the raw DOM HTML snapshot is not written to storage.
+    # Screenshots and graph metadata are unaffected. Useful for UI-driven
+    # runs that only consume screenshots + graph JSON.
+    save_dom_snapshots: bool = True
+    # Viewport-grounded discovery scrolls the page down in ~90%-viewport
+    # steps so below-the-fold affordances are found too. 0 = current
+    # viewport only; each extra step records items with a higher fold index.
+    max_scroll_steps: int = 4
 
 
 class BudgetConfig(StrictModel):
@@ -77,6 +86,10 @@ class ExplorationConfig(StrictModel):
     # Out-edges enqueued per state (top-K after ranking); keeps the graph clean.
     max_actions_per_state: int = 12
     action_timeout_ms: int = 5_000
+    # Cap on distinct states kept per loose URL family (e.g. /post/#) so blog
+    # archives and card grids can't dominate the graph; further siblings fold
+    # into the family representative as skipped surface items + inferred edges.
+    url_family_cap: int = 3
 
 
 class RunConfig(StrictModel):
@@ -98,8 +111,24 @@ class BoundingBox(BaseModel):
     height: float
 
 
+class SurfaceStatus(StrEnum):
+    """Exploration outcome for one discovered surface item."""
+
+    PENDING = "pending"
+    EXPLORED = "explored"
+    BLOCKED = "blocked"
+    NOOP = "noop"
+    SKIPPED_DUPLICATE = "skipped_duplicate"
+
+
 class Interactable(BaseModel):
-    """A visible, actionable element discovered on a page."""
+    """A visible, actionable element discovered on a page.
+
+    Geometry comes in two flavours: ``bounding_box`` is the viewport-relative
+    rect at the moment of discovery, while ``page_box`` is the absolute
+    document-space rect (stable across scrolling, aligned with the full-page
+    screenshot for VLM grounding later).
+    """
 
     selector: str
     tag: str
@@ -108,9 +137,17 @@ class Interactable(BaseModel):
     aria_label: str | None = None
     href: str | None = None
     bounding_box: BoundingBox
+    page_box: BoundingBox | None = None
     in_nav: bool = False
     in_form: bool = False
     in_modal: bool = False
+    # Surface-item metadata (viewport-grounded discovery, Slice 3).
+    item_id: str = ""
+    region: str | None = None  # nav | header | footer | aside | modal | main
+    kind: str | None = None  # link | button | tab | menuitem | select | toggle | disclosure
+    fold: int = 0  # scroll step at which it first became visible (0 = above fold)
+    group_id: str | None = None  # shared by structurally identical siblings
+    status: SurfaceStatus = SurfaceStatus.PENDING
 
     @property
     def label(self) -> str:
@@ -155,6 +192,13 @@ class Observation(BaseModel):
     action_sig: str
     screenshot_dhash: int
     fingerprint: str
+
+
+class Credentials(BaseModel):
+    """In-memory credentials for auth form autofill. Never persisted to disk."""
+
+    username: str | None = None
+    password: str | None = None
 
 
 class ActionStep(BaseModel):
