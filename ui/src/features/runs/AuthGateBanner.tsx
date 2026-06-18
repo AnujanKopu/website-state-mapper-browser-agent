@@ -6,9 +6,10 @@ import type { AuthGateInfo } from "./runState";
 interface AuthGateBannerProps {
   runId: string;
   gate: AuthGateInfo;
+  onResolved: () => void;
 }
 
-export function AuthGateBanner({ runId, gate }: AuthGateBannerProps) {
+export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -24,6 +25,8 @@ export function AuthGateBanner({ runId, gate }: AuthGateBannerProps) {
         runId,
         hasCredentials ? { username: username.trim() || null, password: password || null } : null,
       );
+      onResolved();
+      setBusy(false);
     } catch {
       setLocalError("Failed to resume — run may have already moved on.");
       setBusy(false);
@@ -35,6 +38,8 @@ export function AuthGateBanner({ runId, gate }: AuthGateBannerProps) {
     setLocalError(null);
     try {
       await authSkip(runId);
+      onResolved();
+      setBusy(false);
     } catch {
       setLocalError("Failed to skip.");
       setBusy(false);

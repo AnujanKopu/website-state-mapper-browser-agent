@@ -3,6 +3,10 @@ import { EVENT_TYPES, TERMINAL_EVENT_TYPES } from "../types/events";
 import type { EventType, SSEEnvelope } from "../types/events";
 
 export interface RunStreamHandlers {
+  /** Fired when the browser has established (or re-established) the stream. */
+  onOpen?: () => void;
+  /** Fired when EventSource is temporarily disconnected and will retry. */
+  onRetrying?: () => void;
   /** Fired for every parsed event envelope, in stream order. */
   onEvent: (envelope: SSEEnvelope) => void;
   /** Fired once when a terminal event (run_completed/run_failed) arrives. */
@@ -52,6 +56,10 @@ export function openRunStream(runId: string, handlers: RunStreamHandlers): RunSt
     source.addEventListener(type, (event) => handle((event as MessageEvent).data));
   }
 
+  source.onopen = () => {
+    if (!closed) handlers.onOpen?.();
+  };
+
   source.onerror = () => {
     if (closed) return;
     // Per the SSE spec, a non-2xx/invalid response sets readyState=CLOSED and
@@ -60,6 +68,8 @@ export function openRunStream(runId: string, handlers: RunStreamHandlers): RunSt
     if (source.readyState === EventSource.CLOSED) {
       closed = true;
       handlers.onClosed?.();
+    } else {
+      handlers.onRetrying?.();
     }
   };
 

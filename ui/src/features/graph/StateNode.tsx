@@ -5,18 +5,19 @@ import { stateTypeLabel, truncate } from "../../lib/format";
 import type { GraphState } from "../../types/graph";
 import { accentFor } from "./nodeStyles";
 
-export type StateFlowNode = Node<{ state: GraphState }, "state">;
+export type StateFlowNode = Node<{ state: GraphState | null; current: boolean }, "state">;
 
 export function StateNodeView({ data, selected }: NodeProps<StateFlowNode>) {
   const { state } = data;
+  if (!state) return null;
   const accent = accentFor(state.type);
   const indexLabel = typeof state.index === "number" ? `s${state.index}` : "";
 
   return (
     <div
-      className="state-node"
+      className={`state-node${data.current ? " state-node--current" : ""}`}
       style={{
-        borderColor: selected ? accent : "var(--border)",
+        borderColor: selected ? accent : data.current ? "var(--green)" : "var(--border)",
         boxShadow: selected ? `0 0 0 1px ${accent}` : "none",
       }}
     >

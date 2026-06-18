@@ -15,7 +15,7 @@ interface WorkspaceProps {
 }
 
 export function Workspace({ runId, onNewRun }: WorkspaceProps) {
-  const run = useRunStream(runId);
+  const { run, acknowledgeAuthResolved } = useRunStream(runId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expandedUrl, setExpandedUrl] = useState<string | null>(null);
 
@@ -60,7 +60,11 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
       )}
 
       {run.authGate && (
-        <AuthGateBanner runId={runId} gate={run.authGate} />
+        <AuthGateBanner
+          runId={runId}
+          gate={run.authGate}
+          onResolved={acknowledgeAuthResolved}
+        />
       )}
 
       <div className="panes">
@@ -72,6 +76,8 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
             nodes={run.nodes}
             edges={run.edges}
             selectedId={selectedId}
+            currentId={run.viewportStateId}
+            isLive={["queued", "running", "paused"].includes(run.runStatus)}
             onSelect={setSelectedId}
           />
           {selected && (

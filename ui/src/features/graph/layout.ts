@@ -2,7 +2,7 @@ import dagre from "dagre";
 import type { Edge, Node } from "@xyflow/react";
 
 export const NODE_WIDTH = 210;
-export const NODE_HEIGHT = 66;
+export const NODE_HEIGHT = 78;
 
 /** Left-to-right layered layout via dagre; returns nodes with positions set. */
 export function layoutGraph(nodes: Node[], edges: Edge[]): Node[] {

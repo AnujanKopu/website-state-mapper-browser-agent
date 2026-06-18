@@ -24,7 +24,7 @@ import type {
   SurfaceItem,
 } from "../../types/graph";
 
-export type ConnectionStatus = "connecting" | "live" | "closed" | "error";
+export type ConnectionStatus = "connecting" | "live" | "reconnecting" | "closed" | "error";
 
 export interface LogEntry {
   id: number;
@@ -66,6 +66,8 @@ export interface RunState {
   config: RunStartedPayload["config"] | null;
   /** Non-null while the run is paused at an auth gate. */
   authGate: AuthGateInfo | null;
+  /** Highest SSE sequence applied; reconnect history at or below this is ignored. */
+  lastEventSequence: number;
 }
 
 export const emptyCounters: Counters = {
@@ -96,13 +98,19 @@ export const initialRunState: RunState = {
   log: [],
   config: null,
   authGate: null,
+  lastEventSequence: -1,
 };
 
 export type RunAction =
   | { type: "reset"; runId: string }
   | { type: "hydrate"; graph: GraphDocument }
   | { type: "sse"; envelope: SSEEnvelope }
-  | { type: "streamClosed" };
+  | { type: "streamOpen" }
+  | { type: "streamReconnecting" }
+  | { type: "streamClosed" }
+  | { type: "hydrateFailed"; message: string }
+  | { type: "terminalReconciled" }
+  | { type: "authResolved" };
 
 const LOG_CAP = 500;
 const LOG_SKIP: EventType[] = ["heartbeat", "frontier_updated"];
@@ -172,7 +180,7 @@ function countersFromStats(
     noop: num("noop_actions", 0),
     failed: num("failed_actions", 0),
     actions_performed: num("actions_performed", 0),
-    frontier_size: 0,
+    frontier_size: num("pending_actions", 0),
   };
 }
 
@@ -181,14 +189,16 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
   const counters: Counters = payload?.counters
     ? { ...state.counters, ...(payload.counters as Counters) }
     : state.counters;
-  const connection: ConnectionStatus = state.connection === "error" ? "error" : "live";
+  const connection: ConnectionStatus = "live";
 
-  let { nodes, edges, order, viewportStateId, currentAction, runStatus, stopReason, error, config, authGate } =
+  let { url, nodes, edges, order, viewportStateId, currentAction, runStatus, stopReason, error, config, authGate } =
     state;
 
   switch (env.type) {
     case "run_started": {
-      config = (payload as unknown as RunStartedPayload).config ?? null;
+      const p = payload as unknown as RunStartedPayload;
+      config = p.config ?? null;
+      url = p.url || url;
       runStatus = "running";
       break;
     }
@@ -286,6 +296,7 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
 
   return {
     ...state,
+    url,
     connection,
     counters,
     nodes,
@@ -299,13 +310,26 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
     config,
     authGate,
     log,
+    lastEventSequence: env.sequence,
+  };
+}
+
+function freshRunState(runId: string): RunState {
+  return {
+    ...initialRunState,
+    runId,
+    nodes: {},
+    edges: {},
+    order: [],
+    counters: { ...emptyCounters },
+    log: [],
   };
 }
 
 export function runReducer(state: RunState, action: RunAction): RunState {
   switch (action.type) {
     case "reset":
-      return { ...initialRunState, runId: action.runId };
+      return freshRunState(action.runId);
     case "hydrate": {
       const { graph } = action;
       const nodes = { ...state.nodes };
@@ -332,7 +356,21 @@ export function runReducer(state: RunState, action: RunAction): RunState {
       };
     }
     case "sse":
+      if (action.envelope.sequence <= state.lastEventSequence) return state;
       return applyEvent(state, action.envelope);
+    case "streamOpen":
+      return {
+        ...state,
+        connection: "live",
+        error: state.runStatus === "failed" ? state.error : null,
+      };
+    case "streamReconnecting":
+      return {
+        ...state,
+        connection: ["done", "failed", "cancelled"].includes(state.runStatus)
+          ? state.connection
+          : "reconnecting",
+      };
     case "streamClosed": {
       const terminal = ["done", "failed", "cancelled"].includes(state.runStatus);
       if (state.order.length > 0 || terminal) {
@@ -344,6 +382,16 @@ export function runReducer(state: RunState, action: RunAction): RunState {
         error: state.error ?? "Run not found or no longer available.",
       };
     }
+    case "hydrateFailed":
+      return {
+        ...state,
+        connection: state.order.length > 0 ? state.connection : "error",
+        error: action.message,
+      };
+    case "terminalReconciled":
+      return { ...state, connection: "closed" };
+    case "authResolved":
+      return { ...state, authGate: null, runStatus: "running" };
     default:
       return state;
   }

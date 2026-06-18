@@ -391,7 +391,7 @@ code {
 }
 
 .panes__left {
-  width: 430px;
+  width: clamp(340px, 28vw, 430px);
   flex-shrink: 0;
   border-right: 1px solid var(--border);
   overflow: hidden;
@@ -413,6 +413,10 @@ code {
   flex: 1;
   min-height: 0;
   background: var(--bg);
+}
+
+.graph-view {
+  position: relative;
 }
 
 /* ---------- Agent view ---------- */
@@ -667,8 +671,44 @@ code {
   font-size: 13px;
 }
 
+.graph-empty--overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--bg);
+}
+
+.graph-follow {
+  border: 1px solid var(--border-2);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(17, 17, 17, 0.9);
+  color: var(--text-secondary);
+  font: 11px var(--font);
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
+}
+
+.graph-follow:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-secondary);
+}
+
+.graph-follow--active {
+  color: var(--green);
+  border-color: rgba(91, 191, 138, 0.45);
+}
+
+.graph-follow:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
 .state-node {
   width: 210px;
+  height: 78px;
+  position: relative;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -677,6 +717,22 @@ code {
   flex-direction: column;
   gap: 4px;
   transition: border-color 0.15s ease;
+}
+
+.state-node--current::after {
+  content: "";
+  position: absolute;
+  top: 9px;
+  right: -4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(91, 191, 138, 0.14);
+}
+
+.react-flow__edge-path {
+  transition: stroke 0.15s ease;
 }
 
 .state-node__top {
