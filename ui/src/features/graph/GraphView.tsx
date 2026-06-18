@@ -12,9 +12,12 @@ import {
 
 import type { GraphEdge, GraphState } from "../../types/graph";
 import { buildFlowEdges, createGraphTopology, layoutTopology } from "./graphElements";
+import { FamilyGroupView, type FamilyFlowNode } from "./FamilyGroup";
 import { StateNodeView, type StateFlowNode } from "./StateNode";
 
-const nodeTypes = { state: StateNodeView };
+type GraphFlowNode = StateFlowNode | FamilyFlowNode;
+
+const nodeTypes = { state: StateNodeView, family: FamilyGroupView };
 const LIVE_LAYOUT_DEBOUNCE_MS = 150;
 const FIT_PADDING = 0.18;
 
@@ -46,28 +49,46 @@ function GraphCanvas({
   const explicitFitDurationRef = useRef<number | null>(null);
   const [following, setFollowing] = useState(true);
   const nodesInitialized = useNodesInitialized();
-  const { fitView } = useReactFlow<StateFlowNode, Edge>();
+  const { fitView } = useReactFlow<GraphFlowNode, Edge>();
 
-  const positions = useMemo(
+  const layout = useMemo(
     () => layoutTopology(displayTopology),
     [displayTopology],
   );
 
-  const rfNodes = useMemo<StateFlowNode[]>(
-    () =>
-      displayTopology.nodeIds.flatMap((id) => {
+  const rfNodes = useMemo<GraphFlowNode[]>(
+    () => [
+      ...layout.familyBoxes.map((family): FamilyFlowNode => ({
+        id: family.id,
+        type: "family",
+        position: family.position,
+        data: { pattern: family.pattern, memberCount: family.memberIds.length },
+        selectable: false,
+        draggable: false,
+        connectable: false,
+        focusable: false,
+        zIndex: 0,
+        style: {
+          width: family.width,
+          height: family.height,
+          pointerEvents: "none",
+        },
+      })),
+      ...displayTopology.nodeIds.flatMap((id): StateFlowNode[] => {
         const state = nodes[id];
-        const position = positions[id];
+        const position = layout.nodePositions[id];
         if (!state || !position) return [];
         return [{
           id,
           type: "state" as const,
           position,
           selected: id === selectedId,
+          zIndex: 1,
           data: { state, current: id === currentId },
         }];
       }),
-    [currentId, displayTopology.nodeIds, nodes, positions, selectedId],
+    ],
+    [currentId, displayTopology.nodeIds, layout, nodes, selectedId],
   );
 
   const rfEdges = useMemo(
@@ -94,8 +115,10 @@ function GraphCanvas({
   const scheduleFit = useCallback((duration = 0) => {
     if (fitFrameRef.current !== null) window.cancelAnimationFrame(fitFrameRef.current);
     fitFrameRef.current = window.requestAnimationFrame(() => {
-      fitFrameRef.current = null;
-      fitGraph(duration);
+      fitFrameRef.current = window.requestAnimationFrame(() => {
+        fitFrameRef.current = null;
+        fitGraph(duration);
+      });
     });
   }, [fitGraph]);
 
@@ -120,16 +143,23 @@ function GraphCanvas({
   }, [following, nodesInitialized, rfNodes.length, scheduleFit]);
 
   useEffect(() => {
-    const onVisibilityChange = () => {
+    const refitOnForeground = () => {
       if (document.hidden) {
         pendingFitRef.current = true;
-      } else if (following && nodesInitialized && pendingFitRef.current) {
+      } else if (following && nodesInitialized && rfNodes.length > 0) {
+        pendingFitRef.current = true;
         scheduleFit(0);
       }
     };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [following, nodesInitialized, scheduleFit]);
+    document.addEventListener("visibilitychange", refitOnForeground);
+    window.addEventListener("focus", refitOnForeground);
+    window.addEventListener("pageshow", refitOnForeground);
+    return () => {
+      document.removeEventListener("visibilitychange", refitOnForeground);
+      window.removeEventListener("focus", refitOnForeground);
+      window.removeEventListener("pageshow", refitOnForeground);
+    };
+  }, [following, nodesInitialized, rfNodes.length, scheduleFit]);
 
   useEffect(() => () => {
     if (fitFrameRef.current !== null) window.cancelAnimationFrame(fitFrameRef.current);
@@ -147,7 +177,7 @@ function GraphCanvas({
 
   return (
     <div ref={containerRef} className="graph-view">
-      <ReactFlow<StateFlowNode, Edge>
+      <ReactFlow<GraphFlowNode, Edge>
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
@@ -155,11 +185,12 @@ function GraphCanvas({
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
-        onlyRenderVisibleElements
         onMoveStart={(event) => {
           if (event) setFollowing(false);
         }}
-        onNodeClick={(_, node) => onSelect(node.id)}
+        onNodeClick={(_, node) => {
+          if (node.type === "state") onSelect(node.id);
+        }}
         minZoom={0.1}
         maxZoom={1.8}
         proOptions={{ hideAttribution: true }}

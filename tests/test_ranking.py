@@ -53,6 +53,26 @@ class TestCollapseSiblings:
         ]
         assert len(collapse_siblings(nav)) == 3
 
+    def test_slug_family_is_inferred_but_kept_for_bounded_sampling(self):
+        profiles = [
+            _item(
+                f"#profiles > li:nth-of-type({n}) > a",
+                text=name,
+                href=f"https://demo.test/users/{name.lower()}",
+            )
+            for n, name in enumerate(("Alice", "Bob", "Carol"), start=1)
+        ]
+
+        candidates = collapse_siblings(profiles)
+
+        assert len(candidates) == 3
+        assert {candidate.family_pattern for candidate in candidates} == {
+            "https://demo.test/users/:param"
+        }
+        assert len({item.group_id for item in profiles}) == 1
+        assert candidates[0].collapsed_count == 3
+        assert all(candidate.collapsed_count == 1 for candidate in candidates[1:])
+
     def test_hrefless_buttons_group_by_text(self):
         tabs = [
             _item("#tabs > button:nth-of-type(1)", tag="button", text="Overview"),

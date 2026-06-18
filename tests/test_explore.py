@@ -170,6 +170,53 @@ async def test_early_stop_records_pending_surface_items(settings: Settings):
     assert root["exploration"]["pending"] > 0
 
 
+async def test_dynamic_route_family_merges_templates_and_preserves_variant(
+    settings: Settings,
+):
+    """Repeated content URLs share a node only after exact structure matches."""
+    config = RunConfig(
+        browser=BrowserConfig(stabilize_quiet_ms=50),
+        budgets=BudgetConfig(max_states=20, max_actions=20, max_depth=2, max_wall_seconds=120),
+    )
+    explorer = Explorer(settings, config)
+    run_id = await explorer.run((FIXTURE_SITE / "family.html").as_uri())
+
+    engine = create_db_engine(settings.database_url)
+    session_factory = create_session_factory(engine)
+    graph = await export_graph(session_factory, run_id)
+    await engine.dispose()
+
+    profile_states = [
+        state
+        for state in graph["states"]
+        if "/profiles/" in state["url"] and state["parent_state_id"] is None
+    ]
+    assert len(profile_states) == 2  # shared template + moderator structural variant
+    assert any(state["url"].endswith("alice.html") for state in profile_states)
+    assert any(state["url"].endswith("moderator.html") for state in profile_states)
+    assert not any(state["url"].endswith(("bob.html", "carol.html")) for state in profile_states)
+
+    root = next(state for state in graph["states"] if state["depth"] == 0)
+    family_items = [
+        item for item in root["surface_items"] if item.get("href") and "/profiles/" in item["href"]
+    ]
+    assert len(family_items) == 4
+    assert len({item["group_id"] for item in family_items}) == 1
+    assert any(item["href"].endswith("carol.html") and item["status"] == "skipped_duplicate"
+               for item in family_items)
+
+    stats = graph["run"]["stats"]
+    assert stats["family_dedup_hits"] == 1
+    assert stats["family_urls_skipped"] == 1
+    assert stats["actions_performed"] <= 4
+
+    family_meta = [state["exploration"] for state in profile_states]
+    assert all(meta["route_family"] for meta in family_meta)
+    assert all(meta["family_sampled"] == 3 for meta in family_meta)
+    assert all(meta["family_skipped"] == 1 for meta in family_meta)
+    assert any(edge["collapsed_count"] == 4 for edge in graph["edges"])
+
+
 def test_enqueue_actions_prefers_highest_scored():
     """DFS stack must receive the top-K scored actions, not the bottom-K."""
     from engine.classify import StateAnalysis

@@ -141,10 +141,29 @@ class RunHandle:
         """API-callable: unblock the explorer. Returns False if no gate is pending."""
         if not self.auth_gate:
             return False
+        resolved_gate = dict(self.auth_gate)
         self._auth_gate_decision = decision
         self._auth_gate_creds = credentials
         self.auth_gate = None
         self.status = RunStatus.RUNNING
+        # Publish an authoritative resolution after the pending gate. Every
+        # connected tab receives it, and late subscribers replay both events
+        # in order instead of resurrecting a stale auth prompt.
+        self._fan_out(
+            self._envelope(
+                EventType.AUTH_GATE.value,
+                {
+                    "message": f"Authentication gate {decision}",
+                    "state_id": resolved_gate["state_id"],
+                    "url": resolved_gate["url"],
+                    "title": resolved_gate["url"],
+                    "screenshot": "",
+                    "decision": decision,
+                    "autofill_attempted": credentials is not None,
+                    "suggested_actions": [],
+                },
+            )
+        )
         assert self._auth_gate_event is not None
         self._auth_gate_event.set()
         return True

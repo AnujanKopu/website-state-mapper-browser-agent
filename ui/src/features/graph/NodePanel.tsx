@@ -92,6 +92,16 @@ export function NodePanel({ state, parent, onClose, onExpandScreenshot }: NodePa
         {state.url}
       </a>
 
+      {exploration?.route_family && (
+        <p className="node-panel__coverage">
+          Route family: <code>{exploration.route_family}</code>
+          {typeof exploration.family_sampled === "number"
+            ? ` · ${exploration.family_sampled} sampled`
+            : ""}
+          {exploration.family_skipped ? ` · ${exploration.family_skipped} skipped` : ""}
+        </p>
+      )}
+
       {parent && (
         <p className="node-panel__substate">
           {"\u21B3 "}Sub-state of {typeof parent.index === "number" ? `s${parent.index}` : "parent"}

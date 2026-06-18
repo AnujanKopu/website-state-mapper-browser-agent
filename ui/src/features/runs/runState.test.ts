@@ -188,4 +188,52 @@ describe("runReducer", () => {
     expect(resolved.authGate).toBeNull();
     expect(resolved.runStatus).toBe("running");
   });
+
+  it("converges after replaying pending and authoritative resolved auth events", () => {
+    const pending = event(3, "auth_gate", {
+      state_id: "s-auth",
+      url: "https://example.com/login",
+      title: "Login",
+      screenshot: "",
+      decision: null,
+      autofill_attempted: false,
+      suggested_actions: ["resume", "skip"],
+    });
+    const resolution = event(4, "auth_gate", {
+      ...pending.payload,
+      decision: "resume",
+      suggested_actions: [],
+    });
+
+    const gated = runReducer(resetState(), { type: "sse", envelope: pending });
+    const resolved = runReducer(gated, { type: "sse", envelope: resolution });
+    const replayed = runReducer(resolved, { type: "sse", envelope: resolution });
+
+    expect(gated.authGate).not.toBeNull();
+    expect(resolved.authGate).toBeNull();
+    expect(resolved.runStatus).toBe("running");
+    expect(replayed).toBe(resolved);
+  });
+
+  it("applies live route-family metadata to discovered states", () => {
+    const discovered = event(1, "state_discovered", {
+      state_id: "game-a",
+      index: 1,
+      url: "https://example.com/game/1/a",
+      url_normalized: "https://example.com/game/:id/a",
+      title: "Game A",
+      type: "page",
+      depth: 1,
+      parent_state_id: null,
+      screenshot: "",
+      flags: {},
+      denied_count: 0,
+      route_family: "https://example.com/game/:id/:param",
+    });
+
+    const next = runReducer(resetState(), { type: "sse", envelope: discovered });
+    expect(next.nodes["game-a"].exploration?.route_family).toBe(
+      "https://example.com/game/:id/:param",
+    );
+  });
 });

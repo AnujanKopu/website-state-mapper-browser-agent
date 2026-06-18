@@ -28,7 +28,7 @@ vi.mock("@xyflow/react", () => ({
 
 import { GraphView } from "./GraphView";
 
-function state(id: string, index: number): GraphState {
+function state(id: string, index: number, overrides: Partial<GraphState> = {}): GraphState {
   return {
     id,
     index,
@@ -46,6 +46,7 @@ function state(id: string, index: number): GraphState {
     surface_items: [],
     flags: {},
     path: [],
+    ...overrides,
   };
 }
 
@@ -114,14 +115,15 @@ describe("GraphView viewport lifecycle", () => {
 
     act(() => vi.advanceTimersByTime(1));
     expect(renderedNodes()).toHaveLength(1);
-    act(() => vi.runOnlyPendingTimers());
+    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBeUndefined();
+    act(() => vi.runAllTimers());
     expect(flowMock.fitView).toHaveBeenCalledTimes(1);
     expect(flowMock.fitView).toHaveBeenLastCalledWith({ duration: 0, padding: 0.18 });
   });
 
   it("stops following after manual movement and resumes from the control", () => {
     const view = render(<GraphView {...graphProps({ a: state("a", 0) })} />);
-    act(() => vi.runOnlyPendingTimers());
+    act(() => vi.runAllTimers());
     const initialFits = flowMock.fitView.mock.calls.length;
 
     act(() => {
@@ -135,11 +137,17 @@ describe("GraphView viewport lifecycle", () => {
         )}
       />,
     );
-    act(() => vi.runOnlyPendingTimers());
+    act(() => vi.runAllTimers());
+    expect(flowMock.fitView).toHaveBeenCalledTimes(initialFits);
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      vi.runAllTimers();
+    });
     expect(flowMock.fitView).toHaveBeenCalledTimes(initialFits);
 
     fireEvent.click(screen.getByRole("button", { name: "Follow live" }));
-    act(() => vi.runOnlyPendingTimers());
+    act(() => vi.runAllTimers());
     expect(flowMock.fitView).toHaveBeenLastCalledWith({ duration: 250, padding: 0.18 });
     expect(screen.getByRole("button", { name: "Following live" })).toHaveAttribute(
       "aria-pressed",
@@ -162,7 +170,7 @@ describe("GraphView viewport lifecycle", () => {
     });
     act(() => {
       triggerResizeObservers();
-      vi.runOnlyPendingTimers();
+      vi.runAllTimers();
     });
     expect(flowMock.fitView).toHaveBeenCalledWith({ duration: 0, padding: 0.18 });
   });
@@ -170,14 +178,38 @@ describe("GraphView viewport lifecycle", () => {
   it("retries a pending fit when a backgrounded tab becomes visible", () => {
     Object.defineProperty(document, "hidden", { configurable: true, value: true });
     render(<GraphView {...graphProps({ a: state("a", 0) })} />);
-    act(() => vi.runOnlyPendingTimers());
+    act(() => vi.runAllTimers());
     expect(flowMock.fitView).not.toHaveBeenCalled();
 
     Object.defineProperty(document, "hidden", { configurable: true, value: false });
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));
-      vi.runOnlyPendingTimers();
+      vi.runAllTimers();
     });
     expect(flowMock.fitView).toHaveBeenCalledWith({ duration: 0, padding: 0.18 });
+  });
+
+  it("renders a non-interactive family container behind structural variants", () => {
+    const routeFamily = "https://example.com/game/:id/:param";
+    render(
+      <GraphView
+        {...graphProps({
+          a: state("a", 0, { exploration: { route_family: routeFamily } }),
+          b: state("b", 1, { exploration: { route_family: routeFamily } }),
+        })}
+      />,
+    );
+    act(() => vi.runAllTimers());
+
+    const nodes = renderedNodes() as Array<Record<string, unknown>>;
+    expect(nodes).toHaveLength(3);
+    const family = nodes.find((node) => node.type === "family");
+    expect(family).toMatchObject({
+      selectable: false,
+      draggable: false,
+      connectable: false,
+      zIndex: 0,
+    });
+    expect(nodes.filter((node) => node.type === "state")).toHaveLength(2);
   });
 });

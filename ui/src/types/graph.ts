@@ -61,6 +61,9 @@ export interface ExplorationSummary {
   noop?: number;
   skipped_duplicate?: number;
   visit_status?: "fully_explored" | "partially_explored";
+  route_family?: string;
+  family_sampled?: number;
+  family_skipped?: number;
 }
 
 export interface GraphState {

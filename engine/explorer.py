@@ -33,7 +33,7 @@ from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.events import ActionOutcome, EventType
 from engine.identity import normalize_url
-from engine.ranking import ActionCandidate, is_auth_entry, loose_url_pattern, score_action
+from engine.ranking import ActionCandidate, is_auth_entry, score_action
 from engine.safety import is_same_origin
 from engine.schemas import (
     ActionStep,
@@ -90,6 +90,7 @@ class StateMeta:
     # the items the safety layer blocked -- used to derive surface statuses.
     representative_ids: set[str] = field(default_factory=set)
     blocked_ids: set[str] = field(default_factory=set)
+    route_family: str | None = None
 
 
 @dataclass
@@ -172,9 +173,12 @@ class Explorer:
         self._visited_urls: set[str] = set()
         # First state registered for each normalized URL (inferred-edge target).
         self._url_to_state: dict[str, str] = {}
-        # Loose-URL-family bookkeeping for the per-family state cap.
-        self._family_counts: dict[str, int] = {}
-        self._family_reps: dict[str, str] = {}
+        # Structure-confirmed representatives and bounded sampling per
+        # content-like route family inferred from repeated link cohorts.
+        self._family_variants: dict[str, dict[tuple, str]] = {}
+        self._family_attempts: dict[str, int] = {}
+        self._family_sampled_urls: dict[str, list[str]] = {}
+        self._family_skipped: dict[str, int] = {}
         self._edges_done: set[tuple[str, str]] = set()
         # (state_id, item_id) -> terminal surface status for items we acted on.
         self._item_outcome: dict[tuple[str, str], str] = {}
@@ -188,6 +192,8 @@ class Explorer:
             "noop_actions": 0,
             "failed_actions": 0,
             "actions_denied": 0,
+            "family_dedup_hits": 0,
+            "family_urls_skipped": 0,
         }
 
         engine = create_db_engine(self._settings.database_url)
@@ -372,6 +378,25 @@ class Explorer:
             )
             return
 
+        family_pattern = pending.candidate.family_pattern
+        if family_pattern is not None:
+            attempts = self._family_attempts.get(family_pattern, 0)
+            if attempts >= self._config.exploration.url_family_cap:
+                self._family_skipped[family_pattern] = (
+                    self._family_skipped.get(family_pattern, 0) + 1
+                )
+                self._stats["family_urls_skipped"] += 1
+                self._edges_done.add(edge_key)
+                self._item_outcome[(source.id, item.item_id)] = "skipped_duplicate"
+                self._emit_action_finished(
+                    ActionOutcome.DEDUPED,
+                    f"Skipped '{item.label}' after sampling route family {family_pattern}",
+                    from_state_id=source.id,
+                    route_family=family_pattern,
+                )
+                return
+            self._family_attempts[family_pattern] = attempts + 1
+
         self._budget.note_action()
         self._actions_since_new += 1
         self._emit(
@@ -418,8 +443,14 @@ class Explorer:
 
         await self._absorb_popups(page)
         observation = await observe_page(page, self._config)
+        if family_pattern is not None:
+            self._family_sampled_urls.setdefault(family_pattern, []).append(
+                observation.snapshot.url
+            )
         key = identity.key_for(observation)
         existing_id = self._resolve_existing_state(observation, source, key)
+        if existing_id is None and family_pattern is not None:
+            existing_id = self._family_template_target(observation, family_pattern)
 
         if existing_id == source.id:
             # The action changed nothing meaningful; don't record a self-loop.
@@ -437,6 +468,8 @@ class Explorer:
         if existing_id is not None:
             destination = self._states[existing_id]
             self._stats["dedup_hits"] += 1
+            if family_pattern is not None and destination.route_family == family_pattern:
+                self._stats["family_dedup_hits"] += 1
             self._emit_action_finished(
                 ActionOutcome.DEDUPED,
                 f"'{item.label}' led to known state s{destination.index}",
@@ -444,39 +477,33 @@ class Explorer:
                 to_state_id=destination.id,
             )
         else:
-            destination = self._family_cap_target(observation, source)
-            if destination is not None:
-                via = "inferred"  # folded into the family representative
-                self._stats["dedup_hits"] += 1
-                self._emit_action_finished(
-                    ActionOutcome.DEDUPED,
-                    f"'{item.label}' folds into family s{destination.index} (cap reached)",
-                    from_state_id=source.id,
-                    to_state_id=destination.id,
-                )
-            else:
-                destination = await self._register_state(
-                    observation,
-                    depth=source.depth + 1,
-                    path=self._path_for(observation, source, item.selector, item.label),
-                    key=key,
-                    source=source,
-                    trigger=item,
-                )
-                self._actions_since_new = 0
-                self._emit_action_finished(
-                    ActionOutcome.NEW_STATE,
-                    f"'{item.label}' reached new state s{destination.index}",
-                    from_state_id=source.id,
-                    to_state_id=destination.id,
-                )
+            destination = await self._register_state(
+                observation,
+                depth=source.depth + 1,
+                path=self._path_for(observation, source, item.selector, item.label),
+                key=key,
+                source=source,
+                trigger=item,
+                route_family=family_pattern,
+            )
+            self._actions_since_new = 0
+            self._emit_action_finished(
+                ActionOutcome.NEW_STATE,
+                f"'{item.label}' reached new state s{destination.index}",
+                from_state_id=source.id,
+                to_state_id=destination.id,
+            )
 
         await self._add_edge(source, destination, pending.candidate, via=via)
         self._edges_done.add(edge_key)
         self._item_outcome[(source.id, item.item_id)] = "explored"
-        # A capped fold left the browser on a page we did not register; force a
-        # re-navigation before the next action rather than trusting location.
-        self._current_state_id = None if via == "inferred" else destination.id
+        # A family merge leaves the browser on an alternate instance URL.
+        # Force replay before expanding the representative's actions.
+        self._current_state_id = (
+            destination.id
+            if observation.url_normalized == destination.url_normalized
+            else None
+        )
 
         # Auth-wall gate: pause exploration if the destination is a login page.
         # This runs after recording the edge so the gate node is always visible.
@@ -515,18 +542,26 @@ class Explorer:
             return None
         return source.url_normalized
 
-    def _family_cap_target(
-        self, observation: Observation, source: StateMeta
-    ) -> StateMeta | None:
-        """Return the family representative if this new URL page exceeds the
-        per-family cap, else None (meaning: register it as its own state)."""
-        if observation.url_normalized == source.url_normalized:
-            return None  # same-URL sub-states are never family-capped
-        pattern = loose_url_pattern(observation.snapshot.url)
-        if self._family_counts.get(pattern, 0) < self._config.exploration.url_family_cap:
-            return None
-        rep_id = self._family_reps.get(pattern)
-        return self._states.get(rep_id) if rep_id else None
+    @staticmethod
+    def _family_template_key(observation: Observation) -> tuple:
+        """Conservative cross-URL template identity for a content family."""
+        signals = observation.snapshot.signals
+        return (
+            signals.modal_open,
+            signals.form_count,
+            signals.password_fields,
+            signals.payment_fields,
+            observation.skeleton_hash,
+            observation.action_sig,
+        )
+
+    def _family_template_target(
+        self, observation: Observation, family_pattern: str
+    ) -> str | None:
+        """Match only exact structure/affordances within an inferred family."""
+        return self._family_variants.get(family_pattern, {}).get(
+            self._family_template_key(observation)
+        )
 
     # ------------------------------------------------------------------
     # State registration
@@ -561,6 +596,7 @@ class Explorer:
         key: identity.StateKey | None = None,
         source: StateMeta | None = None,
         trigger: Interactable | None = None,
+        route_family: str | None = None,
     ) -> StateMeta:
         analysis = analyze_state(observation, base_url=self._root_url)
         state_type = analysis.state_type
@@ -590,6 +626,10 @@ class Explorer:
         async with self._sessions() as session:
             row = build_state_row(state)
             row.parent_state_id = parent_state_id
+            if route_family is not None:
+                # Persist grouping metadata at discovery time so another tab
+                # can hydrate the live family before run-finalization.
+                row.exploration = {"route_family": route_family}
             session.add(row)
             await session.commit()
 
@@ -607,15 +647,16 @@ class Explorer:
             interactables=observation.interactables,
             representative_ids=representative_ids,
             blocked_ids=blocked_ids,
+            route_family=route_family,
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
         self._visited_urls.add(observation.url_normalized)
         self._url_to_state.setdefault(observation.url_normalized, meta.id)
-        if parent_state_id is None:  # a top-level URL page (or the root)
-            pattern = loose_url_pattern(observation.snapshot.url)
-            self._family_counts[pattern] = self._family_counts.get(pattern, 0) + 1
-            self._family_reps.setdefault(pattern, meta.id)
+        if parent_state_id is None and route_family is not None:
+            self._family_variants.setdefault(route_family, {}).setdefault(
+                self._family_template_key(observation), meta.id
+            )
         self._stats["states"] += 1
         self._stats["actions_denied"] += len(analysis.denied)
 
@@ -638,6 +679,7 @@ class Explorer:
                     "parent_state_id": parent_state_id,
                     "screenshot": state.screenshot_path,
                     "flags": analysis.flags,
+                    "route_family": route_family,
                     "denied_count": len(analysis.denied),
                     "surface_items": self._surface_summary(meta),
                     "counters": self._counters(),
@@ -686,9 +728,24 @@ class Explorer:
             return
         if meta.state_type in _GATE_TYPES:
             return  # expanded only after auth_gate resolution via _handle_auth_wall
+        eligible: list[ActionCandidate] = []
+        reserved_by_family: dict[str, int] = {}
         for candidate in analysis.safe:
+            family = candidate.family_pattern
+            if family is not None:
+                reserved = reserved_by_family.get(family, 0)
+                attempted = self._family_attempts.get(family, 0)
+                if attempted + reserved >= self._config.exploration.url_family_cap:
+                    self._family_skipped[family] = self._family_skipped.get(family, 0) + 1
+                    self._stats["family_urls_skipped"] += 1
+                    self._item_outcome[(meta.id, candidate.interactable.item_id)] = (
+                        "skipped_duplicate"
+                    )
+                    continue
+                reserved_by_family[family] = reserved + 1
             candidate.score = score_action(candidate, visited_urls=self._visited_urls)
-        ranked = sorted(analysis.safe, key=lambda c: c.score, reverse=True)
+            eligible.append(candidate)
+        ranked = sorted(eligible, key=lambda c: c.score, reverse=True)
         top = ranked[: self._config.exploration.max_actions_per_state]
         # Always reserve a slot for a sign-in/sign-up affordance when one exists.
         auth_pick = next((c for c in ranked if is_auth_entry(c)), None)
@@ -1025,6 +1082,19 @@ class Explorer:
                     row.interactables = items
                     row.exploration = {
                         **counts,
+                        **(
+                            {
+                                "route_family": meta.route_family,
+                                "family_sampled": len(
+                                    self._family_sampled_urls.get(meta.route_family, [])
+                                ),
+                                "family_skipped": self._family_skipped.get(
+                                    meta.route_family, 0
+                                ),
+                            }
+                            if meta.route_family is not None
+                            else {}
+                        ),
                         "visit_status": (
                             "fully_explored" if counts["pending"] == 0 else "partially_explored"
                         ),

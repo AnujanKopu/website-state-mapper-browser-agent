@@ -160,6 +160,9 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
     parent_state_id: p.parent_state_id ?? base.parent_state_id ?? null,
     screenshot: p.screenshot || base.screenshot,
     surface_items: surfaceItems,
+    exploration: p.route_family
+      ? { ...base.exploration, route_family: p.route_family }
+      : base.exploration,
     flags: { ...base.flags, ...((p.flags ?? {}) as StateFlags) },
   };
 }

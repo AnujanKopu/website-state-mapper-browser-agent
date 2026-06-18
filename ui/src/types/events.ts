@@ -85,6 +85,7 @@ export interface StateDiscoveredPayload extends BasePayload {
   flags: Record<string, unknown>;
   denied_count: number;
   surface_items?: SurfaceItemLite[];
+  route_family?: string | null;
 }
 
 export interface EdgeDiscoveredPayload extends BasePayload {

@@ -25,16 +25,25 @@ export function useRunStream(runId: string | null): RunStreamResult {
     if (!runId) return;
     let cancelled = false;
     let stream: RunStreamHandle | null = null;
+    let hydrateInFlight: ReturnType<typeof getGraph> | null = null;
 
     dispatch({ type: "reset", runId });
 
-    const hydrate = () =>
-      getGraph(runId).then((graph) => {
-        if (!cancelled) dispatch({ type: "hydrate", graph });
-        return graph;
-      });
+    const hydrate = () => {
+      if (hydrateInFlight) return hydrateInFlight;
+      hydrateInFlight = getGraph(runId)
+        .then((graph) => {
+          if (!cancelled) dispatch({ type: "hydrate", graph });
+          return graph;
+        })
+        .finally(() => {
+          hydrateInFlight = null;
+        });
+      return hydrateInFlight;
+    };
 
     const attachStream = () => {
+      if (cancelled || stream) return;
       stream = openRunStream(runId, {
         onOpen: () => {
           if (!cancelled) dispatch({ type: "streamOpen" });
@@ -46,6 +55,7 @@ export function useRunStream(runId: string | null): RunStreamResult {
           if (!cancelled) dispatch({ type: "sse", envelope });
         },
         onTerminal: () => {
+          stream = null;
           hydrate()
             .catch(() => {
               if (!cancelled) {
@@ -57,6 +67,7 @@ export function useRunStream(runId: string | null): RunStreamResult {
             });
         },
         onClosed: () => {
+          stream = null;
           hydrate()
             .catch(() => {
               if (!cancelled) {
@@ -69,6 +80,28 @@ export function useRunStream(runId: string | null): RunStreamResult {
         },
       });
     };
+
+    const reconcileForeground = () => {
+      if (cancelled || document.hidden) return;
+      hydrate()
+        .then((graph) => {
+          if (!cancelled && !FINISHED_STATUSES.has(graph.run.status) && !stream) {
+            attachStream();
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            dispatch({ type: "hydrateFailed", message: "Graph refresh failed." });
+          }
+        });
+    };
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) reconcileForeground();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", reconcileForeground);
+    window.addEventListener("pageshow", reconcileForeground);
 
     hydrate()
       .then((graph) => {
@@ -89,6 +122,9 @@ export function useRunStream(runId: string | null): RunStreamResult {
     return () => {
       cancelled = true;
       stream?.close();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", reconcileForeground);
+      window.removeEventListener("pageshow", reconcileForeground);
     };
   }, [runId]);
 

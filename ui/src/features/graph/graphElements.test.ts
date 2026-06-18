@@ -77,7 +77,8 @@ describe("graph element derivation", () => {
   it("produces finite fixed-dimension layouts and readable inferred edges", () => {
     const edges = { e1: edge("e1", "a", "b", "inferred") };
     const topology = createGraphTopology({ a: state("a", 0), b: state("b", 1) }, edges);
-    const positions = layoutTopology(topology);
+    const layout = layoutTopology(topology);
+    const positions = layout.nodePositions;
     const flowEdges = buildFlowEdges(topology, edges);
 
     expect(NODE_WIDTH).toBe(210);
@@ -87,5 +88,49 @@ describe("graph element derivation", () => {
     expect(positions.b.x).toBeGreaterThan(positions.a.x);
     expect(flowEdges[0].animated).toBe(true);
     expect(String(flowEdges[0].label).endsWith("\u2026")).toBe(true);
+  });
+
+  it("places structural variants inside one deterministic family box", () => {
+    const family = "https://example.com/game/:id/:param";
+    const nodes = {
+      first: state("first", 1),
+      second: state("second", 2),
+      other: state("other", 3),
+    };
+    nodes.first.exploration = { route_family: family };
+    nodes.second.exploration = { route_family: family };
+    const edges = {
+      e1: edge("e1", "other", "first"),
+      e2: edge("e2", "other", "second"),
+    };
+
+    const topology = createGraphTopology(nodes, edges);
+    const layout = layoutTopology(topology);
+
+    expect(topology.families).toHaveLength(1);
+    expect(topology.families[0].memberIds).toEqual(["first", "second"]);
+    expect(topology.layoutEdges).toHaveLength(1);
+    expect(layout.familyBoxes).toHaveLength(1);
+    const box = layout.familyBoxes[0];
+    for (const id of box.memberIds) {
+      const position = layout.nodePositions[id];
+      expect(position.x).toBeGreaterThan(box.position.x);
+      expect(position.y).toBeGreaterThan(box.position.y);
+      expect(position.x + NODE_WIDTH).toBeLessThanOrEqual(box.position.x + box.width);
+      expect(position.y + NODE_HEIGHT).toBeLessThanOrEqual(box.position.y + box.height);
+    }
+    expect(layout.nodePositions.other.x).toBeLessThan(box.position.x);
+  });
+
+  it("does not create a box for one-member families or substates", () => {
+    const lone = state("lone", 1);
+    lone.exploration = { route_family: "https://example.com/users/:param" };
+    const substate = state("sub", 2);
+    substate.parent_state_id = "lone";
+    substate.exploration = { route_family: "https://example.com/users/:param" };
+
+    const topology = createGraphTopology({ lone, substate }, {});
+    expect(topology.families).toEqual([]);
+    expect(layoutTopology(topology).familyBoxes).toEqual([]);
   });
 });

@@ -38,6 +38,60 @@ from tests.conftest import FIXTURE_SITE
 LOGIN_URL = (FIXTURE_SITE / "login.html").as_uri()
 
 
+def test_auth_resolution_is_published_for_replay_and_is_atomic():
+    from api.manager import RunHandle
+    from engine.schemas import RunStatus
+
+    handle = RunHandle(run_id="run-auth", url=LOGIN_URL, status=RunStatus.RUNNING)
+    handle.publish(
+        ExplorerEvent(
+            EventType.AUTH_GATE,
+            "Authentication required",
+            {
+                "state_id": "auth-state",
+                "url": LOGIN_URL,
+                "title": "Login",
+                "screenshot": "",
+                "decision": None,
+                "autofill_attempted": False,
+                "suggested_actions": ["resume", "skip"],
+            },
+        )
+    )
+    handle.set_auth_gate("auth-state", LOGIN_URL)
+
+    assert handle.resolve_auth_gate("skip") is True
+    assert handle.resolve_auth_gate("resume") is False
+    auth_events = [event for event in handle.history if event.type == EventType.AUTH_GATE]
+    assert [event.sequence for event in auth_events] == [0, 1]
+    assert [event.payload["decision"] for event in auth_events] == [None, "skip"]
+    assert "credentials" not in auth_events[-1].payload
+    assert handle.status == RunStatus.RUNNING
+
+
+async def test_multiple_subscribers_share_one_handle_event_sequence():
+    from api.manager import RunHandle, RunManager
+    from engine.schemas import RunStatus
+
+    manager = RunManager(Settings(), RunConfig())
+    handle = RunHandle(run_id="shared-run", url="https://example.test")
+
+    async def collect():
+        return [event async for event in manager.subscribe(handle)]
+
+    first = asyncio.create_task(collect())
+    second = asyncio.create_task(collect())
+    await asyncio.sleep(0)
+    handle.publish(ExplorerEvent(EventType.RUN_STARTED, "Started", {"url": handle.url}))
+    handle.publish(ExplorerEvent(EventType.FRONTIER_UPDATED, "", {"frontier_size": 2}))
+    handle.complete(RunStatus.DONE)
+
+    first_events, second_events = await asyncio.gather(first, second)
+    assert [event.sequence for event in first_events] == [0, 1]
+    assert [event.sequence for event in second_events] == [0, 1]
+    assert handle.task is None  # subscriptions observe; they never launch exploration
+
+
 # ---------------------------------------------------------------------------
 # Unit: classify.py recognises AUTH_WALL
 # ---------------------------------------------------------------------------

@@ -776,6 +776,44 @@ code {
   border: none;
 }
 
+.react-flow__node-family {
+  pointer-events: none !important;
+}
+
+.family-group {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border: 1px dashed rgba(110, 168, 254, 0.58);
+  border-radius: 14px;
+  background: rgba(110, 168, 254, 0.045);
+  padding: 10px 14px;
+}
+
+.family-group__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.family-group__pattern {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--blue);
+}
+
+.family-group__count {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
 /* ---------- Node panel ---------- */
 
 .node-panel {

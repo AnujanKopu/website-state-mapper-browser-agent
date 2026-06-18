@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { authResume, authSkip } from "../../api/client";
+import { ApiError, authResume, authSkip, getRun } from "../../api/client";
 import type { AuthGateInfo } from "./runState";
 
 interface AuthGateBannerProps {
@@ -17,6 +17,20 @@ export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps)
 
   const hasCredentials = username.trim() || password.trim();
 
+  async function reconcileConflict(error: unknown): Promise<boolean> {
+    if (!(error instanceof ApiError) || error.status !== 409) return false;
+    try {
+      const run = await getRun(runId);
+      if (run.status !== "paused") {
+        onResolved();
+        return true;
+      }
+    } catch {
+      // Fall through to the existing local error message.
+    }
+    return false;
+  }
+
   async function handleResume() {
     setBusy(true);
     setLocalError(null);
@@ -27,7 +41,11 @@ export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps)
       );
       onResolved();
       setBusy(false);
-    } catch {
+    } catch (error) {
+      if (await reconcileConflict(error)) {
+        setBusy(false);
+        return;
+      }
       setLocalError("Failed to resume — run may have already moved on.");
       setBusy(false);
     }
@@ -40,7 +58,11 @@ export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps)
       await authSkip(runId);
       onResolved();
       setBusy(false);
-    } catch {
+    } catch (error) {
+      if (await reconcileConflict(error)) {
+        setBusy(false);
+        return;
+      }
       setLocalError("Failed to skip.");
       setBusy(false);
     }
