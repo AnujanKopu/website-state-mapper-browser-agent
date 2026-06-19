@@ -1,12 +1,15 @@
 import type { Counters } from "../../types/events";
+import type { CounterFilterKey } from "./eventLogFilter";
 
 interface CountersBarProps {
   counters: Counters;
   frontierSize: number;
+  activeFilter: CounterFilterKey | null;
+  onFilterChange: (filter: CounterFilterKey | null) => void;
 }
 
 interface Tile {
-  key: keyof Counters | "frontier";
+  key: CounterFilterKey;
   label: string;
   tone?: "warn" | "danger";
 }
@@ -22,16 +25,28 @@ const TILES: Tile[] = [
   { key: "failed", label: "Failed", tone: "danger" },
 ];
 
-export function CountersBar({ counters, frontierSize }: CountersBarProps) {
+export function CountersBar({
+  counters,
+  frontierSize,
+  activeFilter,
+  onFilterChange,
+}: CountersBarProps) {
   return (
-    <div className="counters">
+    <div className="counters" role="group" aria-label="Run counters">
       {TILES.map((tile) => {
         const value = tile.key === "frontier" ? frontierSize : counters[tile.key];
+        const isActive = activeFilter === tile.key;
         return (
-          <div key={tile.key} className={`counter counter--${tile.tone ?? "default"}`}>
+          <button
+            key={tile.key}
+            type="button"
+            className={`counter counter--${tile.tone ?? "default"}${isActive ? " is-active" : ""}`}
+            aria-pressed={isActive}
+            onClick={() => onFilterChange(isActive ? null : tile.key)}
+          >
             <span className="counter__value">{value}</span>
             <span className="counter__label">{tile.label}</span>
-          </div>
+          </button>
         );
       })}
     </div>

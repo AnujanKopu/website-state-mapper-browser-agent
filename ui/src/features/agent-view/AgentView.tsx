@@ -1,23 +1,46 @@
+import { useMemo, useState } from "react";
+
 import { runStatusLabel, stateTypeLabel } from "../../lib/format";
 import type { RunState } from "../runs/runState";
 import { CountersBar } from "./CountersBar";
+import type { CounterFilterKey } from "./eventLogFilter";
 import { EventLog } from "./EventLog";
 import { ScreenshotFrame } from "./ScreenshotFrame";
+import type { ExpandedScreenshot } from "./ScreenshotOverlay";
 
 interface AgentViewProps {
   run: RunState;
-  onExpandScreenshot: (url: string) => void;
+  onExpandScreenshot: (screenshot: ExpandedScreenshot) => void;
 }
 
 const RUNNING = new Set(["running", "queued", "paused"]);
 
+const FILTER_LABELS: Record<CounterFilterKey, string> = {
+  states: "state",
+  edges: "edge",
+  inferred_edges: "inferred",
+  frontier: "pending",
+  actions_performed: "action",
+  deduped: "deduped",
+  denied: "denied",
+  failed: "failed",
+  noop: "noop",
+  frontier_size: "pending",
+};
+
 export function AgentView({ run, onExpandScreenshot }: AgentViewProps) {
+  const [logFilter, setLogFilter] = useState<CounterFilterKey | null>(null);
   const current = run.viewportStateId ? run.nodes[run.viewportStateId] : null;
   const isLive = RUNNING.has(run.runStatus) && run.connection === "live";
   const action = run.currentAction;
+  const filterLabel = useMemo(
+    () => (logFilter ? FILTER_LABELS[logFilter] : undefined),
+    [logFilter],
+  );
 
   return (
     <section className="agent-view">
+      <div className="agent-view__kicker"><span>Agent viewport</span><span>Capture stream</span></div>
       <header className="agent-view__header">
         <div className="agent-view__status">
           <span className={`pulse pulse--${isLive ? "live" : run.runStatus}`} aria-hidden />
@@ -53,11 +76,27 @@ export function AgentView({ run, onExpandScreenshot }: AgentViewProps) {
         )}
       </div>
 
-      <CountersBar counters={run.counters} frontierSize={run.counters.frontier_size} />
+      <CountersBar
+        counters={run.counters}
+        frontierSize={run.counters.frontier_size}
+        activeFilter={logFilter}
+        onFilterChange={setLogFilter}
+      />
 
       <div className="agent-view__log-wrap">
-        <h3 className="agent-view__log-title">Event log</h3>
-        <EventLog entries={run.log} />
+        <div className="agent-view__log-head">
+          <h3 className="agent-view__log-title">Event log</h3>
+          {logFilter && (
+            <button
+              type="button"
+              className="agent-view__log-clear"
+              onClick={() => setLogFilter(null)}
+            >
+              Clear filter
+            </button>
+          )}
+        </div>
+        <EventLog entries={run.log} filter={logFilter} filterLabel={filterLabel} />
       </div>
     </section>
   );

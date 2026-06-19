@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
-import { contextUrl, exportUrl } from "../../api/client";
+import { downloadRunExport, type ExportKind } from "../../api/client";
 import { runStatusLabel, truncate } from "../../lib/format";
 import { AgentView } from "../agent-view/AgentView";
-import { ScreenshotOverlay } from "../agent-view/ScreenshotOverlay";
+import { ScreenshotOverlay, type ExpandedScreenshot } from "../agent-view/ScreenshotOverlay";
 import { GraphView } from "../graph/GraphView";
 import { NodePanel } from "../graph/NodePanel";
 import { AuthGateBanner } from "./AuthGateBanner";
@@ -17,7 +17,23 @@ interface WorkspaceProps {
 export function Workspace({ runId, onNewRun }: WorkspaceProps) {
   const { run, acknowledgeAuthResolved } = useRunStream(runId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [expandedUrl, setExpandedUrl] = useState<string | null>(null);
+  const [expandedScreenshot, setExpandedScreenshot] = useState<ExpandedScreenshot | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<ExportKind | null>(null);
+  const exportMenuRef = useRef<HTMLDetailsElement | null>(null);
+
+  const handleExport = async (kind: ExportKind) => {
+    setExportError(null);
+    setExporting(kind);
+    try {
+      await downloadRunExport(runId, kind);
+      if (exportMenuRef.current) exportMenuRef.current.open = false;
+    } catch {
+      setExportError("Export failed. The run may still be loading.");
+    } finally {
+      setExporting(null);
+    }
+  };
 
   const selected = selectedId ? (run.nodes[selectedId] ?? null) : null;
   const selectedParent =
@@ -33,23 +49,41 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
           <span className="topbar__url" title={run.url}>
             {truncate(run.url || runId, 60)}
           </span>
+          <span className="topbar__run-id">RUN / {runId.slice(0, 8)}</span>
         </div>
         <div className="topbar__right">
           <span className={`topbar__status topbar__status--${run.runStatus}`}>
+            <i aria-hidden />
             {runStatusLabel(run.runStatus)}
           </span>
-          <details className="export-menu">
+          <details className="export-menu" ref={exportMenuRef}>
             <summary className="button button--ghost">Export {"\u25BE"}</summary>
             <div className="export-menu__items">
-              <a href={contextUrl(runId, "markdown")} download>
-                Context pack (.md)
-              </a>
-              <a href={contextUrl(runId, "json")} download>
-                Context pack (.json)
-              </a>
-              <a href={exportUrl(runId)} download>
-                Graph (.json)
-              </a>
+              <button
+                type="button"
+                className="export-menu__item"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("context-markdown")}
+              >
+                {exporting === "context-markdown" ? "Downloading\u2026" : "Context pack (.md)"}
+              </button>
+              <button
+                type="button"
+                className="export-menu__item"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("context-json")}
+              >
+                {exporting === "context-json" ? "Downloading\u2026" : "Context pack (.json)"}
+              </button>
+              <button
+                type="button"
+                className="export-menu__item"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("graph")}
+              >
+                {exporting === "graph" ? "Downloading\u2026" : "Graph (.json)"}
+              </button>
+              {exportError && <p className="export-menu__error">{exportError}</p>}
             </div>
           </details>
         </div>
@@ -69,7 +103,7 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
 
       <div className="panes">
         <div className="panes__left">
-          <AgentView run={run} onExpandScreenshot={setExpandedUrl} />
+          <AgentView run={run} onExpandScreenshot={setExpandedScreenshot} />
         </div>
         <div className="panes__right">
           <GraphView
@@ -85,13 +119,16 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
               state={selected}
               parent={selectedParent}
               onClose={() => setSelectedId(null)}
-              onExpandScreenshot={setExpandedUrl}
+              onExpandScreenshot={setExpandedScreenshot}
             />
           )}
         </div>
       </div>
 
-      <ScreenshotOverlay url={expandedUrl} onClose={() => setExpandedUrl(null)} />
+      <ScreenshotOverlay
+        screenshot={expandedScreenshot}
+        onClose={() => setExpandedScreenshot(null)}
+      />
     </div>
   );
 }

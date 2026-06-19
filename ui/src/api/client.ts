@@ -52,6 +52,49 @@ export function contextUrl(runId: string, format: "markdown" | "json"): string {
   return `${API_BASE}/api/runs/${runId}/context?format=${format}`;
 }
 
+export type ExportKind = "graph" | "context-markdown" | "context-json";
+
+const EXPORT_TARGETS: Record<
+  ExportKind,
+  { path: (runId: string) => string; filename: (runId: string) => string }
+> = {
+  graph: {
+    path: (runId) => `/api/runs/${runId}/export`,
+    filename: (runId) => `flowstate-${runId}.json`,
+  },
+  "context-markdown": {
+    path: (runId) => `/api/runs/${runId}/context?format=markdown`,
+    filename: (runId) => `flowstate-${runId}-context.md`,
+  },
+  "context-json": {
+    path: (runId) => `/api/runs/${runId}/context?format=json`,
+    filename: (runId) => `flowstate-${runId}-context.json`,
+  },
+};
+
+function triggerBrowserDownload(blob: Blob, filename: string): void {
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+/** Fetch an export from the API and save it locally (cross-origin safe). */
+export async function downloadRunExport(runId: string, kind: ExportKind): Promise<void> {
+  const target = EXPORT_TARGETS[kind];
+  const response = await fetch(`${API_BASE}${target.path(runId)}`);
+  if (!response.ok) {
+    throw new ApiError(`GET ${target.path(runId)} -> ${response.status}`, response.status);
+  }
+  const blob = await response.blob();
+  triggerBrowserDownload(blob, target.filename(runId));
+}
+
 export interface AuthCredentials {
   username?: string | null;
   password?: string | null;

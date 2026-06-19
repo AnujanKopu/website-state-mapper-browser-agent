@@ -9,6 +9,7 @@ import type {
   Counters,
   EdgeDiscoveredPayload,
   EventType,
+  FrontierUpdatedPayload,
   RunCompletedPayload,
   RunFailedPayload,
   RunStartedPayload,
@@ -113,7 +114,7 @@ export type RunAction =
   | { type: "authResolved" };
 
 const LOG_CAP = 500;
-const LOG_SKIP: EventType[] = ["heartbeat", "frontier_updated"];
+const LOG_SKIP: EventType[] = ["heartbeat"];
 
 function appendLog(log: LogEntry[], entry: LogEntry): LogEntry[] {
   const lastId = log.length ? log[log.length - 1].id : -1;
@@ -284,17 +285,26 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
   }
 
   let log = state.log;
-  if (!LOG_SKIP.includes(env.type) && typeof payload?.message === "string" && payload.message) {
-    log = appendLog(log, {
-      id: env.sequence,
-      type: env.type,
-      message: payload.message,
-      timestamp: env.timestamp,
-      outcome:
-        env.type === "action_finished"
-          ? (payload as unknown as ActionFinishedPayload).outcome
-          : undefined,
-    });
+  if (!LOG_SKIP.includes(env.type)) {
+    let message: string | undefined;
+    if (typeof payload?.message === "string" && payload.message) {
+      message = payload.message;
+    } else if (env.type === "frontier_updated") {
+      const pending = (payload as unknown as FrontierUpdatedPayload).pending_actions;
+      message = `${pending} action${pending === 1 ? "" : "s"} pending`;
+    }
+    if (message) {
+      log = appendLog(log, {
+        id: env.sequence,
+        type: env.type,
+        message,
+        timestamp: env.timestamp,
+        outcome:
+          env.type === "action_finished"
+            ? (payload as unknown as ActionFinishedPayload).outcome
+            : undefined,
+      });
+    }
   }
 
   return {

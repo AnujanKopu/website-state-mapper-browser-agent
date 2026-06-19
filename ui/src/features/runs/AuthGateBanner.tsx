@@ -69,15 +69,19 @@ export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps)
   }
 
   return (
-    <div className="auth-gate-banner">
+    <section className="auth-gate-banner" aria-label="Authentication checkpoint">
       <div className="auth-gate-banner__icon" aria-hidden>
-        🔒
+        <svg viewBox="0 0 16 16">
+          <path d="M4.5 7V5.25a3.5 3.5 0 0 1 7 0V7M3.5 7.5h9v6h-9z" />
+        </svg>
       </div>
       <div className="auth-gate-banner__body">
-        <p className="auth-gate-banner__title">Authentication required</p>
-        <p className="auth-gate-banner__url" title={gate.url}>
-          {gate.url}
-        </p>
+        <div className="auth-gate-banner__summary">
+          <p className="auth-gate-banner__title">
+            Authentication checkpoint <span>Agent paused</span>
+          </p>
+          <p className="auth-gate-banner__url" title={gate.url}>{gate.url}</p>
+        </div>
         {gate.autofillAttempted && (
           <p className="auth-gate-banner__hint">
             Autofill was attempted but did not succeed. Provide correct credentials or authenticate
@@ -122,6 +126,6 @@ export function AuthGateBanner({ runId, gate, onResolved }: AuthGateBannerProps)
           </button>
         </div>
       </div>
-    </div>
+    </section>
   );
 }

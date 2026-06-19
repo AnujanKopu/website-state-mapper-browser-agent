@@ -197,6 +197,10 @@ function GraphCanvas({
       >
         <Background color="#1f2228" gap={22} />
         <Controls showFitView={false} showInteractive={false} />
+        <Panel position="top-left" className="graph-label">
+          <span>State topology</span>
+          <strong>{displayTopology.nodeIds.length} nodes · {rfEdges.length} edges</strong>
+        </Panel>
         <Panel position="top-right">
           <button
             type="button"

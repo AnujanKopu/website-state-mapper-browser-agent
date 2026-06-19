@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { LandingForm } from "./features/runs/LandingForm";
+import { LandingPage } from "./features/runs/LandingPage";
 import { Workspace } from "./features/runs/Workspace";
 
 function runIdFromHash(): string | null {
@@ -27,5 +27,5 @@ export default function App() {
   if (runId) {
     return <Workspace key={runId} runId={runId} onNewRun={newRun} />;
   }
-  return <LandingForm onStarted={startRun} />;
+  return <LandingPage onStarted={startRun} />;
 }

@@ -1,14 +1,17 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import { createRun } from "../../api/client";
+import { useMagneticHover } from "../../lib/pointerMotion";
 import type { CreateRunInput } from "../../types/graph";
 
 interface LandingFormProps {
   onStarted: (runId: string) => void;
+  inputId?: string;
 }
 
-export function LandingForm({ onStarted }: LandingFormProps) {
+export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormProps) {
+  const submitRef = useRef<HTMLButtonElement>(null);
   const [url, setUrl] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [maxStates, setMaxStates] = useState("");
@@ -16,6 +19,8 @@ export function LandingForm({ onStarted }: LandingFormProps) {
   const [maxDepth, setMaxDepth] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useMagneticHover(submitRef);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -46,17 +51,11 @@ export function LandingForm({ onStarted }: LandingFormProps) {
   };
 
   return (
-    <div className="landing">
-      <div className="landing__inner">
-        <h1 className="landing__title">FlowState</h1>
-        <p className="landing__subtitle">
-          Map a live web app into an interactive state graph. Enter a URL and watch the agent
-          explore.
-        </p>
-
         <form className="landing__form" onSubmit={submit}>
           <div className="landing__input-row">
+            <span className="landing__protocol" aria-hidden>URL</span>
             <input
+              id={inputId}
               className="text-input"
               type="text"
               placeholder="https://example.com"
@@ -65,8 +64,14 @@ export function LandingForm({ onStarted }: LandingFormProps) {
               autoFocus
               spellCheck={false}
             />
-            <button className="button button--primary" type="submit" disabled={submitting}>
-              {submitting ? "Starting\u2026" : "Map it"}
+            <button
+              ref={submitRef}
+              className="button button--primary landing__submit"
+              type="submit"
+              disabled={submitting}
+            >
+              {submitting ? "Starting\u2026" : "Start mapping"}
+              {!submitting && <span aria-hidden>↗</span>}
             </button>
           </div>
 
@@ -75,7 +80,8 @@ export function LandingForm({ onStarted }: LandingFormProps) {
             className="landing__advanced-toggle"
             onClick={() => setShowAdvanced((v) => !v)}
           >
-            {showAdvanced ? "Hide" : "Show"} advanced controls
+            <span aria-hidden>{showAdvanced ? "−" : "+"}</span>
+            {showAdvanced ? "Hide" : "Show"} exploration limits
           </button>
 
           {showAdvanced && (
@@ -118,7 +124,5 @@ export function LandingForm({ onStarted }: LandingFormProps) {
 
           {error && <p className="landing__error">{error}</p>}
         </form>
-      </div>
-    </div>
   );
 }

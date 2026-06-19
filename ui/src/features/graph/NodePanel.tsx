@@ -1,13 +1,14 @@
 import { artifactUrl } from "../../lib/constants";
 import { stateTypeLabel } from "../../lib/format";
 import type { GraphState, SurfaceItem, SurfaceStatus } from "../../types/graph";
+import type { ExpandedScreenshot } from "../agent-view/ScreenshotOverlay";
 import { accentFor } from "./nodeStyles";
 
 interface NodePanelProps {
   state: GraphState | null;
   parent: GraphState | null;
   onClose: () => void;
-  onExpandScreenshot: (url: string) => void;
+  onExpandScreenshot: (screenshot: ExpandedScreenshot) => void;
 }
 
 const FLAG_LABELS: Record<string, string> = {
@@ -113,7 +114,11 @@ export function NodePanel({ state, parent, onClose, onExpandScreenshot }: NodePa
       {screenshot && (
         <button
           className="node-panel__shot"
-          onClick={() => onExpandScreenshot(screenshot)}
+          onClick={() => onExpandScreenshot({
+            imageUrl: screenshot,
+            pageUrl: state.url,
+            title: state.label || state.title || "Captured state",
+          })}
           title="Expand screenshot"
         >
           <img src={screenshot} alt={`Screenshot of ${state.title}`} loading="lazy" />
