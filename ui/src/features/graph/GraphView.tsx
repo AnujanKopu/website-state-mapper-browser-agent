@@ -66,7 +66,7 @@ interface GraphViewProps {
   selectedId: string | null;
   currentId: string | null;
   isLive: boolean;
-  onSelect: (id: string) => void;
+  onSelect: (id: string | null) => void;
 }
 
 interface GraphCanvasProps extends GraphViewProps {
@@ -299,6 +299,24 @@ function GraphCanvas({
     scheduleFit(250);
   };
 
+  const clearSelection = useCallback(() => {
+    setSelectedEdgeId(null);
+    setSelectedFamilyId(null);
+    onSelect(null);
+  }, [onSelect]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".graph-search")) return;
+      if (!selectedId && !selectedEdgeId && !selectedFamilyId) return;
+      clearSelection();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [clearSelection, selectedEdgeId, selectedFamilyId, selectedId]);
+
   return (
     <div ref={containerRef} className="graph-view">
       <ReactFlow<GraphFlowNode, Edge>
@@ -323,10 +341,7 @@ function GraphCanvas({
           }
         }}
         onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
-        onPaneClick={() => {
-          setSelectedEdgeId(null);
-          setSelectedFamilyId(null);
-        }}
+        onPaneClick={clearSelection}
         onlyRenderVisibleElements
         minZoom={0.1}
         maxZoom={1.8}
@@ -336,7 +351,10 @@ function GraphCanvas({
         <Controls showFitView={false} showInteractive={false} />
         <Panel position="top-left" className="graph-label">
           <span>State topology</span>
-          <strong>{displayTopology.nodeIds.length} nodes · {rfEdges.length} edges</strong>
+          <strong>
+            {displayTopology.nodeIds.length} nodes · {Object.keys(edges).length} transitions
+            {rfEdges.length !== Object.keys(edges).length ? ` · ${rfEdges.length} visible` : ""}
+          </strong>
         </Panel>
         <Panel position="bottom-left" className="graph-search">
           <input

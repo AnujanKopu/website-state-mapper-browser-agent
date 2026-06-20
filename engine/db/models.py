@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -112,4 +112,12 @@ class Edge(Base):
     via: Mapped[str] = mapped_column(String(12), default="performed")
     # The surface item (Interactable.item_id) this edge originated from.
     surface_item_id: Mapped[str | None] = mapped_column(String(16), default=None)
+    # Stable semantic identity and additive evidence.  ``via`` remains as a
+    # compatibility/display summary while provenance retains the full history.
+    transition_key: Mapped[str | None] = mapped_column(String(40), default=None)
+    transition_kind: Mapped[str] = mapped_column(String(24), default="control")
+    scope: Mapped[str] = mapped_column(String(24), default="local")
+    reversible: Mapped[bool] = mapped_column(Boolean, default=False)
+    provenance: Mapped[list[Any]] = mapped_column(default=list)
+    evidence: Mapped[list[Any]] = mapped_column(default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

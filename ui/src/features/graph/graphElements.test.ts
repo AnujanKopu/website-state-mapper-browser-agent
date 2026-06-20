@@ -181,7 +181,7 @@ describe("graph element derivation", () => {
     expect(flowEdges[0].style).toMatchObject({ stroke: "var(--edge-connected)" });
   });
 
-  it("highlights inbound bundles into a selected family member", () => {
+  it("does not borrow another family member's transitions when one member is selected", () => {
     const family = "https://example.com/game/:id/:param";
     const graphNodes = {
       hub: state("hub", 0),
@@ -195,11 +195,38 @@ describe("graph element derivation", () => {
     const focus = collectNodeEdgeFocus(topology, graphNodes, edges, "first");
     const flowEdges = buildFlowEdges(topology, edges, null, "first", graphNodes);
 
-    expect(focus?.bundleIds.size).toBe(1);
-    expect([...focus!.bundleIds][0].startsWith("bundle:hub>family-")).toBe(true);
-    const inbound = flowEdges.find((item) => item.className === "graph-edge--inbound");
-    expect(inbound).toBeTruthy();
-    expect(focus?.nodeIds.has("hub")).toBe(true);
+    expect(focus?.bundleIds.size).toBe(0);
+    expect(flowEdges[0].className).toBe("graph-edge--dimmed");
+    expect(focus?.nodeIds.has("hub")).toBe(false);
+  });
+
+  it("hides repeated inferred global navigation until a connected node is selected", () => {
+    const graphNodes = { a: state("a", 0), b: state("b", 1), c: state("c", 2) };
+    const global = edge("global", "a", "b", "inferred");
+    global.scope = "global_navigation";
+    global.provenance = ["inferred"];
+    const local = edge("local", "b", "c");
+    const edges = { global, local };
+    const topology = createGraphTopology(graphNodes, edges);
+
+    expect(buildFlowEdges(topology, edges)).toHaveLength(1);
+    const focused = buildFlowEdges(topology, edges, null, "a", graphNodes);
+    expect(focused).toHaveLength(2);
+    expect(focused.find((item) => item.id === "bundle:a>b")?.className)
+      .toBe("graph-edge--outbound");
+  });
+
+  it("marks opposing directed transitions as a visible cycle", () => {
+    const graphNodes = { a: state("a", 0), b: state("b", 1) };
+    const edges = { forward: edge("forward", "a", "b"), back: edge("back", "b", "a") };
+    edges.back.reversible = true;
+    edges.back.transition_kind = "back";
+    const topology = createGraphTopology(graphNodes, edges);
+    const rendered = buildFlowEdges(topology, edges, null, "a", graphNodes);
+
+    expect(rendered).toHaveLength(2);
+    expect(rendered.every((item) => item.type === "default")).toBe(true);
+    expect(rendered.every((item) => item.data?.cyclic === true)).toBe(true);
   });
 
   it("boxes one retained representative when a repeated cohort was discovered", () => {

@@ -40,6 +40,12 @@ _SQLITE_COLUMN_PATCHES: dict[str, list[str]] = {
     "edges": [
         "via VARCHAR(12) DEFAULT 'performed'",
         "surface_item_id VARCHAR(16)",
+        "transition_key VARCHAR(40)",
+        "transition_kind VARCHAR(24) DEFAULT 'control'",
+        "scope VARCHAR(24) DEFAULT 'local'",
+        "reversible BOOLEAN DEFAULT 0",
+        "provenance JSON DEFAULT '[]'",
+        "evidence JSON DEFAULT '[]'",
     ],
 }
 

@@ -57,6 +57,10 @@ export interface SurfaceItemLite {
   fold: number;
   group_id: string | null;
   status: string;
+  aria_selected?: boolean | null;
+  aria_expanded?: boolean | null;
+  control_key?: string;
+  container_key?: string | null;
 }
 
 export interface BasePayload {
@@ -93,6 +97,7 @@ export interface StateDiscoveredPayload extends BasePayload {
   page_role?: "home" | "hub" | "detail" | "results" | "flow_step" | "boundary";
   page_depth?: number;
   substate_depth?: number;
+  return_state_id?: string | null;
   label?: string;
   name?: NameMetadata;
   family?: FamilyMetadata | null;
@@ -109,6 +114,16 @@ export interface EdgeDiscoveredPayload extends BasePayload {
   selector: string;
   via: string;
   surface_item_id?: string | null;
+  operation?: "created" | "updated";
+  element_text?: string | null;
+  confidence?: number;
+  collapsed_count?: number;
+  transition_key?: string;
+  transition_kind?: string;
+  scope?: "local" | "global_navigation";
+  reversible?: boolean;
+  provenance?: string[];
+  evidence?: import("./graph").TransitionEvidence[];
 }
 
 export interface ActionStartedPayload extends BasePayload {
@@ -138,6 +153,8 @@ export interface AuthGatePayload extends BasePayload {
   /** null while pending, "resume"|"skip"|"autofilled" once resolved */
   decision: string | null;
   autofill_attempted: boolean;
+  autofill_submitted?: boolean;
+  observed_url?: string;
   suggested_actions: string[];
   post_auth_state_id?: string | null;
 }

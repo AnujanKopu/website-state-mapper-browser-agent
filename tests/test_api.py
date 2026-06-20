@@ -159,8 +159,19 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
 
     # The stream agrees with the persisted graph.
     graph = (await client.get(f"/api/runs/{run_id}/graph")).json()
-    edge_events = [e for e in kinds if e == "edge_discovered"]
-    assert len(edge_events) == len(graph["edges"])
+    edge_events = [e["payload"] for e in events if e["type"] == "edge_discovered"]
+    # Stable edge ids allow later observations to upgrade an inferred edge
+    # without creating another graph row.  The final event snapshot for every
+    # id must converge with authoritative graph hydration.
+    latest_edges = {payload["edge_id"]: payload for payload in edge_events}
+    persisted_edges = {edge["id"]: edge for edge in graph["edges"]}
+    assert set(latest_edges) == set(persisted_edges)
+    for edge_id, persisted in persisted_edges.items():
+        live = latest_edges[edge_id]
+        assert live["from"] == persisted["from"]
+        assert live["to"] == persisted["to"]
+        assert live["via"] == persisted["via"]
+        assert live["provenance"] == persisted["provenance"]
 
 
 async def test_context_pack_endpoint(client: httpx.AsyncClient):

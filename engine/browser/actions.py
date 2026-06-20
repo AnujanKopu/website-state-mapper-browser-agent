@@ -183,6 +183,12 @@ _DISCOVER_JS = """
       role,
       text: truncate(el.innerText || el.value, 120),
       aria_label: truncate(el.getAttribute('aria-label'), 120),
+      aria_selected: el.hasAttribute('aria-selected')
+        ? el.getAttribute('aria-selected') === 'true'
+        : null,
+      aria_expanded: el.hasAttribute('aria-expanded')
+        ? el.getAttribute('aria-expanded') === 'true'
+        : null,
       title: truncate(el.getAttribute('title'), 120),
       test_id: truncate(el.getAttribute('data-testid'), 120),
       context_label: contextLabelOf(el),
@@ -191,6 +197,13 @@ _DISCOVER_JS = """
       in_form: !!el.closest('form'),
       in_modal: !!el.closest('[role="dialog"], dialog, [aria-modal="true"]'),
       region: regionOf(el),
+      container_selector: (() => {
+        const owner = el.closest([
+          '[role="tablist"]', 'nav', '[role="navigation"]', 'header',
+          'aside', 'footer', '[role="dialog"]', 'dialog'
+        ].join(', '));
+        return owner ? buildSelector(owner) : null;
+      })(),
       kind: kindOf(el, tag, role),
       bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       page_box: { x: rect.x + sx, y: rect.y + sy, width: rect.width, height: rect.height },
@@ -219,6 +232,11 @@ def _item_id(selector: str, label: str) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
 
 
+def _semantic_key(*parts: str | None) -> str:
+    basis = "|".join((part or "").strip().lower() for part in parts)
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_interactable(raw: dict, fold: int) -> Interactable:
     page_box = raw.get("page_box")
     item = Interactable(
@@ -227,6 +245,8 @@ def _build_interactable(raw: dict, fold: int) -> Interactable:
         role=raw["role"],
         text=raw["text"],
         aria_label=raw["aria_label"],
+        aria_selected=raw.get("aria_selected"),
+        aria_expanded=raw.get("aria_expanded"),
         title=raw.get("title"),
         test_id=raw.get("test_id"),
         context_label=raw.get("context_label"),
@@ -242,6 +262,16 @@ def _build_interactable(raw: dict, fold: int) -> Interactable:
     )
     item.item_id = _item_id(item.selector, item.label)
     item.group_id = group_signature(item)
+    container_shape = strip_positional_selector(raw.get("container_selector") or "")
+    item.container_key = _semantic_key(item.region, container_shape)
+    item.control_key = _semantic_key(
+        item.kind,
+        item.region,
+        item.label,
+        item.href,
+        strip_positional_selector(item.selector),
+        item.container_key,
+    )
     return item
 
 

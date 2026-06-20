@@ -171,6 +171,8 @@ class Interactable(BaseModel):
     role: str | None = None
     text: str | None = None
     aria_label: str | None = None
+    aria_selected: bool | None = None
+    aria_expanded: bool | None = None
     title: str | None = None
     test_id: str | None = None
     context_label: str | None = None
@@ -186,6 +188,10 @@ class Interactable(BaseModel):
     kind: str | None = None  # link | button | tab | menuitem | select | toggle | disclosure
     fold: int = 0  # scroll step at which it first became visible (0 = above fold)
     group_id: str | None = None  # shared by structurally identical siblings
+    # Stable semantic signatures used to recognize the same transition
+    # capability across re-observations and persistent navigation surfaces.
+    control_key: str = ""
+    container_key: str | None = None
     status: SurfaceStatus = SurfaceStatus.PENDING
 
     @property

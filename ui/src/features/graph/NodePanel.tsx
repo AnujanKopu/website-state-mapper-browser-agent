@@ -1,12 +1,14 @@
 import { artifactUrl } from "../../lib/constants";
 import { stateTypeLabel } from "../../lib/format";
-import type { GraphState, SurfaceItem, SurfaceStatus } from "../../types/graph";
+import type { GraphEdge, GraphState, SurfaceItem, SurfaceStatus } from "../../types/graph";
 import type { ExpandedScreenshot } from "../agent-view/ScreenshotOverlay";
 import { accentFor } from "./nodeStyles";
 
 interface NodePanelProps {
   state: GraphState | null;
   parent: GraphState | null;
+  states: Record<string, GraphState>;
+  edges: Record<string, GraphEdge>;
   onClose: () => void;
   onExpandScreenshot: (screenshot: ExpandedScreenshot) => void;
 }
@@ -67,7 +69,7 @@ function groupSurface(items: SurfaceItem[]): [string, SurfaceRow[]][] {
   return ordered;
 }
 
-export function NodePanel({ state, parent, onClose, onExpandScreenshot }: NodePanelProps) {
+export function NodePanel({ state, parent, states, edges, onClose, onExpandScreenshot }: NodePanelProps) {
   if (!state) return null;
   const accent = accentFor(state.type);
   const screenshot = artifactUrl(state.screenshot);
@@ -76,6 +78,32 @@ export function NodePanel({ state, parent, onClose, onExpandScreenshot }: NodePa
   const formCount = typeof state.flags.form_count === "number" ? state.flags.form_count : 0;
   const surface = groupSurface(state.surface_items ?? []);
   const exploration = state.exploration;
+  const incoming = Object.values(edges).filter((edge) => edge.to === state.id);
+  const outgoing = Object.values(edges).filter((edge) => edge.from === state.id);
+
+  const transitionList = (items: GraphEdge[], endpoint: "from" | "to") => (
+    <ul className="transition-list">
+      {items.map((edge) => {
+        const peer = states[edge[endpoint]];
+        const provenance = edge.provenance ?? (edge.via ? [edge.via] : []);
+        return (
+          <li key={edge.id}>
+            <span className="transition-list__label">{edge.label}</span>
+            <span className="transition-list__peer">
+              {peer?.label || peer?.title || peer?.url_normalized || edge[endpoint]}
+            </span>
+            <span className="chips">
+              {edge.scope === "global_navigation" && <span className="chip">global nav</span>}
+              {edge.reversible && <span className="chip chip--ok">reversible</span>}
+              <span className={`chip ${provenance.includes("performed") ? "chip--ok" : "chip--pending"}`}>
+                {provenance.includes("performed") ? "performed" : "inferred"}
+              </span>
+            </span>
+          </li>
+        );
+      })}
+    </ul>
+  );
 
   return (
     <aside className="node-panel">
@@ -184,6 +212,20 @@ export function NodePanel({ state, parent, onClose, onExpandScreenshot }: NodePa
               </div>
             </div>
           ))}
+        </section>
+      )}
+
+      {outgoing.length > 0 && (
+        <section className="node-panel__section">
+          <h3>Outgoing transitions ({outgoing.length})</h3>
+          {transitionList(outgoing, "to")}
+        </section>
+      )}
+
+      {incoming.length > 0 && (
+        <section className="node-panel__section">
+          <h3>Incoming transitions ({incoming.length})</h3>
+          {transitionList(incoming, "from")}
         </section>
       )}
 

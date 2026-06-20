@@ -13,6 +13,7 @@
   --edge-inbound: #a78bfa;
   --edge-outbound: #e8944a;
   --edge-connected: #6ea8fe;
+  --edge-reversible: #5bbf8a;
   --red: #e06c75;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -917,6 +918,41 @@ code {
 
 .react-flow__edge.graph-edge--dimmed .react-flow__edge-path {
   opacity: 0.16;
+}
+
+.react-flow__edge.graph-edge--reversible .react-flow__edge-path {
+  stroke: var(--edge-reversible) !important;
+}
+
+.react-flow__edge.graph-edge--global .react-flow__edge-path {
+  stroke-dasharray: 3 5;
+  opacity: 0.65;
+}
+
+.transition-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.transition-list li {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.transition-list__label {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.transition-list__peer {
+  color: var(--text-secondary);
+  font-size: 11px;
+  word-break: break-word;
 }
 
 .state-node__top {

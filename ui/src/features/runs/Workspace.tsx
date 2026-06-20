@@ -118,6 +118,8 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
             <NodePanel
               state={selected}
               parent={selectedParent}
+              states={run.nodes}
+              edges={run.edges}
               onClose={() => setSelectedId(null)}
               onExpandScreenshot={setExpandedScreenshot}
             />

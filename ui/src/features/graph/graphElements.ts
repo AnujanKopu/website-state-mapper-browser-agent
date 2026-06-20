@@ -122,6 +122,9 @@ export function createGraphTopology(
   const seenLayoutEdges = new Set<string>();
   const layoutEdges: Edge[] = [];
   for (const edge of validEdges) {
+    const inferredOnly = edge.via === "inferred"
+      && !(edge.provenance ?? []).includes("performed");
+    if (edge.scope === "global_navigation" && inferredOnly) continue;
     const source = ownerByNode[edge.from];
     const target = ownerByNode[edge.to];
     if (source === target) continue;
@@ -192,10 +195,6 @@ function edgeBundleId(topology: GraphTopology, edge: GraphEdge): string | null {
   return `bundle:${source}>${target}`;
 }
 
-function layoutUnit(topology: GraphTopology, nodeId: string): string {
-  return topology.ownerByNode[nodeId] ?? nodeId;
-}
-
 function isDescendantOf(
   nodes: Record<string, GraphState>,
   nodeId: string,
@@ -205,25 +204,25 @@ function isDescendantOf(
 }
 
 function edgeTargetsNode(
-  topology: GraphTopology,
+  _topology: GraphTopology,
   nodes: Record<string, GraphState>,
   edge: GraphEdge,
   nodeId: string,
 ): boolean {
   if (edge.to === nodeId) return true;
   if (isDescendantOf(nodes, edge.to, nodeId)) return true;
-  return layoutUnit(topology, edge.to) === layoutUnit(topology, nodeId);
+  return false;
 }
 
 function edgeSourcesNode(
-  topology: GraphTopology,
+  _topology: GraphTopology,
   nodes: Record<string, GraphState>,
   edge: GraphEdge,
   nodeId: string,
 ): boolean {
   if (edge.from === nodeId) return true;
   if (isDescendantOf(nodes, edge.from, nodeId)) return true;
-  return layoutUnit(topology, edge.from) === layoutUnit(topology, nodeId);
+  return false;
 }
 
 export type EdgeFocusDirection = "inbound" | "outbound" | "both";
@@ -234,7 +233,7 @@ export interface NodeEdgeFocus {
   bundleDirections: Map<string, EdgeFocusDirection>;
 }
 
-/** Selected node, its ancestor paths, neighbors, and connected edge bundles. */
+/** Selected node and its exact one-hop incoming/outgoing neighborhood. */
 export function collectNodeEdgeFocus(
   topology: GraphTopology,
   nodes: Record<string, GraphState>,
@@ -263,19 +262,6 @@ export function collectNodeEdgeFocus(
     const inbound = edgeTargetsNode(topology, nodes, edge, selectedId);
     if (outbound) markBundle(edge, "outbound");
     if (inbound) markBundle(edge, "inbound");
-  }
-
-  const queue = [selectedId];
-  const visited = new Set<string>([selectedId]);
-  while (queue.length > 0) {
-    const cursor = queue.shift()!;
-    for (const edge of Object.values(edges)) {
-      if (!edgeTargetsNode(topology, nodes, edge, cursor)) continue;
-      markBundle(edge, "inbound");
-      if (visited.has(edge.from)) continue;
-      visited.add(edge.from);
-      queue.push(edge.from);
-    }
   }
 
   return { nodeIds, bundleIds, bundleDirections };
@@ -314,6 +300,14 @@ export function buildFlowEdges(
   for (const id of topology.edgeIds) {
     const edge = edges[id];
     if (!edge) continue;
+    const inferredOnly = edge.via === "inferred"
+      && !(edge.provenance ?? []).includes("performed");
+    if (
+      edge.scope === "global_navigation"
+      && inferredOnly
+      && !focusedNodeId
+      && selectedBundleId !== edgeBundleId(topology, edge)
+    ) continue;
     const bundleId = edgeBundleId(topology, edge);
     if (!bundleId) continue;
     const bucket = bundles.get(bundleId) ?? [];
@@ -323,6 +317,10 @@ export function buildFlowEdges(
   return [...bundles.entries()].map(([id, bundle]) => {
     const edge = bundle[0];
     const inferred = bundle.every((item) => item.via === "inferred");
+    const reversible = bundle.some((item) => item.reversible);
+    const globalNavigation = bundle.every((item) => item.scope === "global_navigation");
+    const reverseId = `bundle:${topology.ownerByNode[edge.to] ?? edge.to}>${topology.ownerByNode[edge.from] ?? edge.from}`;
+    const cyclic = bundles.has(reverseId);
     const connected = focus?.bundleIds.has(id) ?? false;
     const direction = focus?.bundleDirections.get(id);
     const visualRole = connected
@@ -337,6 +335,8 @@ export function buildFlowEdges(
           ? "var(--edge-connected)"
           : inferred
             ? "var(--text-muted)"
+            : reversible
+              ? "var(--green)"
             : "var(--border-2)";
     const label = bundle.length > 1
       ? `${bundle.length} paths: ${truncate(edge.label, 30)}`
@@ -345,7 +345,7 @@ export function buildFlowEdges(
       id,
       source: topology.ownerByNode[edge.from] ?? edge.from,
       target: topology.ownerByNode[edge.to] ?? edge.to,
-      type: "smoothstep",
+      type: cyclic ? "default" : "smoothstep",
       label: selectedBundleId === id || connected ? label : undefined,
       animated: inferred && !connected,
       className: visualRole === "inbound"
@@ -356,7 +356,11 @@ export function buildFlowEdges(
             ? "graph-edge--connected"
             : dimmed
               ? "graph-edge--dimmed"
-              : undefined,
+              : reversible
+                ? "graph-edge--reversible"
+                : globalNavigation
+                  ? "graph-edge--global"
+                  : undefined,
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       style: {
         stroke,
@@ -368,7 +372,13 @@ export function buildFlowEdges(
       labelBgPadding: [4, 2] as [number, number],
       labelBgBorderRadius: 3,
       labelBgStyle: { fill: "var(--bg)", fillOpacity: 0.9 },
-      data: { edgeIds: bundle.map((item) => item.id), count: bundle.length },
+      data: {
+        edgeIds: bundle.map((item) => item.id),
+        count: bundle.length,
+        cyclic,
+        reversible,
+        globalNavigation,
+      },
       zIndex: visualRole === "inbound" ? 3 : visualRole ? 2 : 0,
     };
   });

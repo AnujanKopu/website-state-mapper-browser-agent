@@ -70,6 +70,10 @@ def _surface_items(interactables: list[dict]) -> list[dict]:
             "in_nav": item.get("in_nav", False),
             "in_form": item.get("in_form", False),
             "in_modal": item.get("in_modal", False),
+            "aria_selected": item.get("aria_selected"),
+            "aria_expanded": item.get("aria_expanded"),
+            "control_key": item.get("control_key", ""),
+            "container_key": item.get("container_key"),
             "page_box": item.get("page_box"),
         }
         for item in interactables
@@ -151,6 +155,12 @@ async def export_graph(
                 "collapsed_count": edge.collapsed_count,
                 "via": edge.via,
                 "surface_item_id": edge.surface_item_id,
+                "transition_key": edge.transition_key or edge.id,
+                "transition_kind": edge.transition_kind or edge.action_type,
+                "scope": edge.scope or "local",
+                "reversible": bool(edge.reversible),
+                "provenance": edge.provenance or [edge.via],
+                "evidence": edge.evidence or [],
             }
             for edge in edges
         ],

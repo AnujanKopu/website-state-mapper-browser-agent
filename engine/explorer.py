@@ -13,9 +13,10 @@ stack drains or any budget is exhausted.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import re
 import time
-import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -49,7 +50,7 @@ from engine.events import ActionOutcome, EventType
 from engine.identity import normalize_url
 from engine.organize import heuristic_name, infer_page_role
 from engine.ranking import ActionCandidate, is_auth_entry, score_action
-from engine.safety import is_same_origin
+from engine.safety import evaluate_action, is_same_origin
 from engine.schemas import (
     ActionStep,
     AuthContext,
@@ -116,6 +117,21 @@ class StateMeta:
     family: dict | None = None
     page_role: PageRole = PageRole.FLOW_STEP
     display_label: str = ""
+    # Exact canonical state expected after closing/cancelling a local surface.
+    # This is intentionally separate from the organizational page parent.
+    return_state_id: str | None = None
+
+
+@dataclass
+class TransitionCapability:
+    """One visible source-local control that can support a directed edge."""
+
+    source_id: str
+    capability_id: str
+    control_key: str
+    item: Interactable
+    target_hint: str | None = None
+    global_key: str | None = None
 
 
 @dataclass
@@ -169,6 +185,7 @@ class Frontier:
         def priority(item: PendingAction) -> tuple:
             local_continuation = item.from_state.state_type in {
                 StateType.MODAL,
+                StateType.DROPDOWN,
                 StateType.FORM,
                 StateType.WIZARD_STEP,
             }
@@ -269,6 +286,20 @@ class Explorer:
         self._family_skipped: dict[str, int] = {}
         self._family_info: dict[str, dict] = {}
         self._edges_done: set[tuple[str, str]] = set()
+        self._capabilities: dict[tuple[str, str], TransitionCapability] = {}
+        self._capability_by_item: dict[tuple[str, str], str] = {}
+        self._waiting_by_target: dict[
+            tuple[AuthContext, str], set[tuple[str, str]]
+        ] = defaultdict(set)
+        self._global_capabilities: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self._global_targets: dict[str, str] = {}
+        self._ambiguous_global_targets: set[str] = set()
+        self._tab_capabilities: dict[
+            tuple[str, str], set[tuple[str, str]]
+        ] = defaultdict(set)
+        self._tab_targets: dict[tuple[str, str], str] = {}
+        self._edge_records: dict[str, dict] = {}
+        self._validated_history: set[tuple[str, str]] = set()
         # (state_id, item_id) -> terminal surface status for items we acted on.
         self._item_outcome: dict[tuple[str, str], str] = {}
         self._current_state_id: str | None = None
@@ -283,6 +314,9 @@ class Explorer:
             "actions_denied": 0,
             "family_dedup_hits": 0,
             "family_urls_skipped": 0,
+            "restoration_checks": 0,
+            "global_navigation_edges": 0,
+            "reversible_edges": 0,
         }
 
         engine = create_db_engine(self._settings.database_url)
@@ -425,6 +459,211 @@ class Explorer:
             return None
         return target_id
 
+    @staticmethod
+    def _stable_hash(*parts: str | None, length: int = 20) -> str:
+        basis = "|".join((part or "").strip().lower() for part in parts)
+        return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:length]
+
+    def _control_key(self, item: Interactable) -> str:
+        if item.control_key:
+            return item.control_key
+        return self._stable_hash(
+            item.kind,
+            item.region,
+            item.label,
+            item.href,
+            identity.strip_positional_selector(item.selector),
+            item.container_key,
+            length=16,
+        )
+
+    def _capability_id(self, source: StateMeta, item: Interactable) -> str:
+        return self._stable_hash(
+            source.id,
+            item.item_id,
+            self._control_key(item),
+            length=20,
+        )
+
+    def _target_hint(self, item: Interactable) -> str | None:
+        href = item.href
+        if not href or not href.startswith(("http://", "https://", "file://")):
+            return None
+        if not is_same_origin(href, self._root_url):
+            return None
+        return normalize_url(href)
+
+    def _global_key(
+        self, source: StateMeta, item: Interactable, target_hint: str | None
+    ) -> str | None:
+        if not (item.in_nav or item.region in {"nav", "header", "aside"}):
+            return None
+        origin = urlsplit(self._root_url)
+        return self._stable_hash(
+            origin.scheme,
+            origin.netloc,
+            source.auth_context.value,
+            item.container_key,
+            item.kind,
+            item.label,
+            target_hint,
+            identity.strip_positional_selector(item.selector),
+            length=24,
+        )
+
+    def _is_global_capability(self, capability: TransitionCapability) -> bool:
+        if capability.global_key is None:
+            return False
+        sources = {
+            source_id
+            for source_id, _ in self._global_capabilities[capability.global_key]
+        }
+        return len(sources) >= 2
+
+    def _capability_for(
+        self, source: StateMeta, item: Interactable
+    ) -> TransitionCapability | None:
+        capability_id = self._capability_by_item.get((source.id, item.item_id))
+        if capability_id is None:
+            return None
+        return self._capabilities.get((source.id, capability_id))
+
+    async def _resolve_capability(self, ref: tuple[str, str]) -> None:
+        capability = self._capabilities.get(ref)
+        if capability is None:
+            return
+        source = self._states.get(capability.source_id)
+        if source is None:
+            return
+
+        target_id: str | None = None
+        if capability.target_hint is not None:
+            target_id = self._url_to_state.get(
+                (source.auth_context, capability.target_hint)
+            )
+            if target_id is None:
+                target_id = self._url_to_state.get(capability.target_hint)
+        if target_id is None and capability.item.kind == "tab":
+            page_id = self._page_ancestor(source)
+            target_id = self._tab_targets.get((page_id, capability.control_key))
+        if (
+            target_id is None
+            and capability.global_key is not None
+            and capability.global_key not in self._ambiguous_global_targets
+            and self._is_global_capability(capability)
+        ):
+            target_id = self._global_targets.get(capability.global_key)
+
+        if target_id == source.id:
+            return
+        if target_id is None or target_id not in self._states:
+            if capability.target_hint is not None:
+                self._waiting_by_target[
+                    (source.auth_context, capability.target_hint)
+                ].add(ref)
+            return
+
+        await self._add_edge(
+            source,
+            self._states[target_id],
+            ActionCandidate(interactable=capability.item, score=100.0),
+            via="inferred",
+            capability=capability,
+        )
+
+    async def _register_transition_capabilities(
+        self, meta: StateMeta
+    ) -> None:
+        """Persist visible transition evidence independently from exploration.
+
+        Ranking and substate delta filtering decide what to click; they must not
+        decide which visibly supported transitions exist in the state machine.
+        """
+        items = meta.interactables
+        if meta.state_type == StateType.MODAL:
+            modal_items = [item for item in items if item.in_modal]
+            if modal_items:
+                items = modal_items
+
+        touched_globals: set[str] = set()
+        touched_tabs: set[tuple[str, str]] = set()
+        for item in items:
+            if not evaluate_action(item, base_url=self._root_url).allowed:
+                continue
+            control_key = self._control_key(item)
+            item.control_key = control_key
+            capability_id = self._capability_id(meta, item)
+            target_hint = self._target_hint(item)
+            global_key = self._global_key(meta, item, target_hint)
+            capability = TransitionCapability(
+                source_id=meta.id,
+                capability_id=capability_id,
+                control_key=control_key,
+                item=item,
+                target_hint=target_hint,
+                global_key=global_key,
+            )
+            ref = (meta.id, capability_id)
+            self._capabilities[ref] = capability
+            self._capability_by_item[(meta.id, item.item_id)] = capability_id
+
+            if global_key is not None:
+                self._global_capabilities[global_key].add(ref)
+                touched_globals.add(global_key)
+
+            if item.kind == "tab":
+                tab_key = (self._page_ancestor(meta), control_key)
+                self._tab_capabilities[tab_key].add(ref)
+                touched_tabs.add(tab_key)
+                if item.aria_selected is True:
+                    self._tab_targets.setdefault(tab_key, meta.id)
+
+            await self._resolve_capability(ref)
+
+        # A newly observed selected tab or newly repeated navbar signature can
+        # resolve controls captured in earlier states.
+        for tab_key in touched_tabs:
+            if tab_key in self._tab_targets:
+                for ref in tuple(self._tab_capabilities[tab_key]):
+                    await self._resolve_capability(ref)
+        for global_key in touched_globals:
+            refs = tuple(self._global_capabilities[global_key])
+            if len({source_id for source_id, _ in refs}) >= 2:
+                for ref in refs:
+                    await self._resolve_capability(ref)
+
+        target_key = (meta.auth_context, meta.url_normalized)
+        waiting = tuple(self._waiting_by_target.pop(target_key, set()))
+        for ref in waiting:
+            await self._resolve_capability(ref)
+
+    async def _learn_performed_capability(
+        self, source: StateMeta, item: Interactable, destination: StateMeta
+    ) -> None:
+        capability = self._capability_for(source, item)
+        if capability is None:
+            return
+
+        if capability.item.kind == "tab":
+            tab_key = (self._page_ancestor(source), capability.control_key)
+            self._tab_targets.setdefault(tab_key, destination.id)
+            for ref in tuple(self._tab_capabilities[tab_key]):
+                await self._resolve_capability(ref)
+
+        global_key = capability.global_key
+        if global_key is None or not self._is_global_capability(capability):
+            return
+        known = self._global_targets.get(global_key)
+        if known is not None and known != destination.id:
+            self._ambiguous_global_targets.add(global_key)
+            self._global_targets.pop(global_key, None)
+            return
+        if global_key in self._ambiguous_global_targets:
+            return
+        self._global_targets[global_key] = destination.id
+        for ref in tuple(self._global_capabilities[global_key]):
+            await self._resolve_capability(ref)
+
     async def _execute(self, page: Page, pending: PendingAction) -> None:
         source = pending.from_state
         item = pending.candidate.interactable
@@ -471,7 +710,6 @@ class Explorer:
             )
             self._edges_done.add(edge_key)
             self._item_outcome[(source.id, item.item_id)] = "explored"
-            self._stats["inferred_edges"] += 1
             self._emit_action_finished(
                 ActionOutcome.DEDUPED,
                 f"Inferred '{item.label}' -> known s{self._states[inferred_id].index}",
@@ -630,6 +868,7 @@ class Explorer:
             )
 
         await self._add_edge(source, destination, pending.candidate, via=via)
+        await self._learn_performed_capability(source, item, destination)
         self._edges_done.add(edge_key)
         self._item_outcome[(source.id, item.item_id)] = "explored"
         # A family merge leaves the browser on an alternate instance URL.
@@ -639,6 +878,8 @@ class Explorer:
             if observation.url_normalized == destination.url_normalized
             else None
         )
+        if self._current_state_id == destination.id:
+            await self._validate_browser_back(page, source, destination)
 
         # Auth-wall gate: pause exploration if the destination is a login page.
         # This runs after recording the edge so the gate node is always visible.
@@ -767,10 +1008,20 @@ class Explorer:
         # Same-URL sub-states (modal/tab/dropdown) hang off the page that
         # opened them; refine the type for non-modal structural changes.
         parent_state_id: str | None = None
+        return_state_id: str | None = None
         page_depth = 0
         substate_depth = 0
-        if source is not None and observation.url_normalized == source.url_normalized:
+        if source is not None and state_type == StateType.MODAL:
+            # Modals can reflect their open state in the query string.  They
+            # still belong to the page that opened them and should return to
+            # the exact source state, not merely the same normalized URL.
             parent_state_id = self._page_ancestor(source)
+            return_state_id = source.id
+            page_depth = source.page_depth
+            substate_depth = source.substate_depth + 1
+        elif source is not None and observation.url_normalized == source.url_normalized:
+            parent_state_id = self._page_ancestor(source)
+            return_state_id = source.id
             page_depth = source.page_depth
             substate_depth = source.substate_depth + 1
             if state_type == StateType.PAGE:
@@ -820,6 +1071,7 @@ class Explorer:
                 "page_role": page_role.value,
                 "page_depth": page_depth,
                 "substate_depth": substate_depth,
+                **({"return_state_id": return_state_id} if return_state_id else {}),
                 "name": naming,
                 **({"route_family": route_family} if route_family else {}),
                 **({"family": dict(family)} if family else {}),
@@ -849,6 +1101,7 @@ class Explorer:
             family=dict(family) if family else None,
             page_role=page_role,
             display_label=naming["text"],
+            return_state_id=return_state_id,
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
@@ -895,6 +1148,7 @@ class Explorer:
                     "auth_context": observation.auth_context.value,
                     "page_depth": page_depth,
                     "substate_depth": substate_depth,
+                    "return_state_id": return_state_id,
                     "family": family,
                     "denied_count": len(analysis.denied),
                     "surface_items": self._surface_summary(meta),
@@ -903,6 +1157,7 @@ class Explorer:
             )
         )
 
+        await self._register_transition_capabilities(meta)
         if enqueue_actions:
             self._enqueue_actions(meta, analysis)
         return meta
@@ -918,6 +1173,10 @@ class Explorer:
                 "region": item.region,
                 "fold": item.fold,
                 "group_id": item.group_id,
+                "aria_selected": item.aria_selected,
+                "aria_expanded": item.aria_expanded,
+                "control_key": item.control_key,
+                "container_key": item.container_key,
                 "status": (
                     "blocked" if item.item_id in meta.blocked_ids else "pending"
                 ),
@@ -934,7 +1193,10 @@ class Explorer:
     ) -> list[ActionStep]:
         """Replay path for a new state: URL-addressable states restart from a
         goto; sub-URL states (modals, tabs) extend the source state's path."""
-        if observation.url_normalized != source.url_normalized:
+        if (
+            observation.url_normalized != source.url_normalized
+            and not observation.snapshot.signals.modal_open
+        ):
             return [ActionStep(kind="goto", url=observation.snapshot.url)]
         return [*source.path, ActionStep(kind="click", selector=selector, label=label)]
 
@@ -1004,6 +1266,27 @@ class Explorer:
         family_pick = next((c for c in ranked if c.family_pattern), None)
         if family_pick and family_pick not in top and top:
             top = [*top[:-1], family_pick]
+        if meta.return_state_id is not None:
+            return_pick = next(
+                (
+                    candidate
+                    for candidate in ranked
+                    if re.search(
+                        r"\b(close|cancel|dismiss|back|return|previous)\b",
+                        candidate.interactable.label,
+                        re.I,
+                    )
+                    or (
+                        meta.state_type == StateType.DROPDOWN
+                        and candidate.interactable.kind == "disclosure"
+                    )
+                ),
+                None,
+            )
+            if return_pick and return_pick not in top:
+                top = [return_pick, *top][
+                    : self._config.exploration.max_actions_per_state
+                ]
         meta.representative_ids = {c.interactable.item_id for c in eligible}
         for candidate in top:
             journey_key = meta.journey_key
@@ -1068,15 +1351,38 @@ class Explorer:
         autofill_attempted = False
         while True:
             observation: Observation | None = None
+            autofill_submitted = False
             if self._credentials is not None:
                 autofill_attempted = True
                 try:
+                    auth_page_url = page.url
                     submitted = await autofill_auth_form(
                         page,
                         self._credentials,
                         timeout_ms=self._config.exploration.action_timeout_ms,
                     )
+                    autofill_submitted = submitted
                     if submitted:
+                        with contextlib.suppress(PlaywrightError):
+                            await page.wait_for_function(
+                                """
+                                (sourceUrl) => {
+                                  if (location.href !== sourceUrl) return true;
+                                  const fields = [...document.querySelectorAll(
+                                    'input[type="password"]'
+                                  )];
+                                  return !fields.some((field) => {
+                                    const style = getComputedStyle(field);
+                                    const rect = field.getBoundingClientRect();
+                                    return style.display !== 'none'
+                                      && style.visibility !== 'hidden'
+                                      && rect.width > 0 && rect.height > 0;
+                                  });
+                                }
+                                """,
+                                arg=auth_page_url,
+                                timeout=self._config.browser.navigation_timeout_ms,
+                            )
                         await stabilize(page, self._config.browser.stabilize_quiet_ms)
                     observation = await observe_page(
                         page, self._config, auth_context=AuthContext.GUEST
@@ -1098,6 +1404,10 @@ class Explorer:
                         "screenshot": meta.id,
                         "decision": None,
                         "autofill_attempted": autofill_attempted,
+                        "autofill_submitted": autofill_submitted,
+                        "observed_url": (
+                            observation.snapshot.url if observation is not None else page.url
+                        ),
                         "suggested_actions": ["resume", "skip"],
                     },
                 )
@@ -1183,43 +1493,22 @@ class Explorer:
         self, source: StateMeta, destination: StateMeta
     ) -> None:
         """Record a user-authenticated transition (manual or credential autofill)."""
-        edge_id = uuid.uuid4().hex
-        async with self._sessions() as session:
-            session.add(
-                db.Edge(
-                    id=edge_id,
-                    run_id=self._run_id,
-                    from_state_id=source.id,
-                    to_state_id=destination.id,
-                    action_type="user_auth",
-                    label="User authenticated",
-                    selector="",
-                    selector_strategy="css",
-                    confidence=1.0,
-                    via="user_auth",
-                )
-            )
-            await session.commit()
-
-        self._stats["edges"] += 1
-        self._emit(
-            ExplorerEvent(
-                EventType.EDGE_DISCOVERED,
-                f"s{source.index} -> s{destination.index}: User authenticated",
-                {
-                    "edge_id": edge_id,
-                    "from": source.id,
-                    "to": destination.id,
-                    "from_index": source.index,
-                    "to_index": destination.index,
-                    "action": "user_auth",
-                    "label": "User authenticated",
-                    "selector": "",
-                    "via": "user_auth",
-                    "surface_item_id": None,
-                    "counters": self._counters(),
-                },
-            )
+        await self._upsert_transition(
+            source,
+            destination,
+            capability_id="user-auth",
+            action_type="user_auth",
+            label="User authenticated",
+            selector="auth",
+            element_text=None,
+            confidence=1.0,
+            collapsed_count=1,
+            via="user_auth",
+            surface_item_id=None,
+            transition_kind="auth",
+            scope="local",
+            reversible=False,
+            evidence={"mode": "user_auth", "validated": True},
         )
 
     # ------------------------------------------------------------------
@@ -1247,6 +1536,95 @@ class Explorer:
         self._current_state_id = target.id
         return True
 
+    async def _validate_browser_back(
+        self, page: Page, source: StateMeta, destination: StateMeta
+    ) -> None:
+        """Record contextual browser Back only after exact restoration.
+
+        Back is history-dependent, so this check is performed once for each
+        actually executed source/destination context and never inferred as a
+        blanket reverse edge.
+        """
+        pair = (source.id, destination.id)
+        if pair in self._validated_history:
+            return
+        self._validated_history.add(pair)
+        if source.url_normalized == destination.url_normalized:
+            return
+        if destination.state_type in {StateType.AUTH_WALL, StateType.EXTERNAL}:
+            return
+        if not (
+            is_same_origin(source.url, self._root_url)
+            and is_same_origin(destination.url, self._root_url)
+        ):
+            return
+
+        self._stats["restoration_checks"] += 1
+        restored_id: str | None = None
+        went_back = False
+        try:
+            await page.go_back(
+                wait_until="domcontentloaded",
+                timeout=self._config.exploration.action_timeout_ms,
+            )
+            went_back = True
+            await stabilize(page, self._config.browser.stabilize_quiet_ms)
+            restored = await observe_page(
+                page, self._config, auth_context=self._auth_context
+            )
+            restored_id = self._resolve_existing_state(
+                restored, destination, identity.key_for(restored)
+            )
+            if restored_id == source.id:
+                await self._upsert_transition(
+                    destination,
+                    source,
+                    capability_id=f"history:{source.id}",
+                    action_type="browser_back",
+                    label=f"Back to {source.display_label or f's{source.index}'}",
+                    selector=f"history:{source.id}",
+                    element_text=None,
+                    confidence=1.0,
+                    collapsed_count=1,
+                    via="performed",
+                    surface_item_id=None,
+                    transition_kind="back",
+                    scope="local",
+                    reversible=True,
+                    evidence={
+                        "mode": "performed",
+                        "mechanism": "browser_history",
+                        "expected_state_id": source.id,
+                        "restored_state_id": restored_id,
+                        "validated": True,
+                    },
+                )
+        except PlaywrightError:
+            restored_id = None
+        finally:
+            if not went_back:
+                self._current_state_id = destination.id
+            else:
+                try:
+                    await page.go_forward(
+                        wait_until="domcontentloaded",
+                        timeout=self._config.exploration.action_timeout_ms,
+                    )
+                    await stabilize(page, self._config.browser.stabilize_quiet_ms)
+                    forward = await observe_page(
+                        page, self._config, auth_context=self._auth_context
+                    )
+                    forward_id = self._resolve_existing_state(
+                        forward, source, identity.key_for(forward)
+                    )
+                    self._current_state_id = (
+                        destination.id if forward_id == destination.id else None
+                    )
+                except PlaywrightError:
+                    self._current_state_id = None
+                if self._current_state_id != destination.id:
+                    await self._ensure_at(page, destination)
+
     async def _absorb_popups(self, page: Page) -> None:
         """Close any popup/new-tab pages; follow same-origin targets in the
         main page so the action's effect is still observed."""
@@ -1264,6 +1642,178 @@ class Explorer:
     # Persistence
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _transition_kind(
+        source: StateMeta, destination: StateMeta, item: Interactable
+    ) -> str:
+        label = item.label.strip().lower()
+        if item.kind == "tab" or item.role == "tab":
+            return "tab"
+        if re.search(r"\b(cancel|dismiss)\b", label):
+            return "cancel"
+        if re.search(r"\b(close|back|return|previous)\b", label):
+            if "back" in label:
+                return "back"
+            if "previous" in label:
+                return "return"
+            return "close"
+        if item.kind == "disclosure":
+            return "close" if source.state_type == StateType.DROPDOWN else "open"
+        if destination.state_type in {StateType.MODAL, StateType.DROPDOWN}:
+            return "open"
+        if item.href or item.kind in {"link", "menuitem"}:
+            return "link"
+        return "control"
+
+    async def _upsert_transition(
+        self,
+        source: StateMeta,
+        destination: StateMeta,
+        *,
+        capability_id: str,
+        action_type: str,
+        label: str,
+        selector: str,
+        element_text: str | None,
+        confidence: float,
+        collapsed_count: int,
+        via: str,
+        surface_item_id: str | None,
+        transition_kind: str,
+        scope: str,
+        reversible: bool,
+        evidence: dict,
+    ) -> None:
+        transition_key = self._stable_hash(
+            source.id,
+            transition_kind,
+            capability_id,
+            length=40,
+        )
+        edge_id = self._stable_hash(self._run_id, transition_key, length=32)
+        previous = self._edge_records.get(edge_id)
+        created = previous is None
+        previous_via = previous.get("via") if previous else None
+        provenance = list(previous.get("provenance", [])) if previous else []
+        provenance_value = "performed" if via in {"performed", "user_auth"} else via
+        if provenance_value not in provenance:
+            provenance.append(provenance_value)
+        strongest_via = (
+            "user_auth"
+            if via == "user_auth" or previous_via == "user_auth"
+            else "performed"
+            if "performed" in provenance
+            else "inferred"
+        )
+        evidence_rows = list(previous.get("evidence", [])) if previous else []
+        if evidence not in evidence_rows:
+            evidence_rows.append(evidence)
+        effective_scope = (
+            "global_navigation"
+            if scope == "global_navigation"
+            or (previous and previous.get("scope") == "global_navigation")
+            else "local"
+        )
+        effective_reversible = reversible or bool(previous and previous.get("reversible"))
+        # Prefer the performed action's purpose-aware label over its earlier
+        # inferred placeholder, but never downgrade a performed record.
+        effective_label = (
+            previous.get("label", label)
+            if via == "inferred" and previous_via in {"performed", "user_auth"}
+            else label
+        )
+        record = {
+            "id": edge_id,
+            "transition_key": transition_key,
+            "from": source.id,
+            "to": destination.id,
+            "action": action_type,
+            "label": effective_label,
+            "selector": selector,
+            "element_text": element_text,
+            "confidence": max(confidence, float(previous.get("confidence", 0)) if previous else 0),
+            "collapsed_count": max(
+                collapsed_count, int(previous.get("collapsed_count", 1)) if previous else 1
+            ),
+            "via": strongest_via,
+            "surface_item_id": surface_item_id,
+            "transition_kind": transition_kind,
+            "scope": effective_scope,
+            "reversible": effective_reversible,
+            "provenance": provenance,
+            "evidence": evidence_rows,
+        }
+        self._edge_records[edge_id] = record
+
+        async with self._sessions() as session:
+            row = await session.get(db.Edge, edge_id)
+            if row is None:
+                row = db.Edge(
+                    id=edge_id,
+                    run_id=self._run_id,
+                    from_state_id=source.id,
+                    to_state_id=destination.id,
+                    action_type=action_type,
+                    label=effective_label,
+                    selector=selector,
+                    selector_strategy="css",
+                )
+                session.add(row)
+            row.label = effective_label
+            row.from_state_id = source.id
+            row.to_state_id = destination.id
+            row.action_type = action_type
+            row.element_text = element_text
+            row.confidence = record["confidence"]
+            row.collapsed_count = record["collapsed_count"]
+            row.via = strongest_via
+            row.surface_item_id = surface_item_id
+            row.transition_key = transition_key
+            row.transition_kind = transition_kind
+            row.scope = effective_scope
+            row.reversible = effective_reversible
+            row.provenance = provenance
+            row.evidence = evidence_rows
+            await session.commit()
+
+        if created:
+            self._stats["edges"] += 1
+            if strongest_via == "inferred":
+                self._stats["inferred_edges"] += 1
+            if effective_scope == "global_navigation":
+                self._stats["global_navigation_edges"] += 1
+            if effective_reversible:
+                self._stats["reversible_edges"] += 1
+        else:
+            if previous_via == "inferred" and strongest_via != "inferred":
+                self._stats["inferred_edges"] = max(
+                    0, self._stats["inferred_edges"] - 1
+                )
+            if (
+                previous.get("scope") != "global_navigation"
+                and effective_scope == "global_navigation"
+            ):
+                self._stats["global_navigation_edges"] += 1
+            if not previous.get("reversible") and effective_reversible:
+                self._stats["reversible_edges"] += 1
+
+        self._emit(
+            ExplorerEvent(
+                EventType.EDGE_DISCOVERED,
+                f"s{source.index} -> s{destination.index}: {effective_label}",
+                {
+                    "edge_id": edge_id,
+                    "operation": "created" if created else "updated",
+                    "from": source.id,
+                    "to": destination.id,
+                    "from_index": source.index,
+                    "to_index": destination.index,
+                    **record,
+                    "counters": self._counters(),
+                },
+            )
+        )
+
     async def _add_edge(
         self,
         source: StateMeta,
@@ -1271,6 +1821,7 @@ class Explorer:
         candidate: ActionCandidate,
         *,
         via: str = "performed",
+        capability: TransitionCapability | None = None,
     ) -> None:
         item = candidate.interactable
         if via == "inferred":
@@ -1283,47 +1834,44 @@ class Explorer:
             label = f"Activate {item.label}"
         if candidate.collapsed_count > 1:
             label += f" (1 of {candidate.collapsed_count} similar)"
-
-        edge_id = uuid.uuid4().hex
-        async with self._sessions() as session:
-            session.add(
-                db.Edge(
-                    id=edge_id,
-                    run_id=self._run_id,
-                    from_state_id=source.id,
-                    to_state_id=destination.id,
-                    action_type="click",
-                    label=label,
-                    selector=item.selector,
-                    selector_strategy="css",
-                    element_text=item.text,
-                    confidence=max(0.0, min(1.0, candidate.score / 100.0)),
-                    collapsed_count=candidate.collapsed_count,
-                    via=via,
-                    surface_item_id=item.item_id or None,
-                )
-            )
-            await session.commit()
-
-        self._stats["edges"] += 1
-        self._emit(
-            ExplorerEvent(
-                EventType.EDGE_DISCOVERED,
-                f"s{source.index} -> s{destination.index}: {label}",
-                {
-                    "edge_id": edge_id,
-                    "from": source.id,
-                    "to": destination.id,
-                    "from_index": source.index,
-                    "to_index": destination.index,
-                    "action": "click",
-                    "label": label,
-                    "selector": item.selector,
-                    "via": via,
-                    "surface_item_id": item.item_id or None,
-                    "counters": self._counters(),
-                },
-            )
+        capability = capability or self._capability_for(source, item)
+        capability_id = (
+            capability.capability_id
+            if capability is not None
+            else self._capability_id(source, item)
+        )
+        transition_kind = self._transition_kind(source, destination, item)
+        reversible = transition_kind in {"close", "cancel", "back", "return"}
+        scope = (
+            "global_navigation"
+            if capability is not None and self._is_global_capability(capability)
+            else "local"
+        )
+        await self._upsert_transition(
+            source,
+            destination,
+            capability_id=capability_id,
+            action_type="click",
+            label=label,
+            selector=item.selector,
+            element_text=item.text,
+            confidence=max(0.0, min(1.0, candidate.score / 100.0)),
+            collapsed_count=candidate.collapsed_count,
+            via=via,
+            surface_item_id=item.item_id or None,
+            transition_kind=transition_kind,
+            scope=scope,
+            reversible=reversible,
+            evidence={
+                "mode": via,
+                "surface_item_id": item.item_id or None,
+                "selector": item.selector,
+                "href": item.href,
+                "region": item.region,
+                "control_key": self._control_key(item),
+                "container_key": item.container_key,
+                "validated": via == "performed",
+            },
         )
 
     def _final_status(self, meta: StateMeta, item: Interactable) -> str:

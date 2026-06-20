@@ -200,6 +200,31 @@ describe("GraphView viewport lifecycle", () => {
     );
   });
 
+  it("clears node selection when the pane is clicked or Escape is pressed", () => {
+    const onSelect = vi.fn<(id: string | null) => void>();
+    const view = render(
+      <GraphView
+        {...graphProps({ a: state("a", 0) }, {}, { selectedId: "a", onSelect })}
+      />,
+    );
+    act(() => vi.runAllTimers());
+
+    act(() => {
+      (flowMock.latestProps?.onPaneClick as () => void)();
+    });
+    expect(onSelect).toHaveBeenLastCalledWith(null);
+
+    view.rerender(
+      <GraphView
+        {...graphProps({ a: state("a", 0) }, {}, { selectedId: "a", onSelect })}
+      />,
+    );
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    expect(onSelect).toHaveBeenLastCalledWith(null);
+  });
+
   it("shows only Fit graph after the run finishes", () => {
     render(<GraphView {...graphProps({ a: state("a", 0) })} isLive={false} />);
     expect(screen.getByRole("button", { name: "Fit graph" })).toBeInTheDocument();

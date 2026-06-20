@@ -169,6 +169,7 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
       ...(p.page_role ? { page_role: p.page_role } : {}),
       ...(typeof p.page_depth === "number" ? { page_depth: p.page_depth } : {}),
       ...(typeof p.substate_depth === "number" ? { substate_depth: p.substate_depth } : {}),
+      ...(p.return_state_id ? { return_state_id: p.return_state_id } : {}),
       ...(p.name ? { name: p.name } : {}),
       ...(p.family ? { family: p.family } : {}),
     },
@@ -230,14 +231,20 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
         action: p.action,
         label: p.label,
         selector: p.selector,
-        element_text: null,
-        confidence: 0,
-        collapsed_count: 1,
+        element_text: p.element_text ?? null,
+        confidence: p.confidence ?? 0,
+        collapsed_count: p.collapsed_count ?? 1,
         via: p.via,
         surface_item_id: p.surface_item_id ?? null,
+        transition_key: p.transition_key,
+        transition_kind: p.transition_kind as GraphEdge["transition_kind"],
+        scope: p.scope,
+        reversible: p.reversible ?? false,
+        provenance: p.provenance ?? [p.via],
+        evidence: p.evidence ?? [],
       };
       const existing = edges[p.edge_id];
-      edges = { ...edges, [p.edge_id]: existing ? { ...sseEdge, ...existing } : sseEdge };
+      edges = { ...edges, [p.edge_id]: existing ? { ...existing, ...sseEdge } : sseEdge };
       break;
     }
     case "action_started": {

@@ -79,7 +79,10 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert checkout["flags"]["payment_required"] is True
     denied_categories = {d["category"] for d in checkout["flags"]["denied_actions"]}
     assert "payment" in denied_categories
-    assert all(e["from"] != checkout["id"] for e in edges)  # no out-edges
+    checkout_out = [e for e in edges if e["from"] == checkout["id"]]
+    assert checkout_out
+    assert all(e["transition_kind"] == "back" for e in checkout_out)
+    assert all(e["reversible"] for e in checkout_out)
 
     # --- dead end detected ---
     dead_ends = [s for s in states if s["type"] == "dead_end"]
@@ -103,6 +106,64 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert inferred, "expected at least one inferred (no-click) edge"
     assert all(e["from"] in by_id and e["to"] in by_id for e in inferred)
     assert all(e["via"] in {"performed", "inferred"} for e in edges)
+
+    # --- cyclic state-machine semantics: persistent navbar capabilities are
+    # reconciled after their destinations become known, not just when clicked.
+    home = root
+    pricing = next(s for s in states if s["url_normalized"].endswith("pricing.html"))
+    docs = next(s for s in states if s["url_normalized"].endswith("docs.html"))
+    global_pairs = {
+        (e["from"], e["to"])
+        for e in edges
+        if e["scope"] == "global_navigation"
+    }
+    for source in (home, pricing, docs):
+        for destination in (home, pricing, docs):
+            if source["id"] != destination["id"]:
+                assert (source["id"], destination["id"]) in global_pairs
+
+    # The home -> Docs control is inferred when Docs is registered and then
+    # upgraded in place when its original pending action executes.
+    home_docs = [
+        e
+        for e in edges
+        if e["from"] == home["id"]
+        and e["to"] == docs["id"]
+        and e["surface_item_id"]
+        and "Docs" in e["label"]
+    ]
+    assert len(home_docs) == 1
+    assert set(home_docs[0]["provenance"]) == {"inferred", "performed"}
+
+    # Browser back edges exist only as validated restoration evidence.
+    history_edges = [e for e in edges if e["transition_kind"] == "back"]
+    assert history_edges
+    assert all(e["reversible"] for e in history_edges)
+    assert all(
+        any(ev.get("mechanism") != "browser_history" or ev.get("validated") is True
+            for ev in e["evidence"])
+        for e in history_edges
+    )
+
+    # Tabs expose both directions because both controls are visible in each
+    # captured state; neither direction creates another canonical page.
+    tab_state = next(
+        s for s in states
+        if s["type"] == "tab" and "Integrations" in (s["label"] or s["title"])
+    )
+    assert any(
+        e["from"] == home["id"] and e["to"] == tab_state["id"]
+        and e["transition_kind"] == "tab"
+        for e in edges
+    )
+    assert any(
+        e["from"] == tab_state["id"] and e["to"] == home["id"]
+        and e["transition_kind"] == "tab"
+        for e in edges
+    )
+
+    # Stable semantic keys prevent duplicate inferred/performed rows.
+    assert len({e["transition_key"] for e in edges}) == len(edges)
 
     # --- same-URL sub-states hang off their parent page ---
     for modal in modal_states:
@@ -349,3 +410,62 @@ def test_same_url_substate_skips_url_dedup():
     )
     key = key_for(observation)
     assert explorer._resolve_existing_state(observation, source, key) is None
+
+
+async def test_browser_back_mismatch_does_not_create_reverse_edge(monkeypatch):
+    """A history movement is evidence only when it restores the expected node."""
+    from engine.explorer import Explorer, StateMeta
+    from engine.schemas import AuthContext, RunConfig, StateType
+
+    explorer = Explorer(Settings(), RunConfig())
+    explorer._root_url = "https://app.test/"
+    explorer._auth_context = AuthContext.GUEST
+    explorer._validated_history = set()
+    explorer._edge_records = {}
+    explorer._stats = {"restoration_checks": 0}
+    explorer._current_state_id = "destination"
+    source = StateMeta(
+        id="source",
+        index=0,
+        url="https://app.test/source",
+        url_normalized="https://app.test/source",
+        depth=0,
+        path=[],
+        state_type=StateType.PAGE,
+    )
+    destination = StateMeta(
+        id="destination",
+        index=1,
+        url="https://app.test/destination",
+        url_normalized="https://app.test/destination",
+        depth=1,
+        path=[],
+        state_type=StateType.PAGE,
+    )
+
+    class FakePage:
+        async def go_back(self, **_kwargs):
+            return None
+
+        async def go_forward(self, **_kwargs):
+            return None
+
+    async def fake_observe(*_args, **_kwargs):
+        return object()
+
+    async def fake_stabilize(*_args, **_kwargs):
+        return None
+
+    async def fake_ensure(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr("engine.explorer.observe_page", fake_observe)
+    monkeypatch.setattr("engine.explorer.stabilize", fake_stabilize)
+    monkeypatch.setattr("engine.explorer.identity.key_for", lambda _observation: object())
+    monkeypatch.setattr(explorer, "_resolve_existing_state", lambda *_args: "unexpected")
+    monkeypatch.setattr(explorer, "_ensure_at", fake_ensure)
+
+    await explorer._validate_browser_back(FakePage(), source, destination)
+
+    assert explorer._stats["restoration_checks"] == 1
+    assert explorer._edge_records == {}

@@ -52,6 +52,10 @@ export interface SurfaceItem {
   in_nav?: boolean;
   in_form?: boolean;
   in_modal?: boolean;
+  aria_selected?: boolean | null;
+  aria_expanded?: boolean | null;
+  control_key?: string;
+  container_key?: string | null;
 }
 
 export interface ExplorationSummary {
@@ -70,6 +74,7 @@ export interface ExplorationSummary {
   substate_depth?: number;
   name?: NameMetadata;
   family?: FamilyMetadata;
+  return_state_id?: string;
 }
 
 export interface NameMetadata {
@@ -127,6 +132,26 @@ export interface GraphEdge {
   collapsed_count: number;
   via?: string;
   surface_item_id?: string | null;
+  transition_key?: string;
+  transition_kind?: "link" | "tab" | "open" | "close" | "cancel" | "back" | "return" | "auth" | "control";
+  scope?: "local" | "global_navigation";
+  reversible?: boolean;
+  provenance?: string[];
+  evidence?: TransitionEvidence[];
+}
+
+export interface TransitionEvidence {
+  mode: string;
+  surface_item_id?: string | null;
+  selector?: string;
+  href?: string | null;
+  region?: string | null;
+  control_key?: string;
+  container_key?: string | null;
+  mechanism?: string;
+  expected_state_id?: string;
+  restored_state_id?: string | null;
+  validated?: boolean;
 }
 
 export interface RunInfo {

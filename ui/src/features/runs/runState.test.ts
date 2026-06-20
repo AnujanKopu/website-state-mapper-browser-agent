@@ -236,4 +236,51 @@ describe("runReducer", () => {
       "https://example.com/game/:id/:param",
     );
   });
+
+  it("upgrades an inferred edge in place and converges with terminal hydration", () => {
+    const inferred = event(1, "edge_discovered", {
+      edge_id: "edge-stable",
+      operation: "created",
+      from: "a",
+      to: "b",
+      from_index: 0,
+      to_index: 1,
+      action: "click",
+      label: "Open Pricing",
+      selector: "#pricing",
+      via: "inferred",
+      transition_key: "transition-stable",
+      transition_kind: "link",
+      scope: "global_navigation",
+      reversible: false,
+      provenance: ["inferred"],
+      evidence: [{ mode: "inferred", validated: false }],
+    });
+    const performed = event(2, "edge_discovered", {
+      ...inferred.payload,
+      operation: "updated",
+      via: "performed",
+      provenance: ["inferred", "performed"],
+      evidence: [
+        { mode: "inferred", validated: false },
+        { mode: "performed", validated: true },
+      ],
+    });
+
+    const live = runReducer(
+      runReducer(resetState(), { type: "sse", envelope: inferred }),
+      { type: "sse", envelope: performed },
+    );
+    expect(Object.keys(live.edges)).toEqual(["edge-stable"]);
+    expect(live.edges["edge-stable"].via).toBe("performed");
+    expect(live.edges["edge-stable"].provenance).toEqual(["inferred", "performed"]);
+
+    const authoritative: GraphDocument = {
+      ...graph([graphState("a", 0), graphState("b", 1)], { status: "done" }),
+      edges: [live.edges["edge-stable"]],
+    };
+    const hydrated = runReducer(live, { type: "hydrate", graph: authoritative });
+    expect(hydrated.edges).toEqual(live.edges);
+    expect(Object.keys(hydrated.edges)).toHaveLength(1);
+  });
 });
