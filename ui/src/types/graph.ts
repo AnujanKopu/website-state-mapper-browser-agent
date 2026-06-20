@@ -64,6 +64,34 @@ export interface ExplorationSummary {
   route_family?: string;
   family_sampled?: number;
   family_skipped?: number;
+  auth_context?: "guest" | "authenticated" | "unknown";
+  page_role?: "home" | "hub" | "detail" | "results" | "flow_step" | "boundary";
+  page_depth?: number;
+  substate_depth?: number;
+  name?: NameMetadata;
+  family?: FamilyMetadata;
+}
+
+export interface NameMetadata {
+  text: string;
+  source: "heuristic" | "llm" | "user";
+  confidence: number;
+  key: string;
+}
+
+export interface FamilyMetadata {
+  id: string;
+  label: string;
+  kind: string;
+  pattern: string;
+  label_source: string;
+  confidence: number;
+  discovered_count: number;
+  checked_count?: number;
+  represented_count?: number;
+  skipped_count?: number;
+  sample_labels?: string[];
+  sample_urls?: string[];
 }
 
 export interface GraphState {
@@ -136,6 +164,8 @@ export interface RunStatusResponse {
 
 export interface CreateRunInput {
   url: string;
+  auth_mode?: "guest" | "login";
+  credentials?: { username: string; password: string };
   max_states?: number;
   max_actions?: number;
   max_depth?: number;

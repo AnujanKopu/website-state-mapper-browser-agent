@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from PIL import Image
 
-from engine.schemas import Interactable, Observation
+from engine.schemas import AuthContext, Interactable, Observation
 
 # --------------------------------------------------------------------------
 # URL normalization
@@ -205,6 +205,7 @@ class StateKey:
     action_sig: str
     text_simhash: int
     screenshot_dhash: int
+    auth_context: AuthContext = AuthContext.UNKNOWN
 
 
 def key_for(observation: Observation) -> StateKey:
@@ -215,6 +216,7 @@ def key_for(observation: Observation) -> StateKey:
         action_sig=observation.action_sig,
         text_simhash=observation.text_simhash,
         screenshot_dhash=observation.screenshot_dhash,
+        auth_context=observation.auth_context,
     )
 
 
@@ -228,10 +230,14 @@ class IdentityIndex:
               (absorbs structural noise that text/pixels say is the same state)
     """
 
-    _buckets: dict[tuple[str, bool], list[tuple[StateKey, str]]] = field(default_factory=dict)
+    _buckets: dict[tuple[str, bool, AuthContext], list[tuple[StateKey, str]]] = field(
+        default_factory=dict
+    )
 
     def find(self, key: StateKey) -> str | None:
-        bucket = self._buckets.get((key.url_normalized, key.modal_open), [])
+        bucket = self._buckets.get(
+            (key.url_normalized, key.modal_open, key.auth_context), []
+        )
         for known, state_id in bucket:
             if known.action_sig != key.action_sig:
                 continue
@@ -246,4 +252,6 @@ class IdentityIndex:
         return None
 
     def add(self, key: StateKey, state_id: str) -> None:
-        self._buckets.setdefault((key.url_normalized, key.modal_open), []).append((key, state_id))
+        self._buckets.setdefault(
+            (key.url_normalized, key.modal_open, key.auth_context), []
+        ).append((key, state_id))

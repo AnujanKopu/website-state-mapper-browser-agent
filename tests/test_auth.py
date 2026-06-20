@@ -249,9 +249,8 @@ async def test_auth_gate_hook_skip_no_post_auth(settings: Settings):
 # ---------------------------------------------------------------------------
 
 
-async def test_auth_wall_fixture_skip(settings: Settings):
-    """Exploring login.html with skip: graph must contain one AUTH_WALL state
-    with no out-edges, and the auth_gate event must appear in history."""
+async def test_guest_mode_maps_auth_wall_without_pausing(settings: Settings):
+    """Guest exploration records a login boundary without prompting."""
     gate_events: list[ExplorerEvent] = []
     all_events: list[ExplorerEvent] = []
 
@@ -293,10 +292,7 @@ async def test_auth_wall_fixture_skip(settings: Settings):
     out_edges = [e for e in edges if e["from"] in auth_ids]
     assert not out_edges, "Skipped auth_wall must have no out-edges"
 
-    # AUTH_GATE event was emitted.
-    assert gate_events, "Expected auth_gate events"
-    gate_payload = gate_events[0].data
-    assert gate_payload["state_id"] in auth_ids
+    assert not gate_events, "guest mode must never pause at an auth gate"
 
 
 # ---------------------------------------------------------------------------

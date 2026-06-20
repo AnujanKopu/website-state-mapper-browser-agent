@@ -20,6 +20,32 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class AuthMode(StrEnum):
+    """How a run should treat authentication boundaries."""
+
+    GUEST = "guest"
+    LOGIN = "login"
+
+
+class AuthContext(StrEnum):
+    """Session context that participates in state identity."""
+
+    GUEST = "guest"
+    AUTHENTICATED = "authenticated"
+    UNKNOWN = "unknown"
+
+
+class PageRole(StrEnum):
+    """Organizational role of an observed state, separate from StateType."""
+
+    HOME = "home"
+    HUB = "hub"
+    DETAIL = "detail"
+    RESULTS = "results"
+    FLOW_STEP = "flow_step"
+    BOUNDARY = "boundary"
+
+
 class StateType(StrEnum):
     """Classification of a captured state."""
 
@@ -90,6 +116,15 @@ class ExplorationConfig(StrictModel):
     # archives and card grids can't dominate the graph; further siblings fold
     # into the family representative as skipped surface items + inferred edges.
     url_family_cap: int = 3
+    # Login mode may inspect a few header/menu controls to reveal a hidden
+    # authentication entry before general exploration starts.
+    auth_discovery_action_cap: int = 6
+    # Same-URL interactions do not consume page depth, but remain bounded.
+    max_substate_depth: int = 2
+
+
+class AuthenticationConfig(StrictModel):
+    mode: AuthMode = AuthMode.GUEST
 
 
 class RunConfig(StrictModel):
@@ -97,6 +132,7 @@ class RunConfig(StrictModel):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
     exploration: ExplorationConfig = Field(default_factory=ExplorationConfig)
+    authentication: AuthenticationConfig = Field(default_factory=AuthenticationConfig)
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +171,9 @@ class Interactable(BaseModel):
     role: str | None = None
     text: str | None = None
     aria_label: str | None = None
+    title: str | None = None
+    test_id: str | None = None
+    context_label: str | None = None
     href: str | None = None
     bounding_box: BoundingBox
     page_box: BoundingBox | None = None
@@ -152,7 +191,14 @@ class Interactable(BaseModel):
     @property
     def label(self) -> str:
         """Best human-readable name for this element."""
-        return self.text or self.aria_label or self.href or f"<{self.tag}>"
+        if self.text or self.aria_label or self.title:
+            return self.text or self.aria_label or self.title or ""
+        if self.context_label:
+            verb = "Open" if self.kind in {"button", "menuitem", "disclosure"} else "View"
+            return f"{verb} {self.context_label}"
+        if self.test_id:
+            return self.test_id.replace("-", " ").replace("_", " ").strip().title()
+        return self.href or f"Unlabelled {self.tag}"
 
 
 class PageSignals(BaseModel):
@@ -160,6 +206,7 @@ class PageSignals(BaseModel):
 
     modal_open: bool = False
     password_fields: int = 0
+    username_fields: int = 0
     payment_fields: int = 0
     form_count: int = 0
 
@@ -192,6 +239,7 @@ class Observation(BaseModel):
     action_sig: str
     screenshot_dhash: int
     fingerprint: str
+    auth_context: AuthContext = AuthContext.UNKNOWN
 
 
 class Credentials(BaseModel):

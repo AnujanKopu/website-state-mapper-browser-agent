@@ -35,10 +35,33 @@ describe("LandingForm", () => {
     await waitFor(() => expect(onStarted).toHaveBeenCalledWith("run-42"));
     expect(mocks.createRun).toHaveBeenCalledWith({
       url: "https://example.com",
+      auth_mode: "guest",
       save_dom_snapshots: false,
       max_states: 12,
       max_actions: 24,
       max_depth: 2,
+    });
+  });
+
+  it("sends credentials only for an explicit login run", async () => {
+    mocks.createRun.mockResolvedValue({ run_id: "auth-run" });
+    render(<LandingForm onStarted={vi.fn()} />);
+    fireEvent.change(screen.getByPlaceholderText("https://example.com"), {
+      target: { value: "https://example.com" },
+    });
+    fireEvent.click(screen.getByLabelText("With login"));
+    fireEvent.change(screen.getByLabelText("Username or email"), {
+      target: { value: "person@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start mapping" }));
+
+    await waitFor(() => expect(mocks.createRun).toHaveBeenCalled());
+    expect(mocks.createRun).toHaveBeenCalledWith({
+      url: "https://example.com",
+      auth_mode: "login",
+      credentials: { username: "person@example.com", password: "secret" },
+      save_dom_snapshots: false,
     });
   });
 });

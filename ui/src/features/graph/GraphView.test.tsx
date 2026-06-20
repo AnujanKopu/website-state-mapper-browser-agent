@@ -110,12 +110,12 @@ describe("GraphView viewport lifecycle", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Waiting for the first state");
 
     view.rerender(<GraphView {...graphProps({ a: state("a", 0) })} />);
-    act(() => vi.advanceTimersByTime(149));
+    act(() => vi.advanceTimersByTime(299));
     expect(renderedNodes()).toHaveLength(0);
 
     act(() => vi.advanceTimersByTime(1));
     expect(renderedNodes()).toHaveLength(1);
-    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBeUndefined();
+    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBe(true);
     act(() => vi.runAllTimers());
     expect(flowMock.fitView).toHaveBeenCalledTimes(1);
     expect(flowMock.fitView).toHaveBeenLastCalledWith({ duration: 0, padding: 0.18 });
@@ -189,7 +189,7 @@ describe("GraphView viewport lifecycle", () => {
     expect(flowMock.fitView).toHaveBeenCalledWith({ duration: 0, padding: 0.18 });
   });
 
-  it("renders a non-interactive family container behind structural variants", () => {
+  it("renders an interactive family container behind structural variants", () => {
     const routeFamily = "https://example.com/game/:id/:param";
     render(
       <GraphView
@@ -205,7 +205,7 @@ describe("GraphView viewport lifecycle", () => {
     expect(nodes).toHaveLength(3);
     const family = nodes.find((node) => node.type === "family");
     expect(family).toMatchObject({
-      selectable: false,
+      selectable: true,
       draggable: false,
       connectable: false,
       zIndex: 0,

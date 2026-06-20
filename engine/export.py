@@ -35,7 +35,7 @@ def _visible_ctas(interactables: list[dict]) -> list[str]:
     ctas = []
     for item in interactables:
         if item.get("tag") in _CTA_TAGS:
-            label = item.get("text") or item.get("aria_label")
+            label = item.get("text") or item.get("aria_label") or item.get("title")
             if label:
                 ctas.append(label)
         if len(ctas) >= _MAX_CTAS:
@@ -47,6 +47,9 @@ def _label_of(item: dict) -> str:
     return (
         item.get("text")
         or item.get("aria_label")
+        or item.get("title")
+        or item.get("context_label")
+        or item.get("test_id")
         or item.get("href")
         or f"<{item.get('tag', '?')}>"
     )

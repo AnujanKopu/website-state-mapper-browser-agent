@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from engine.schemas import AuthMode
 
 _HAS_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
 
@@ -27,6 +29,7 @@ class CreateRunRequest(BaseModel):
     max_wall_seconds: int | None = Field(default=None, ge=1)
     save_dom_snapshots: bool | None = None
     credentials: CredentialsRequest | None = None
+    auth_mode: AuthMode = AuthMode.GUEST
 
     @field_validator("url")
     @classmethod
@@ -36,6 +39,12 @@ class CreateRunRequest(BaseModel):
             raise ValueError("url must not be empty")
         # Bare hosts (example.com) default to https; explicit schemes pass through.
         return value if _HAS_SCHEME.match(value) else f"https://{value}"
+
+    @model_validator(mode="after")
+    def _credentials_require_login_mode(self):
+        if self.credentials is not None and self.auth_mode != AuthMode.LOGIN:
+            raise ValueError("credentials require auth_mode='login'")
+        return self
 
     def overrides(self) -> dict:
         return self.model_dump(exclude={"url", "credentials"}, exclude_none=True)

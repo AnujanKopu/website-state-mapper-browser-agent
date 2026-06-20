@@ -210,6 +210,14 @@ class TestIdentityIndex:
         index.add(_key(), "s1")
         assert index.find(_key(url_normalized="https://a.com/other")) is None
 
+    def test_auth_context_separates_same_structural_page(self):
+        from engine.schemas import AuthContext
+
+        index = IdentityIndex()
+        index.add(_key(auth_context=AuthContext.GUEST), "guest-home")
+        assert index.find(_key(auth_context=AuthContext.AUTHENTICATED)) is None
+        assert index.find(_key(auth_context=AuthContext.GUEST)) == "guest-home"
+
     def test_fuzzy_rejected_when_text_too_far(self):
         index = IdentityIndex()
         index.add(_key(), "s1")

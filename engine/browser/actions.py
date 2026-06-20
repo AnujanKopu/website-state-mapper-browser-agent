@@ -10,6 +10,7 @@ affordances are discovered too, each tagged with the fold they appeared at.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from urllib.parse import urljoin
 
@@ -94,6 +95,18 @@ _DISCOVER_JS = """
     return trimmed.length > n ? trimmed.slice(0, n) : trimmed;
   };
 
+  const contextLabelOf = (el) => {
+    const owner = el.closest('section, article, li, [role="region"], [data-testid]');
+    if (!owner) return null;
+    const heading = owner.querySelector('h1, h2, h3, [role="heading"]');
+    return truncate(
+      (heading && heading.innerText)
+        || owner.getAttribute('aria-label')
+        || owner.getAttribute('data-testid'),
+      80,
+    );
+  };
+
   const regionOf = (el) => {
     if (el.closest('[role="dialog"], dialog, [aria-modal="true"]')) return 'modal';
     if (el.closest('nav, [role="navigation"]')) return 'nav';
@@ -170,6 +183,9 @@ _DISCOVER_JS = """
       role,
       text: truncate(el.innerText || el.value, 120),
       aria_label: truncate(el.getAttribute('aria-label'), 120),
+      title: truncate(el.getAttribute('title'), 120),
+      test_id: truncate(el.getAttribute('data-testid'), 120),
+      context_label: contextLabelOf(el),
       href,
       in_nav: !!el.closest('nav, header, [role="navigation"]'),
       in_form: !!el.closest('form'),
@@ -211,6 +227,9 @@ def _build_interactable(raw: dict, fold: int) -> Interactable:
         role=raw["role"],
         text=raw["text"],
         aria_label=raw["aria_label"],
+        title=raw.get("title"),
+        test_id=raw.get("test_id"),
+        context_label=raw.get("context_label"),
         href=raw["href"],
         in_nav=raw["in_nav"],
         in_form=raw["in_form"],
@@ -301,8 +320,8 @@ async def click_interactable(
                 pass  # fall through to locator strategies
 
     locator = page.locator(item.selector).first
-    await locator.scroll_into_view_if_needed(timeout=timeout_ms)
     try:
+        await locator.scroll_into_view_if_needed(timeout=timeout_ms)
         await locator.click(timeout=timeout_ms)
         return
     except PlaywrightError:
@@ -319,6 +338,43 @@ async def click_interactable(
                 continue
 
     await locator.click(timeout=timeout_ms, force=True)
+
+
+async def validate_interactable(page: Page, item: Interactable) -> bool:
+    """Cheaply reject selectors that now point at a different control."""
+    # Same-origin anchors are executed by URL first, deliberately avoiding
+    # generated selectors that often change after hydration.
+    if item.tag == "a" and item.href and not item.href.startswith("#"):
+        return True
+    try:
+        locator = page.locator(item.selector)
+        if await locator.count() < 1:
+            label = item.text or item.aria_label or item.title
+            role = item.role or ("link" if item.tag == "a" else "button")
+            if label:
+                return await page.get_by_role(role, name=label, exact=False).count() == 1
+            return False
+        current = locator.first
+        if item.href:
+            href = await current.get_attribute("href")
+            if href and urljoin(page.url, href) != urljoin(page.url, item.href):
+                return False
+        expected = (item.text or item.aria_label or item.title or "").strip().lower()
+        if expected:
+            current_text = ""
+            with contextlib.suppress(PlaywrightError):
+                current_text = (await current.inner_text(timeout=500)).strip().lower()
+            if not current_text:
+                current_text = (
+                    (await current.get_attribute("aria-label"))
+                    or (await current.get_attribute("title"))
+                    or ""
+                ).strip().lower()
+            if current_text and expected not in current_text and current_text not in expected:
+                return False
+        return True
+    except PlaywrightError:
+        return False
 
 
 async def click_selector(page: Page, selector: str, *, timeout_ms: int) -> None:

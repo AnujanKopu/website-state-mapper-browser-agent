@@ -28,9 +28,9 @@ export function StateNodeView({ data, selected }: NodeProps<StateFlowNode>) {
         </span>
         {indexLabel && <span className="state-node__index">{indexLabel}</span>}
       </div>
-      <div className="state-node__title">{truncate(state.title || state.url_normalized, 40)}</div>
+      <div className="state-node__title">{truncate(state.label || state.title || state.url_normalized, 40)}</div>
       <div className="state-node__meta">
-        depth {state.depth}
+        {state.exploration?.page_role ?? "state"} · depth {state.exploration?.page_depth ?? state.depth}
         {state.parent_state_id ? ` \u00b7 \u21B3 sub` : ""}
       </div>
       <Handle type="source" position={Position.Right} className="state-node__handle" />

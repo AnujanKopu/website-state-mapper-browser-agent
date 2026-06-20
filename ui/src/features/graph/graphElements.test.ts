@@ -79,7 +79,7 @@ describe("graph element derivation", () => {
     const topology = createGraphTopology({ a: state("a", 0), b: state("b", 1) }, edges);
     const layout = layoutTopology(topology);
     const positions = layout.nodePositions;
-    const flowEdges = buildFlowEdges(topology, edges);
+    const flowEdges = buildFlowEdges(topology, edges, "bundle:a>b");
 
     expect(NODE_WIDTH).toBe(210);
     expect(NODE_HEIGHT).toBe(78);
@@ -132,5 +132,22 @@ describe("graph element derivation", () => {
     const topology = createGraphTopology({ lone, substate }, {});
     expect(topology.families).toEqual([]);
     expect(layoutTopology(topology).familyBoxes).toEqual([]);
+  });
+
+  it("boxes one retained representative when a repeated cohort was discovered", () => {
+    const representative = state("game", 1);
+    representative.exploration = {
+      route_family: "https://example.com/game/:id/:param",
+      family: {
+        id: "games",
+        label: "Games",
+        kind: "game",
+        pattern: "https://example.com/game/:id/:param",
+        label_source: "heuristic",
+        confidence: 0.9,
+        discovered_count: 10,
+      },
+    };
+    expect(createGraphTopology({ game: representative }, {}).families).toHaveLength(1);
   });
 });

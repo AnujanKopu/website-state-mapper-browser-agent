@@ -208,7 +208,7 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
     stats = graph["run"]["stats"]
     assert stats["family_dedup_hits"] == 1
     assert stats["family_urls_skipped"] == 1
-    assert stats["actions_performed"] <= 4
+    assert stats["actions_performed"] <= 5
 
     family_meta = [state["exploration"] for state in profile_states]
     assert all(meta["route_family"] for meta in family_meta)

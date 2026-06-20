@@ -36,88 +36,65 @@ async def autofill_auth_form(
     *,
     timeout_ms: int = _CLICK_TIMEOUT_MS,
 ) -> bool:
-    """Attempt to fill and submit the login form on `page`.
-
-    Searches for an email/username field and a password field, fills them, and
-    clicks the most plausible submit button. Returns True if a submit click was
-    attempted (regardless of whether authentication succeeded — the caller must
-    re-observe the page to verify).  Returns False if the expected fields could
-    not be found.
-    """
+    """Fill a username-first, password-only, or combined authentication step."""
     username_val = credentials.username or ""
     password_val = credentials.password or ""
     if not username_val and not password_val:
         return False
 
-    # --- find password field ---
-    password_handle = None
-    try:
-        password_handle = page.locator("input[type=password]").first
-        await password_handle.wait_for(state="visible", timeout=_FILL_TIMEOUT_MS)
-    except PlaywrightError:
-        return False  # no password field → not an auth form
+    async def visible_first(selectors: list[str]):
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                await locator.wait_for(state="visible", timeout=500)
+                return locator
+            except PlaywrightError:
+                continue
+        return None
 
-    # --- find username/email field ---
-    username_handle = None
-    # Try type=email first.
-    for locator_expr in [
-        "input[type=email]",
-        "input[name*=email i]",
-        "input[id*=email i]",
-        "input[placeholder*=email i]",
-        "input[name*=user i]",
-        "input[id*=user i]",
-        "input[name*=login i]",
-        "input[id*=login i]",
-        "input[type=text]",  # last resort: first visible text input
-    ]:
-        try:
-            handle = page.locator(locator_expr).first
-            await handle.wait_for(state="visible", timeout=500)
-            username_handle = handle
-            break
-        except PlaywrightError:
-            continue
+    username = await visible_first(
+        [
+            "input[type=email]",
+            "input[name*=email i]",
+            "input[id*=email i]",
+            "input[placeholder*=email i]",
+            "input[name*=user i]",
+            "input[id*=user i]",
+            "input[name*=login i]",
+            "input[id*=login i]",
+            "input[type=text]",
+        ]
+    )
+    password = await visible_first(["input[type=password]"])
+    if username is None and password is None:
+        return False
 
-    # --- fill fields ---
     try:
-        if username_handle and username_val:
-            await username_handle.fill(username_val, timeout=_FILL_TIMEOUT_MS)
-        if password_val:
-            await password_handle.fill(password_val, timeout=_FILL_TIMEOUT_MS)
+        if username is not None and username_val:
+            await username.fill(username_val, timeout=_FILL_TIMEOUT_MS)
+        if password is not None and password_val:
+            await password.fill(password_val, timeout=_FILL_TIMEOUT_MS)
     except PlaywrightError:
         return False
 
-    # --- find and click submit button ---
-    submitted = False
-    # Try: explicit submit input/button in the form context.
-    for locator_expr in [
-        "input[type=submit]",
-        "button[type=submit]",
-    ]:
+    submit = await visible_first(["input[type=submit]", "button[type=submit]"])
+    if submit is not None:
         try:
-            handle = page.locator(locator_expr).first
-            await handle.wait_for(state="visible", timeout=500)
-            await handle.click(timeout=timeout_ms)
-            submitted = True
-            break
-        except PlaywrightError:
-            continue
-
-    # Fallback: any button whose text matches common auth-submit patterns.
-    if not submitted:
-        try:
-            buttons = await page.locator("button").all()
-            for btn in buttons:
-                try:
-                    text = (await btn.inner_text(timeout=500)).strip()
-                    if _SUBMIT_TEXT.search(text):
-                        await btn.click(timeout=timeout_ms)
-                        submitted = True
-                        break
-                except PlaywrightError:
-                    continue
+            await submit.click(timeout=timeout_ms)
+            return True
         except PlaywrightError:
             pass
 
-    return submitted
+    try:
+        buttons = await page.locator("button").all()
+        for button in buttons:
+            try:
+                text = (await button.inner_text(timeout=500)).strip()
+                if _SUBMIT_TEXT.search(text):
+                    await button.click(timeout=timeout_ms)
+                    return True
+            except PlaywrightError:
+                continue
+    except PlaywrightError:
+        pass
+    return False

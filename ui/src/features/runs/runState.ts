@@ -157,13 +157,21 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
     url: p.url,
     url_normalized: p.url_normalized,
     title: p.title || base.title,
+    label: p.label ?? base.label,
     depth: p.depth,
     parent_state_id: p.parent_state_id ?? base.parent_state_id ?? null,
     screenshot: p.screenshot || base.screenshot,
     surface_items: surfaceItems,
-    exploration: p.route_family
-      ? { ...base.exploration, route_family: p.route_family }
-      : base.exploration,
+    exploration: {
+      ...base.exploration,
+      ...(p.route_family ? { route_family: p.route_family } : {}),
+      ...(p.auth_context ? { auth_context: p.auth_context } : {}),
+      ...(p.page_role ? { page_role: p.page_role } : {}),
+      ...(typeof p.page_depth === "number" ? { page_depth: p.page_depth } : {}),
+      ...(typeof p.substate_depth === "number" ? { substate_depth: p.substate_depth } : {}),
+      ...(p.name ? { name: p.name } : {}),
+      ...(p.family ? { family: p.family } : {}),
+    },
     flags: { ...base.flags, ...((p.flags ?? {}) as StateFlags) },
   };
 }

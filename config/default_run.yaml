@@ -38,3 +38,11 @@ exploration:
   # Distinct states kept per loose URL family (e.g. /post/#); further siblings
   # fold into the family representative as skipped items + inferred edges.
   url_family_cap: 3
+  # Header/menu actions allowed while looking for a hidden login entry.
+  auth_discovery_action_cap: 6
+  # Same-URL tabs/menus are bounded separately from page navigation depth.
+  max_substate_depth: 2
+
+authentication:
+  # API/UI requests may override this per run. Credentials are never stored here.
+  mode: guest

@@ -109,7 +109,10 @@ export function LandingPage({ onStarted }: LandingPageProps) {
         <section className="landing-final" data-reveal>
           <div className="landing-final__trace" aria-hidden />
           <p>Ready when you are</p>
-          <h2>Give the agent a URL.<br />Get the whole product back.</h2>
+          <h2>
+            Give the agent a URL<span className="landing-final__dot">.</span> Get the whole
+            product back<span className="landing-final__dot">.</span>
+          </h2>
           <button type="button" className="button button--primary" onClick={focusMapper}>
             Start mapping <span aria-hidden>↑</span>
           </button>

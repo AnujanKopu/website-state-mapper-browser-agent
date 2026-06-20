@@ -1,7 +1,8 @@
-"""Depth-first exploration: the core state-mapping loop.
+"""Journey-aware exploration: the core state-mapping loop.
 
-DFS over actions: finish ranked affordances from the current branch before
-backtracking. Within each state, higher-scored actions are tried first.
+Pending actions are scheduled across user journeys instead of exhausting one
+deep branch. Meaningful local continuations (modals/forms/wizards) remain
+together, while root navigation journeys receive fair coverage.
 Each step navigates to its source state (replaying the stored path when
 needed), performs the action, observes the result, and either merges into a
 known state (identity or URL dedup) or registers a new node and enqueues its
@@ -12,35 +13,52 @@ stack drains or any budget is exhausted.
 from __future__ import annotations
 
 import contextlib
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
 from engine import identity
-from engine.browser.actions import click_interactable, click_selector, dismiss_cookie_banner
+from engine.browser.actions import (
+    click_interactable,
+    click_selector,
+    dismiss_cookie_banner,
+    validate_interactable,
+)
 from engine.browser.autofill import autofill_auth_form
 from engine.browser.session import BrowserSession
 from engine.browser.snapshot import stabilize
-from engine.capture import build_state_row, new_id, observe_page, persist_state
+from engine.capture import (
+    build_state_row,
+    new_id,
+    observe_page,
+    persist_state,
+    with_auth_context,
+)
 from engine.classify import StateAnalysis, analyze_state
 from engine.config import Settings
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.events import ActionOutcome, EventType
 from engine.identity import normalize_url
+from engine.organize import heuristic_name, infer_page_role
 from engine.ranking import ActionCandidate, is_auth_entry, score_action
 from engine.safety import is_same_origin
 from engine.schemas import (
     ActionStep,
+    AuthContext,
+    AuthMode,
     BudgetConfig,
     Credentials,
     Interactable,
     Observation,
+    PageRole,
     RunConfig,
     StateType,
 )
@@ -91,12 +109,22 @@ class StateMeta:
     representative_ids: set[str] = field(default_factory=set)
     blocked_ids: set[str] = field(default_factory=set)
     route_family: str | None = None
+    auth_context: AuthContext = AuthContext.UNKNOWN
+    page_depth: int = 0
+    substate_depth: int = 0
+    journey_key: str = "root"
+    family: dict | None = None
+    page_role: PageRole = PageRole.FLOW_STEP
+    display_label: str = ""
 
 
 @dataclass
 class PendingAction:
     from_state: StateMeta
     candidate: ActionCandidate
+    journey_key: str = "root"
+    phase: int = 1
+    sequence: int = 0
 
 
 class Budget:
@@ -125,19 +153,76 @@ class Budget:
 
 
 class Frontier:
-    """LIFO stack of pending actions for depth-first exploration."""
+    """Deterministic fair scheduler across root-level user journeys."""
 
     def __init__(self) -> None:
-        self._stack: list[PendingAction] = []
+        self._items: list[PendingAction] = []
+        self._journey_pops: dict[str, int] = {}
+        self._sequence = 0
 
     def push(self, item: PendingAction) -> None:
-        self._stack.append(item)
+        item.sequence = self._sequence
+        self._sequence += 1
+        self._items.append(item)
 
     def pop(self) -> PendingAction:
-        return self._stack.pop()
+        def priority(item: PendingAction) -> tuple:
+            local_continuation = item.from_state.state_type in {
+                StateType.MODAL,
+                StateType.FORM,
+                StateType.WIZARD_STEP,
+            }
+            return (
+                item.phase,
+                0 if local_continuation else 1,
+                self._journey_pops.get(item.journey_key, 0),
+                -item.candidate.score,
+                item.from_state.page_depth,
+                item.sequence,
+            )
+
+        index = min(range(len(self._items)), key=lambda i: priority(self._items[i]))
+        item = self._items.pop(index)
+        self._journey_pops[item.journey_key] = (
+            self._journey_pops.get(item.journey_key, 0) + 1
+        )
+        return item
 
     def __len__(self) -> int:
-        return len(self._stack)
+        return len(self._items)
+
+
+_AUTH_SUCCESS = re.compile(
+    r"\b(log\s*out|sign\s*out|my\s+account|profile|dashboard)\b", re.I
+)
+_AUTH_PATH = re.compile(r"/(log-?in|sign-?in|sign-?up|register|auth)(/|$)", re.I)
+_AUTH_RETURN_PARAMS = {
+    "after",
+    "continue",
+    "next",
+    "redirect",
+    "redirect_uri",
+    "return",
+    "return_to",
+    "returnurl",
+}
+
+
+def _journey_slug(label: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    return value[:48] or "other"
+
+
+def _auth_surface_url(url: str) -> str | None:
+    parts = urlsplit(normalize_url(url))
+    if not _AUTH_PATH.search(parts.path):
+        return None
+    kept = [
+        (name, value)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+        if name.lower() not in _AUTH_RETURN_PARAMS
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), ""))
 
 
 class Explorer:
@@ -157,6 +242,7 @@ class Explorer:
         self._emit: EventSink = on_event or (lambda event: None)
         self._auth_gate_hook = auth_gate_hook
         self._credentials = credentials
+        self._auth_mode = config.authentication.mode
 
     async def run(self, url: str, *, run_id: str | None = None) -> str:
         """Explore `url` until budgets exhaust; returns the run id.
@@ -171,14 +257,17 @@ class Explorer:
         self._identity = identity.IdentityIndex()
         self._states: dict[str, StateMeta] = {}
         self._visited_urls: set[str] = set()
+        self._auth_context = AuthContext.GUEST
         # First state registered for each normalized URL (inferred-edge target).
-        self._url_to_state: dict[str, str] = {}
+        self._url_to_state: dict[tuple[AuthContext, str], str] = {}
+        self._auth_surface_to_state: dict[tuple[AuthContext, str], str] = {}
         # Structure-confirmed representatives and bounded sampling per
         # content-like route family inferred from repeated link cohorts.
         self._family_variants: dict[str, dict[tuple, str]] = {}
         self._family_attempts: dict[str, int] = {}
         self._family_sampled_urls: dict[str, list[str]] = {}
         self._family_skipped: dict[str, int] = {}
+        self._family_info: dict[str, dict] = {}
         self._edges_done: set[tuple[str, str]] = set()
         # (state_id, item_id) -> terminal surface status for items we acted on.
         self._item_outcome: dict[tuple[str, str], str] = {}
@@ -238,6 +327,7 @@ class Explorer:
                         "max_actions": self._config.budgets.max_actions,
                         "max_depth": self._config.budgets.max_depth,
                         "max_wall_seconds": self._config.budgets.max_wall_seconds,
+                        "auth_mode": self._auth_mode.value,
                     },
                     "counters": self._counters(),
                 },
@@ -246,16 +336,24 @@ class Explorer:
         await page.goto(url)
         await dismiss_cookie_banner(page)
 
-        observation = await observe_page(page, self._config)
+        observation = await observe_page(
+            page, self._config, auth_context=self._auth_context
+        )
         root = await self._register_state(
-            observation, depth=0, path=[ActionStep(kind="goto", url=page.url)]
+            observation,
+            depth=0,
+            path=[ActionStep(kind="goto", url=page.url)],
+            enqueue_actions=self._auth_mode == AuthMode.GUEST,
         )
         self._current_state_id = root.id
 
         if root.state_type == StateType.AUTH_WALL:
-            post_auth = await self._handle_auth_wall(page, root)
-            if post_auth is not None:
-                await self._add_user_auth_edge(root, post_auth)
+            if self._auth_mode == AuthMode.LOGIN:
+                post_auth = await self._handle_auth_wall(page, root)
+                if post_auth is not None:
+                    await self._add_user_auth_edge(root, post_auth)
+        elif self._auth_mode == AuthMode.LOGIN:
+            self._enqueue_auth_discovery(root, analyze_state(observation, base_url=self._root_url))
 
         self._emit_frontier()
 
@@ -320,7 +418,9 @@ class Explorer:
         target_norm = normalize_url(href)
         if target_norm == source.url_normalized:
             return None
-        target_id = self._url_to_state.get(target_norm)
+        target_id = self._url_to_state.get((source.auth_context, target_norm))
+        if target_id is None:
+            target_id = self._url_to_state.get(target_norm)  # legacy unit fixtures
         if target_id is None or target_id == source.id:
             return None
         return target_id
@@ -336,7 +436,9 @@ class Explorer:
         # inferred edge -- no click, no action budget spent.
         self_page_id = self._self_link_target(item, source)
         if self_page_id is not None:
-            page_id = self._url_to_state.get(self_page_id)
+            page_id = self._url_to_state.get((source.auth_context, self_page_id))
+            if page_id is None:
+                page_id = self._url_to_state.get(self_page_id)
             if page_id is None:
                 page_id = source.id
             destination = self._states[page_id]
@@ -380,6 +482,23 @@ class Explorer:
 
         family_pattern = pending.candidate.family_pattern
         if family_pattern is not None:
+            self._family_info.setdefault(
+                family_pattern,
+                {
+                    "id": pending.candidate.family_id,
+                    "label": pending.candidate.family_label,
+                    "kind": pending.candidate.family_kind,
+                    "pattern": family_pattern,
+                    "label_source": "heuristic",
+                    "confidence": 0.85,
+                    "discovered_count": max(1, pending.candidate.collapsed_count),
+                    "sample_labels": list(pending.candidate.grouped_labels),
+                },
+            )
+            info = self._family_info[family_pattern]
+            info["discovered_count"] = max(
+                int(info.get("discovered_count", 1)), pending.candidate.collapsed_count
+            )
             attempts = self._family_attempts.get(family_pattern, 0)
             if attempts >= self._config.exploration.url_family_cap:
                 self._family_skipped[family_pattern] = (
@@ -422,6 +541,17 @@ class Explorer:
             )
             return
 
+        if not await validate_interactable(page, item):
+            self._stats["failed_actions"] += 1
+            self._item_outcome[(source.id, item.item_id)] = "noop"
+            self._edges_done.add(edge_key)
+            self._emit_action_finished(
+                ActionOutcome.FAILED,
+                f"Dropped stale action {item.label!r}",
+                from_state_id=source.id,
+            )
+            return
+
         try:
             await click_interactable(
                 page,
@@ -442,7 +572,9 @@ class Explorer:
             return
 
         await self._absorb_popups(page)
-        observation = await observe_page(page, self._config)
+        observation = await observe_page(
+            page, self._config, auth_context=self._auth_context
+        )
         if family_pattern is not None:
             self._family_sampled_urls.setdefault(family_pattern, []).append(
                 observation.snapshot.url
@@ -485,6 +617,9 @@ class Explorer:
                 source=source,
                 trigger=item,
                 route_family=family_pattern,
+                journey_key=pending.journey_key,
+                family=self._family_info.get(family_pattern),
+                enqueue_actions=pending.phase != 0,
             )
             self._actions_since_new = 0
             self._emit_action_finished(
@@ -508,10 +643,15 @@ class Explorer:
         # Auth-wall gate: pause exploration if the destination is a login page.
         # This runs after recording the edge so the gate node is always visible.
         if destination.state_type == StateType.AUTH_WALL:
-            post_auth = await self._handle_auth_wall(page, destination)
-            if post_auth is not None:
-                await self._add_user_auth_edge(destination, post_auth)
-                self._current_state_id = post_auth.id
+            if self._auth_mode == AuthMode.LOGIN:
+                post_auth = await self._handle_auth_wall(page, destination)
+                if post_auth is not None:
+                    await self._add_user_auth_edge(destination, post_auth)
+                    self._current_state_id = post_auth.id
+        elif pending.phase == 0:
+            self._enqueue_auth_discovery(
+                destination, analyze_state(observation, base_url=self._root_url)
+            )
 
     def _resolve_existing_state(
         self, observation: Observation, source: StateMeta, key: identity.StateKey
@@ -524,11 +664,27 @@ class Explorer:
         existing_id = self._identity.find(key)
         if existing_id is not None:
             return existing_id
+        if (
+            observation.snapshot.signals.password_fields > 0
+            or observation.snapshot.signals.username_fields > 0
+        ):
+            auth_url = _auth_surface_url(observation.snapshot.url)
+            if auth_url is not None:
+                known_auth = getattr(self, "_auth_surface_to_state", {}).get(
+                    (observation.auth_context, auth_url)
+                )
+                if known_auth is not None:
+                    return known_auth
         if observation.url_normalized == source.url_normalized:
             return None
         if observation.snapshot.signals.modal_open:
             return None
-        return self._url_to_state.get(observation.url_normalized)
+        existing = self._url_to_state.get(
+            (observation.auth_context, observation.url_normalized)
+        )
+        if existing is None:
+            existing = self._url_to_state.get(observation.url_normalized)
+        return existing
 
     @staticmethod
     def _self_link_target(item: Interactable, source: StateMeta) -> str | None:
@@ -550,6 +706,7 @@ class Explorer:
             signals.modal_open,
             signals.form_count,
             signals.password_fields,
+            signals.username_fields,
             signals.payment_fields,
             observation.skeleton_hash,
             observation.action_sig,
@@ -597,6 +754,10 @@ class Explorer:
         source: StateMeta | None = None,
         trigger: Interactable | None = None,
         route_family: str | None = None,
+        journey_key: str | None = None,
+        enqueue_actions: bool = True,
+        family: dict | None = None,
+        page_depth_override: int | None = None,
     ) -> StateMeta:
         analysis = analyze_state(observation, base_url=self._root_url)
         state_type = analysis.state_type
@@ -606,10 +767,32 @@ class Explorer:
         # Same-URL sub-states (modal/tab/dropdown) hang off the page that
         # opened them; refine the type for non-modal structural changes.
         parent_state_id: str | None = None
+        page_depth = 0
+        substate_depth = 0
         if source is not None and observation.url_normalized == source.url_normalized:
             parent_state_id = self._page_ancestor(source)
+            page_depth = source.page_depth
+            substate_depth = source.substate_depth + 1
             if state_type == StateType.PAGE:
                 state_type = self._substate_type(trigger)
+        elif source is not None:
+            page_depth = source.page_depth + 1
+        if page_depth_override is not None:
+            page_depth = page_depth_override
+
+        page_role = infer_page_role(
+            observation,
+            analysis,
+            state_type,
+            depth=page_depth,
+            route_family=route_family,
+        )
+        naming = heuristic_name(
+            observation,
+            state_type=state_type,
+            trigger_label=trigger.label if trigger else None,
+            parent_label=source.display_label if source else None,
+        )
 
         state = persist_state(
             observation,
@@ -621,15 +804,26 @@ class Explorer:
             save_dom=self._config.capture.save_dom_snapshots,
         )
         state.state_type = state_type
-        state.detected_flags = analysis.flags
+        state.detected_flags = {
+            **analysis.flags,
+            "auth_context": observation.auth_context.value,
+            "page_role": page_role.value,
+            "name": naming,
+        }
 
         async with self._sessions() as session:
             row = build_state_row(state)
             row.parent_state_id = parent_state_id
-            if route_family is not None:
-                # Persist grouping metadata at discovery time so another tab
-                # can hydrate the live family before run-finalization.
-                row.exploration = {"route_family": route_family}
+            row.label = naming["text"]
+            row.exploration = {
+                "auth_context": observation.auth_context.value,
+                "page_role": page_role.value,
+                "page_depth": page_depth,
+                "substate_depth": substate_depth,
+                "name": naming,
+                **({"route_family": route_family} if route_family else {}),
+                **({"family": dict(family)} if family else {}),
+            }
             session.add(row)
             await session.commit()
 
@@ -648,11 +842,26 @@ class Explorer:
             representative_ids=representative_ids,
             blocked_ids=blocked_ids,
             route_family=route_family,
+            auth_context=observation.auth_context,
+            page_depth=page_depth,
+            substate_depth=substate_depth,
+            journey_key=journey_key or (source.journey_key if source else "root"),
+            family=dict(family) if family else None,
+            page_role=page_role,
+            display_label=naming["text"],
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
         self._visited_urls.add(observation.url_normalized)
-        self._url_to_state.setdefault(observation.url_normalized, meta.id)
+        self._url_to_state.setdefault(
+            (observation.auth_context, observation.url_normalized), meta.id
+        )
+        if state_type == StateType.AUTH_WALL:
+            auth_url = _auth_surface_url(observation.snapshot.url)
+            if auth_url is not None:
+                self._auth_surface_to_state.setdefault(
+                    (observation.auth_context, auth_url), meta.id
+                )
         if parent_state_id is None and route_family is not None:
             self._family_variants.setdefault(route_family, {}).setdefault(
                 self._family_template_key(observation), meta.id
@@ -660,7 +869,7 @@ class Explorer:
         self._stats["states"] += 1
         self._stats["actions_denied"] += len(analysis.denied)
 
-        title = observation.snapshot.title or observation.url_normalized
+        title = naming["text"]
         message = f"s{meta.index} [{state_type.value}] {title!r} (depth {depth})"
         if analysis.denied:
             message += f" - {len(analysis.denied)} risky action(s) blocked"
@@ -678,8 +887,15 @@ class Explorer:
                     "depth": depth,
                     "parent_state_id": parent_state_id,
                     "screenshot": state.screenshot_path,
-                    "flags": analysis.flags,
+                    "flags": state.detected_flags,
+                    "label": naming["text"],
+                    "page_role": page_role.value,
+                    "name": naming,
                     "route_family": route_family,
+                    "auth_context": observation.auth_context.value,
+                    "page_depth": page_depth,
+                    "substate_depth": substate_depth,
+                    "family": family,
                     "denied_count": len(analysis.denied),
                     "surface_items": self._surface_summary(meta),
                     "counters": self._counters(),
@@ -687,7 +903,8 @@ class Explorer:
             )
         )
 
-        self._enqueue_actions(meta, analysis)
+        if enqueue_actions:
+            self._enqueue_actions(meta, analysis)
         return meta
 
     @staticmethod
@@ -722,15 +939,44 @@ class Explorer:
         return [*source.path, ActionStep(kind="click", selector=selector, label=label)]
 
     def _enqueue_actions(self, meta: StateMeta, analysis: StateAnalysis) -> None:
-        if meta.depth >= self._config.budgets.max_depth:
+        if meta.page_depth >= self._config.budgets.max_depth:
+            return
+        if meta.substate_depth >= self._config.exploration.max_substate_depth:
             return
         if meta.state_type in _TERMINAL_TYPES:
             return
         if meta.state_type in _GATE_TYPES:
             return  # expanded only after auth_gate resolution via _handle_auth_wall
         eligible: list[ActionCandidate] = []
+        parent_selector_shapes: set[str] = set()
+        if meta.parent_state_id:
+            parent = self._states.get(meta.parent_state_id)
+            if parent is not None:
+                parent_selector_shapes = {
+                    identity.strip_positional_selector(item.selector)
+                    for item in parent.interactables
+                }
         reserved_by_family: dict[str, int] = {}
+        seen_semantic_actions: set[tuple[str, str | None]] = set()
         for candidate in analysis.safe:
+            item = candidate.interactable
+            if (
+                item.label.lower().startswith("unlabelled ")
+                and item.region not in {"nav", "header", "modal"}
+            ):
+                continue
+            semantic_key = (item.label.strip().lower(), item.region)
+            if semantic_key in seen_semantic_actions:
+                continue
+            seen_semantic_actions.add(semantic_key)
+            if (
+                parent_selector_shapes
+                and identity.strip_positional_selector(item.selector)
+                in parent_selector_shapes
+                and not (item.kind == "tab" or item.in_modal or item.region == "modal")
+            ):
+                # Unchanged navigation/footer chrome belongs to the parent.
+                continue
             family = candidate.family_pattern
             if family is not None:
                 reserved = reserved_by_family.get(family, 0)
@@ -753,9 +999,63 @@ class Explorer:
             top = [auth_pick, *[c for c in top if c is not auth_pick]][
                 : self._config.exploration.max_actions_per_state
             ]
-        # Top-K by score; push worst-first so stack pop tries the best action first.
-        for candidate in reversed(top):
-            self._frontier.push(PendingAction(from_state=meta, candidate=candidate))
+        # A collection surface should sample one repeated entity family even
+        # when filters and navigation links fill the top-K slots.
+        family_pick = next((c for c in ranked if c.family_pattern), None)
+        if family_pick and family_pick not in top and top:
+            top = [*top[:-1], family_pick]
+        meta.representative_ids = {c.interactable.item_id for c in eligible}
+        for candidate in top:
+            journey_key = meta.journey_key
+            if meta.depth == 0:
+                journey_key = _journey_slug(candidate.interactable.label)
+            self._frontier.push(
+                PendingAction(
+                    from_state=meta,
+                    candidate=candidate,
+                    journey_key=journey_key,
+                )
+            )
+
+    def _enqueue_auth_discovery(
+        self, meta: StateMeta, analysis: StateAnalysis
+    ) -> None:
+        """Seed login mode with auth actions before any general journey."""
+        ranked: list[ActionCandidate] = []
+        revealers: list[ActionCandidate] = []
+        for candidate in analysis.safe:
+            candidate.score = score_action(candidate, visited_urls=self._visited_urls)
+            if is_auth_entry(candidate):
+                ranked.append(candidate)
+            else:
+                item = candidate.interactable
+                label = item.label.lower()
+                if (
+                    item.region in {"nav", "header"}
+                    and item.kind in {"button", "menuitem", "disclosure"}
+                    and any(word in label for word in ("menu", "account", "profile"))
+                ):
+                    revealers.append(candidate)
+        picks = sorted(ranked, key=lambda c: c.score, reverse=True)
+        if not picks:
+            picks = sorted(revealers, key=lambda c: c.score, reverse=True)[
+                : self._config.exploration.auth_discovery_action_cap
+            ]
+        meta.representative_ids = {c.interactable.item_id for c in picks}
+        for candidate in picks:
+            self._frontier.push(
+                PendingAction(
+                    from_state=meta,
+                    candidate=candidate,
+                    journey_key="authentication",
+                    phase=0,
+                )
+            )
+
+        # If no authentication entry can be found, pause at the root instead
+        # of silently pretending this is an authenticated run.
+        if not picks:
+            self._enqueue_actions(meta, analysis)
 
     # ------------------------------------------------------------------
     # Auth gate
@@ -764,141 +1064,120 @@ class Explorer:
     async def _handle_auth_wall(
         self, page: Page, meta: StateMeta
     ) -> StateMeta | None:
-        """Handle reaching an AUTH_WALL state.
+        """Authenticate, retrying the checkpoint until success or explicit skip."""
+        autofill_attempted = False
+        while True:
+            observation: Observation | None = None
+            if self._credentials is not None:
+                autofill_attempted = True
+                try:
+                    submitted = await autofill_auth_form(
+                        page,
+                        self._credentials,
+                        timeout_ms=self._config.exploration.action_timeout_ms,
+                    )
+                    if submitted:
+                        await stabilize(page, self._config.browser.stabilize_quiet_ms)
+                    observation = await observe_page(
+                        page, self._config, auth_context=AuthContext.GUEST
+                    )
+                except Exception:  # noqa: BLE001 - user can recover at the gate
+                    observation = None
 
-        1. Try autofill if credentials are available (Slice 6).
-        2. Emit AUTH_GATE event.
-        3. If a hook is registered, pause and await the user's decision.
-        4. On resume: re-observe the page to capture the post-auth state.
-        5. Return the post-auth StateMeta if auth succeeded, else None.
-        """
-        # --- Step 1: attempt credential autofill (Slice 6) ---
-        if self._credentials is not None:
-            try:
-                submitted = await autofill_auth_form(
-                    page,
-                    self._credentials,
-                    timeout_ms=self._config.exploration.action_timeout_ms,
+            if observation is not None and self._auth_succeeded(observation, meta):
+                return await self._register_authenticated_state(observation, meta)
+
+            self._emit(
+                ExplorerEvent(
+                    EventType.AUTH_GATE,
+                    f"Authentication required at {meta.url!r}",
+                    {
+                        "state_id": meta.id,
+                        "url": meta.url,
+                        "title": meta.url,
+                        "screenshot": meta.id,
+                        "decision": None,
+                        "autofill_attempted": autofill_attempted,
+                        "suggested_actions": ["resume", "skip"],
+                    },
                 )
-                if submitted:
-                    await stabilize(page, self._config.browser.stabilize_quiet_ms)
-                    observation = await observe_page(page, self._config)
-                    key = identity.key_for(observation)
-                    existing_id = self._resolve_existing_state(observation, meta, key)
-                    # If the page changed and is no longer an auth wall, register it.
-                    if (
-                        existing_id is None
-                        and observation.snapshot.signals.password_fields == 0
-                    ):
-                        post_auth = await self._register_state(
-                            observation,
-                            depth=meta.depth + 1,
-                            path=[ActionStep(kind="goto", url=observation.snapshot.url)],
-                            key=key,
-                            source=meta,
-                        )
-                        self._actions_since_new = 0
-                        self._emit(
-                            ExplorerEvent(
-                                EventType.AUTH_GATE,
-                                f"Auth autofill succeeded; reached s{post_auth.index}",
-                                {
-                                    "state_id": meta.id,
-                                    "url": meta.url,
-                                    "title": observation.snapshot.title,
-                                    "screenshot": meta.id,
-                                    "decision": "autofilled",
-                                    "post_auth_state_id": post_auth.id,
-                                    "autofill_attempted": True,
-                                },
-                            )
-                        )
-                        return post_auth
-                    # Autofill was submitted but page didn't change (wrong creds / captcha);
-                    # fall through to emit auth_gate and pause.
-            except Exception:  # noqa: BLE001 – autofill is best-effort
-                pass
+            )
+            if self._auth_gate_hook is None:
+                return None
 
-        # --- Step 2: emit AUTH_GATE event ---
+            decision, new_credentials = await self._auth_gate_hook(meta.id, meta.url)
+            if new_credentials is not None:
+                self._credentials = new_credentials
+            if decision == "skip":
+                self._auth_mode = AuthMode.GUEST
+                self._config.authentication.mode = AuthMode.GUEST
+                await self._mark_auth_skipped(meta.id)
+                return None
+
+            # A headed run may have been authenticated manually while paused.
+            try:
+                observation = await observe_page(
+                    page, self._config, auth_context=AuthContext.GUEST
+                )
+            except Exception:  # noqa: BLE001
+                observation = None
+            if observation is not None and self._auth_succeeded(observation, meta):
+                return await self._register_authenticated_state(observation, meta)
+            autofill_attempted = False
+
+    @staticmethod
+    def _auth_succeeded(observation: Observation, source: StateMeta) -> bool:
+        if observation.snapshot.signals.password_fields > 0:
+            return False
+        analysis = analyze_state(observation, base_url=source.url)
+        if analysis.state_type == StateType.AUTH_WALL:
+            return False
+        changed_page = observation.url_normalized != source.url_normalized
+        return bool(_AUTH_SUCCESS.search(observation.snapshot.visible_text)) or changed_page
+
+    async def _register_authenticated_state(
+        self, observation: Observation, source: StateMeta
+    ) -> StateMeta:
+        self._auth_context = AuthContext.AUTHENTICATED
+        observation = with_auth_context(observation, AuthContext.AUTHENTICATED)
+        # All guest candidates are stale once the site's header/session changes.
+        self._frontier = Frontier()
+        post_auth = await self._register_state(
+            observation,
+            depth=source.depth + 1,
+            path=[ActionStep(kind="goto", url=observation.snapshot.url)],
+            key=identity.key_for(observation),
+            source=source,
+            journey_key="authentication",
+            page_depth_override=0,
+        )
+        self._actions_since_new = 0
         self._emit(
             ExplorerEvent(
                 EventType.AUTH_GATE,
-                f"Auth wall reached at {meta.url!r} — awaiting user decision",
+                f"Authentication succeeded; reached s{post_auth.index}",
                 {
-                    "state_id": meta.id,
-                    "url": meta.url,
-                    "title": meta.url,
-                    "screenshot": meta.id,
-                    "decision": None,
-                    "autofill_attempted": self._credentials is not None,
-                    "suggested_actions": ["resume", "skip"],
+                    "state_id": source.id,
+                    "url": source.url,
+                    "title": observation.snapshot.title,
+                    "screenshot": source.id,
+                    "decision": "autofilled",
+                    "post_auth_state_id": post_auth.id,
+                    "autofill_attempted": True,
                 },
             )
         )
-
-        # --- Step 3: pause if a hook is wired (API-driven runs) ---
-        if self._auth_gate_hook is None:
-            return None  # non-API runs: skip the gate, continue exploration
-
-        decision, new_credentials = await self._auth_gate_hook(meta.id, meta.url)
-
-        if new_credentials is not None:
-            self._credentials = new_credentials
-
-        if decision == "skip":
-            # Mark gate as skipped in the state's flags (best-effort DB update).
-            with contextlib.suppress(Exception):
-                async with self._sessions() as session:
-                    row = await session.get(db.StateNode, meta.id)
-                    if row is not None:
-                        flags = dict(row.detected_flags or {})
-                        flags["auth_gate_skipped"] = True
-                        row.detected_flags = flags
-                        await session.commit()
-            return None
-
-        # --- Step 4: decision == "resume" — try autofill with new/existing creds ---
-        if self._credentials is not None:
-            try:
-                submitted = await autofill_auth_form(
-                    page,
-                    self._credentials,
-                    timeout_ms=self._config.exploration.action_timeout_ms,
-                )
-                if submitted:
-                    await stabilize(page, self._config.browser.stabilize_quiet_ms)
-            except Exception:  # noqa: BLE001
-                pass
-
-        # Re-observe page after resume (user may have authenticated manually
-        # in a headed browser, or autofill was just attempted above).
-        try:
-            await stabilize(page, self._config.browser.stabilize_quiet_ms)
-            observation = await observe_page(page, self._config)
-        except Exception:  # noqa: BLE001
-            return None
-
-        key = identity.key_for(observation)
-        existing_id = self._resolve_existing_state(observation, meta, key)
-
-        if existing_id is not None and existing_id != meta.id:
-            # Arrived at an already-known state after auth.
-            return self._states[existing_id]
-
-        if observation.snapshot.signals.password_fields > 0:
-            # Still on auth wall — auth didn't work, give up.
-            return None
-
-        # New post-auth state.
-        post_auth = await self._register_state(
-            observation,
-            depth=meta.depth + 1,
-            path=[ActionStep(kind="goto", url=observation.snapshot.url)],
-            key=key,
-            source=meta,
-        )
-        self._actions_since_new = 0
         return post_auth
+
+    async def _mark_auth_skipped(self, state_id: str) -> None:
+        with contextlib.suppress(Exception):
+            async with self._sessions() as session:
+                row = await session.get(db.StateNode, state_id)
+                if row is not None:
+                    flags = dict(row.detected_flags or {})
+                    flags["auth_gate_skipped"] = True
+                    row.detected_flags = flags
+                    await session.commit()
 
     async def _add_user_auth_edge(
         self, source: StateMeta, destination: StateMeta
@@ -994,7 +1273,14 @@ class Explorer:
         via: str = "performed",
     ) -> None:
         item = candidate.interactable
-        label = f"Links to '{item.label}'" if via == "inferred" else f"Clicked '{item.label}'"
+        if via == "inferred":
+            label = f"Open {item.label}"
+        elif item.kind == "tab":
+            label = f"Switch to {item.label}"
+        elif item.kind in {"menuitem", "disclosure"} or item.href:
+            label = f"Open {item.label}"
+        else:
+            label = f"Activate {item.label}"
         if candidate.collapsed_count > 1:
             label += f" (1 of {candidate.collapsed_count} similar)"
 
@@ -1079,8 +1365,27 @@ class Explorer:
 
                 row = await session.get(db.StateNode, meta.id)
                 if row is not None:
+                    family = None
+                    if meta.route_family is not None:
+                        family = {
+                            **self._family_info.get(meta.route_family, {}),
+                            "checked_count": len(
+                                self._family_sampled_urls.get(meta.route_family, [])
+                            ),
+                            "represented_count": len(
+                                self._family_variants.get(meta.route_family, {})
+                            ),
+                            "skipped_count": self._family_skipped.get(
+                                meta.route_family, 0
+                            ),
+                            "sample_urls": self._family_sampled_urls.get(
+                                meta.route_family, []
+                            ),
+                        }
+                    existing_exploration = dict(row.exploration or {})
                     row.interactables = items
                     row.exploration = {
+                        **existing_exploration,
                         **counts,
                         **(
                             {
@@ -1091,6 +1396,7 @@ class Explorer:
                                 "family_skipped": self._family_skipped.get(
                                     meta.route_family, 0
                                 ),
+                                "family": family,
                             }
                             if meta.route_family is not None
                             else {}

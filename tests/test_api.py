@@ -85,6 +85,21 @@ def test_bare_host_gets_https_scheme():
         CreateRunRequest(url="   ")
 
 
+def test_credentials_require_explicit_login_mode():
+    with pytest.raises(ValueError):
+        CreateRunRequest(
+            url="https://example.com",
+            credentials={"username": "u", "password": "p"},
+        )
+    request = CreateRunRequest(
+        url="https://example.com",
+        auth_mode="login",
+        credentials={"username": "u", "password": "p"},
+    )
+    assert request.overrides()["auth_mode"] == "login"
+    assert "credentials" not in request.overrides()
+
+
 async def test_full_lifecycle_graph_and_export(client: httpx.AsyncClient):
     run_id = (await client.post("/api/runs", json={"url": FIXTURE_URL})).json()["run_id"]
 

@@ -8,6 +8,7 @@ export const FAMILY_PAD_X = 24;
 export const FAMILY_HEADER_HEIGHT = 40;
 export const FAMILY_PAD_BOTTOM = 22;
 export const FAMILY_MEMBER_GAP = 16;
+export const FAMILY_MIN_WIDTH = 380;
 
 export interface FamilyGroup {
   id: string;
@@ -15,6 +16,13 @@ export interface FamilyGroup {
   memberIds: string[];
   width: number;
   height: number;
+  label: string;
+  kind: string;
+  discoveredCount: number;
+  checkedCount: number;
+  representedCount: number;
+  skippedCount: number;
+  sampleLabels: string[];
 }
 
 export interface FamilyBox extends FamilyGroup {
@@ -28,6 +36,7 @@ export interface GraphLayout {
 
 export interface GraphTopology {
   key: string;
+  layoutKey: string;
   nodeIds: string[];
   edgeIds: string[];
   layoutEdges: Edge[];
@@ -52,7 +61,7 @@ function familyId(pattern: string): string {
 
 function familyDimensions(memberCount: number): { width: number; height: number } {
   return {
-    width: NODE_WIDTH + FAMILY_PAD_X * 2,
+    width: Math.max(FAMILY_MIN_WIDTH, NODE_WIDTH + FAMILY_PAD_X * 2),
     height:
       FAMILY_HEADER_HEIGHT
       + memberCount * NODE_HEIGHT
@@ -77,13 +86,26 @@ export function createGraphTopology(
     familyMembers.set(pattern, members);
   }
   const families: FamilyGroup[] = [...familyMembers.entries()]
-    .filter(([, members]) => members.length >= 2)
-    .map(([pattern, members]) => ({
-      id: familyId(pattern),
-      pattern,
-      memberIds: members.map((state) => state.id),
-      ...familyDimensions(members.length),
-    }))
+    .filter(([, members]) => {
+      const discovered = members[0]?.exploration?.family?.discovered_count ?? 0;
+      return members.length >= 2 || discovered > 1;
+    })
+    .map(([pattern, members]) => {
+      const metadata = members[0]?.exploration?.family;
+      return {
+        id: metadata?.id ? `family-${metadata.id}` : familyId(pattern),
+        pattern,
+        memberIds: members.map((state) => state.id),
+        label: metadata?.label ?? displayFamilyPattern(pattern),
+        kind: metadata?.kind ?? "items",
+        discoveredCount: metadata?.discovered_count ?? members.length,
+        checkedCount: metadata?.checked_count ?? members.length,
+        representedCount: metadata?.represented_count ?? members.length,
+        skippedCount: metadata?.skipped_count ?? 0,
+        sampleLabels: metadata?.sample_labels ?? [],
+        ...familyDimensions(members.length),
+      };
+    })
     .sort((a, b) => a.id.localeCompare(b.id));
 
   const ownerByNode: Record<string, string> = Object.fromEntries(
@@ -112,8 +134,21 @@ export function createGraphTopology(
   const key = `${nodeIds.map((id) => `${id}@${ownerByNode[id]}`).join("|")}::${validEdges
     .map((edge) => `${edge.id}:${edge.from}>${edge.to}`)
     .join("|")}`;
+  const layoutKey = nodeIds.map((id) => `${id}@${ownerByNode[id]}`).join("|");
 
-  return { key, nodeIds, edgeIds, layoutEdges, ownerByNode, families };
+  return { key, layoutKey, nodeIds, edgeIds, layoutEdges, ownerByNode, families };
+}
+
+function displayFamilyPattern(pattern: string): string {
+  try {
+    const url = new URL(pattern);
+    const literal = url.pathname.split("/").filter((part) => part && !part.startsWith(":"))[0];
+    if (!literal) return "Items";
+    const label = literal.replaceAll("-", " ");
+    return label.endsWith("s") ? label : `${label}s`;
+  } catch {
+    return "Items";
+  }
 }
 
 export function layoutTopology(topology: GraphTopology): GraphLayout {
@@ -140,7 +175,7 @@ export function layoutTopology(topology: GraphTopology): GraphLayout {
     const position = unitPositions[family.id];
     family.memberIds.forEach((memberId, index) => {
       nodePositions[memberId] = {
-        x: position.x + FAMILY_PAD_X,
+        x: position.x + (family.width - NODE_WIDTH) / 2,
         y: position.y + FAMILY_HEADER_HEIGHT + index * (NODE_HEIGHT + FAMILY_MEMBER_GAP),
       };
     });
@@ -154,18 +189,33 @@ export function layoutTopology(topology: GraphTopology): GraphLayout {
 export function buildFlowEdges(
   topology: GraphTopology,
   edges: Record<string, GraphEdge>,
+  selectedBundleId: string | null = null,
 ): Edge[] {
-  return topology.edgeIds.flatMap((id) => {
+  const bundles = new Map<string, GraphEdge[]>();
+  for (const id of topology.edgeIds) {
     const edge = edges[id];
-    if (!edge) return [];
-    const inferred = edge.via === "inferred";
+    if (!edge) continue;
+    const source = topology.ownerByNode[edge.from] ?? edge.from;
+    const target = topology.ownerByNode[edge.to] ?? edge.to;
+    if (source === target) continue;
+    const bundleId = `bundle:${source}>${target}`;
+    const bucket = bundles.get(bundleId) ?? [];
+    bucket.push(edge);
+    bundles.set(bundleId, bucket);
+  }
+  return [...bundles.entries()].map(([id, bundle]) => {
+    const edge = bundle[0];
+    const inferred = bundle.every((item) => item.via === "inferred");
     const stroke = inferred ? "var(--text-muted)" : "var(--border-2)";
-    return [{
-      id: edge.id,
-      source: edge.from,
-      target: edge.to,
+    const label = bundle.length > 1
+      ? `${bundle.length} paths: ${truncate(edge.label, 30)}`
+      : truncate(edge.label, 42);
+    return {
+      id,
+      source: topology.ownerByNode[edge.from] ?? edge.from,
+      target: topology.ownerByNode[edge.to] ?? edge.to,
       type: "smoothstep",
-      label: truncate(edge.label, 42),
+      label: selectedBundleId === id ? label : undefined,
       animated: inferred,
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       style: {
@@ -177,6 +227,7 @@ export function buildFlowEdges(
       labelBgPadding: [4, 2] as [number, number],
       labelBgBorderRadius: 3,
       labelBgStyle: { fill: "var(--bg)", fillOpacity: 0.9 },
-    }];
+      data: { edgeIds: bundle.map((item) => item.id), count: bundle.length },
+    };
   });
 }

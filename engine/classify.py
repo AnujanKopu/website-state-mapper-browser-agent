@@ -42,7 +42,7 @@ def classify_state(
     """Assign a state type and detection flags from structural evidence."""
     flags = {
         "modal_open": signals.modal_open,
-        "auth_required": signals.password_fields > 0,
+        "auth_required": signals.password_fields > 0 or signals.username_fields > 0,
         "payment_required": signals.payment_fields > 0
         or any(d.category and d.category.value == "payment" for _, d in denied),
         "form_count": signals.form_count,
@@ -64,7 +64,11 @@ def classify_state(
         state_type = StateType.RISKY_TERMINAL
     elif signals.modal_open:
         state_type = StateType.MODAL
-    elif signals.password_fields > 0 and _LOGIN_WORDS.search(visible_text):
+    elif (
+        (signals.password_fields > 0 or signals.username_fields > 0)
+        and signals.form_count > 0
+        and _LOGIN_WORDS.search(visible_text)
+    ):
         state_type = StateType.AUTH_WALL
     elif signals.payment_fields > 0 or (
         _PRICE.search(visible_text) and _PAYWALL_WORDS.search(visible_text)

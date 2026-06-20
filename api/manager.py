@@ -322,4 +322,6 @@ class RunManager:
         for name in budget_fields:
             if (value := overrides.get(name)) is not None:
                 setattr(config.budgets, name, value)
+        if (auth_mode := overrides.get("auth_mode")) is not None:
+            config.authentication.mode = auth_mode
         return config

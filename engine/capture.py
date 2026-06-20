@@ -26,7 +26,7 @@ from engine.classify import analyze_state
 from engine.config import Settings, load_run_config
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
-from engine.schemas import ActionStep, CapturedState, Observation, RunConfig
+from engine.schemas import ActionStep, AuthContext, CapturedState, Observation, RunConfig
 from engine.storage import LocalStorage, StorageBackend
 
 
@@ -34,7 +34,12 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
-async def observe_page(page: Page, config: RunConfig) -> Observation:
+async def observe_page(
+    page: Page,
+    config: RunConfig,
+    *,
+    auth_context: AuthContext = AuthContext.UNKNOWN,
+) -> Observation:
     """Stabilize and observe the current page; compute all identity signals."""
     await stabilize(page, config.browser.stabilize_quiet_ms)
     snapshot = await take_snapshot(page, config.capture)
@@ -50,6 +55,7 @@ async def observe_page(page: Page, config: RunConfig) -> Observation:
         "modal" if snapshot.signals.modal_open else "page",
         skeleton_hash,
         action_sig,
+        auth_context.value,
     )
 
     return Observation(
@@ -62,6 +68,23 @@ async def observe_page(page: Page, config: RunConfig) -> Observation:
         action_sig=action_sig,
         screenshot_dhash=identity.screenshot_dhash(snapshot.screenshot_png),
         fingerprint=fingerprint,
+        auth_context=auth_context,
+    )
+
+
+def with_auth_context(
+    observation: Observation, auth_context: AuthContext
+) -> Observation:
+    """Re-key an already captured observation without another page capture."""
+    fingerprint = identity.state_fingerprint(
+        observation.url_normalized,
+        "modal" if observation.snapshot.signals.modal_open else "page",
+        observation.skeleton_hash,
+        observation.action_sig,
+        auth_context.value,
+    )
+    return observation.model_copy(
+        update={"auth_context": auth_context, "fingerprint": fingerprint}
     )
 
 

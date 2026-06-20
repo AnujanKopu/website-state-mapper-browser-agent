@@ -14,6 +14,9 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
   const submitRef = useRef<HTMLButtonElement>(null);
   const [url, setUrl] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [authMode, setAuthMode] = useState<"guest" | "login">("guest");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [maxStates, setMaxStates] = useState("");
   const [maxActions, setMaxActions] = useState("");
   const [maxDepth, setMaxDepth] = useState("");
@@ -24,13 +27,24 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!url.trim() || submitting) return;
+    if (
+      !url.trim()
+      || submitting
+      || (authMode === "login" && (!username.trim() || !password))
+    ) return;
     setSubmitting(true);
     setError(null);
 
     // UI-driven runs only consume screenshots + graph metadata, so skip the
     // raw DOM HTML artifacts to save disk.
-    const input: CreateRunInput = { url: url.trim(), save_dom_snapshots: false };
+    const input: CreateRunInput = {
+      url: url.trim(),
+      auth_mode: authMode,
+      save_dom_snapshots: false,
+    };
+    if (authMode === "login") {
+      input.credentials = { username: username.trim(), password };
+    }
     const asInt = (value: string): number | undefined => {
       const n = Number.parseInt(value, 10);
       return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -68,12 +82,67 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
               ref={submitRef}
               className="button button--primary landing__submit"
               type="submit"
-              disabled={submitting}
+              disabled={
+                submitting
+                || (authMode === "login" && (!username.trim() || !password))
+              }
             >
               {submitting ? "Starting\u2026" : "Start mapping"}
               {!submitting && <span aria-hidden>↗</span>}
             </button>
           </div>
+
+          <fieldset className="landing__auth-mode">
+            <legend>Session mode</legend>
+            <label className={authMode === "guest" ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="auth-mode"
+                value="guest"
+                checked={authMode === "guest"}
+                onChange={() => setAuthMode("guest")}
+              />
+              Without login
+            </label>
+            <label className={authMode === "login" ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="auth-mode"
+                value="login"
+                checked={authMode === "login"}
+                onChange={() => setAuthMode("login")}
+              />
+              With login
+            </label>
+          </fieldset>
+
+          {authMode === "login" && (
+            <div className="landing__credentials">
+              <label>
+                Username or email
+                <input
+                  className="text-input text-input--small"
+                  type="text"
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  className="text-input text-input--small"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  required
+                />
+              </label>
+              <p>Credentials are held in memory for this run and are never exported.</p>
+            </div>
+          )}
 
           <button
             type="button"

@@ -1,5 +1,7 @@
 // Mirrors the backend SSE contract v1 (engine/events.py + api/manager.py).
 
+import type { FamilyMetadata, NameMetadata } from "./graph";
+
 export type EventType =
   | "run_started"
   | "state_discovered"
@@ -69,6 +71,7 @@ export interface RunStartedPayload extends BasePayload {
     max_actions: number;
     max_depth: number;
     max_wall_seconds: number;
+    auth_mode?: "guest" | "login";
   };
 }
 
@@ -86,6 +89,13 @@ export interface StateDiscoveredPayload extends BasePayload {
   denied_count: number;
   surface_items?: SurfaceItemLite[];
   route_family?: string | null;
+  auth_context?: "guest" | "authenticated" | "unknown";
+  page_role?: "home" | "hub" | "detail" | "results" | "flow_step" | "boundary";
+  page_depth?: number;
+  substate_depth?: number;
+  label?: string;
+  name?: NameMetadata;
+  family?: FamilyMetadata | null;
 }
 
 export interface EdgeDiscoveredPayload extends BasePayload {

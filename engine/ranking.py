@@ -42,6 +42,7 @@ _SCORE_NEW_URL = 10.0
 _SCORE_VISITED_URL = -30.0
 _SCORE_MAIN_FOLD0 = 8.0
 _SCORE_FOOTER = -15.0
+_SCORE_ASIDE_NAV = 12.0
 _SCORE_AUTH_ENTRY = 25.0  # on top of flow keyword — reach login before content nav
 
 _AUTH_ENTRY = re.compile(r"\b(log\s?in|sign\s?in|sign\s?up|register|create\s+account)\b", re.I)
@@ -58,6 +59,9 @@ class ActionCandidate:
     # Set only for repeated, content-like link cohorts whose URLs differ in
     # parameter positions (for example /game/123/foo and /game/456/bar).
     family_pattern: str | None = None
+    family_id: str | None = None
+    family_label: str | None = None
+    family_kind: str | None = None
 
 
 def loose_url_pattern(url: str) -> str:
@@ -123,6 +127,36 @@ def _infer_family_pattern(items: list[Interactable]) -> str | None:
     return urlunsplit((first.scheme, first.netloc, path, urlencode(pattern_query, safe=":"), ""))
 
 
+def _family_display(pattern: str, items: list[Interactable]) -> tuple[str, str, str]:
+    family_id = hashlib.sha1(f"route-family|{pattern}".encode()).hexdigest()[:12]
+    contexts = [item.context_label for item in items if item.context_label]
+    if contexts and len(set(contexts)) == 1:
+        label = contexts[0] or "Items"
+    else:
+        segments = [
+            segment
+            for segment in urlsplit(pattern).path.split("/")
+            if segment and not segment.startswith(":")
+        ]
+        label = (segments[-1] if segments else "items").replace("-", " ").title()
+    lowered = label.lower()
+    kinds = (
+        ("game", "Games"),
+        ("video", "Videos"),
+        ("product", "Products"),
+        ("post", "Posts"),
+        ("profile", "Profiles"),
+        ("user", "Profiles"),
+        ("item", "Items"),
+        ("card", "Cards"),
+    )
+    kind = next((kind for kind, _ in kinds if kind in lowered or kind in pattern.lower()), "items")
+    if not contexts:
+        canonical = next((name for needle, name in kinds if needle == kind), None)
+        label = canonical or (label if label.endswith("s") else f"{label}s")
+    return family_id, label, kind
+
+
 def _group_key(item: Interactable) -> tuple[str, str, str, str]:
     target = (
         loose_url_pattern(item.href)
@@ -165,16 +199,25 @@ def collapse_siblings(items: list[Interactable]) -> list[ActionCandidate]:
         selector_key = (item.tag, item.role or "", strip_positional_selector(item.selector))
         selector_cohorts.setdefault((*selector_key, *shape), []).append(item)
 
-    family_by_item: dict[str, tuple[str, int, list[str]]] = {}
+    family_by_item: dict[
+        str, tuple[str, int, list[str], str, str, str]
+    ] = {}
     for cohort in selector_cohorts.values():
         pattern = _infer_family_pattern(cohort)
         if pattern is None:
             continue
-        group_id = hashlib.sha1(f"route-family|{pattern}".encode()).hexdigest()[:12]
+        group_id, family_label, family_kind = _family_display(pattern, cohort)
         labels = [item.label for item in cohort]
         for item in cohort:
             item.group_id = group_id
-            family_by_item[item.item_id or item.selector] = (pattern, len(cohort), labels)
+            family_by_item[item.item_id or item.selector] = (
+                pattern,
+                len(cohort),
+                labels,
+                group_id,
+                family_label,
+                family_kind,
+            )
 
     groups: dict[tuple, ActionCandidate] = {}
     candidates: list[ActionCandidate] = []
@@ -182,7 +225,7 @@ def collapse_siblings(items: list[Interactable]) -> list[ActionCandidate]:
     for item in items:
         family = family_by_item.get(item.item_id or item.selector)
         if family is not None:
-            pattern, family_size, labels = family
+            pattern, family_size, labels, family_id, family_label, family_kind = family
             # Keep members as separate candidates so the explorer can observe
             # and compare a bounded number of examples. The first candidate's
             # count describes the full discovered cohort in graph output.
@@ -192,6 +235,9 @@ def collapse_siblings(items: list[Interactable]) -> list[ActionCandidate]:
                     collapsed_count=family_size if pattern not in family_seen else 1,
                     grouped_labels=labels if pattern not in family_seen else [item.label],
                     family_pattern=pattern,
+                    family_id=family_id,
+                    family_label=family_label,
+                    family_kind=family_kind,
                 )
             )
             family_seen.add(pattern)
@@ -232,6 +278,8 @@ def score_action(candidate: ActionCandidate, *, visited_urls: set[str]) -> float
     # de-prioritize footer boilerplate.
     if item.region == "main" and item.fold == 0:
         score += _SCORE_MAIN_FOLD0
+    if item.region == "aside" and item.kind in {"link", "menuitem"}:
+        score += _SCORE_ASIDE_NAV
     if item.region == "footer":
         score += _SCORE_FOOTER
 

@@ -203,6 +203,31 @@ code {
   color: #e2e5df;
 }
 
+.landing__auth-mode {
+  display:flex;
+  gap:8px;
+  margin:14px 0 0;
+  padding:0;
+  border:0;
+}
+.landing__auth-mode legend { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+.landing__auth-mode label {
+  display:flex;
+  align-items:center;
+  gap:7px;
+  min-height:34px;
+  padding:0 12px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  color:var(--text-muted);
+  cursor:pointer;
+}
+.landing__auth-mode label.is-selected { border-color:var(--green); color:var(--text); background:rgba(91,184,125,.08); }
+.landing__auth-mode input { accent-color:var(--green); }
+.landing__credentials { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px; }
+.landing__credentials label { display:grid; gap:6px; color:var(--text-muted); font-size:12px; }
+.landing__credentials p { grid-column:1 / -1; margin:0; color:var(--text-muted); font-size:11px; }
+
 .landing__advanced {
   display: flex;
   gap: 12px;
@@ -905,7 +930,7 @@ code {
 }
 
 .react-flow__node-family {
-  pointer-events: none !important;
+  pointer-events: auto !important;
 }
 
 .family-group {
@@ -917,6 +942,8 @@ code {
   background: rgba(110, 168, 254, 0.045);
   padding: 10px 14px;
 }
+.family-group--selected { border-color:var(--blue); background:rgba(110,168,254,.09); }
+.family-group__handle { width:7px; height:7px; border:0; background:var(--blue); opacity:.75; }
 
 .family-group__heading {
   display: flex;
@@ -925,6 +952,8 @@ code {
   gap: 12px;
   min-width: 0;
 }
+.family-group__heading > div { display:grid; gap:2px; min-width:0; }
+.family-group__heading strong { font-size:12px; color:var(--text); }
 
 .family-group__pattern {
   min-width: 0;
@@ -941,6 +970,18 @@ code {
   font-size: 10px;
   color: var(--text-muted);
 }
+
+.graph-search input {
+  width:min(260px, 45vw);
+  min-height:34px;
+  padding:0 11px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:rgba(14,16,20,.92);
+  color:var(--text);
+  outline:none;
+}
+.graph-search input:focus { border-color:var(--blue); }
 
 /* ---------- Node panel ---------- */
 
@@ -2638,10 +2679,37 @@ code {
 .landing-metric span { color:#656a62; font-size:13px; font-weight:550; }
 
 .landing-final { position:relative; min-height:680px; padding:120px 24px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; overflow:hidden; }
-.landing-final h2 { max-width:900px; font-size:clamp(50px,6vw,88px); }
+.landing-final h2 {
+  max-width: min(820px, 92vw);
+  margin-inline: auto;
+  font-size: clamp(40px, 5.5vw, 76px);
+  line-height: 1.08;
+  letter-spacing: -0.05em;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.landing-final__dot {
+  margin-left: 0.08em;
+}
+.landing-final > p,
+.landing-final h2,
+.landing-final .button { position: relative; z-index: 1; }
 .landing-final .button { margin-top:25px; min-height:44px; padding-inline:22px; }
-.landing-final__trace { position:absolute; z-index:-1; width:850px; height:300px; left:50%; top:50%; border:1px solid rgba(255,255,255,.035); border-radius:50%; transform:translate(-50%,-50%) rotate(-8deg); box-shadow:0 0 0 70px rgba(99,102,241,.015),0 0 0 140px rgba(236,72,153,.01); }
-.landing-final__trace::after { content:""; position:absolute; width:9px; height:9px; left:12%; top:24%; border-radius:50%; background:#a855f7; box-shadow:0 0 22px #a855f7; animation:final-orbit 7s ease-in-out infinite alternate; }
+.landing-final__trace {
+  position:absolute;
+  z-index:0;
+  width:min(720px, 88vw);
+  height:min(260px, 34vw);
+  left:50%;
+  top:54%;
+  border:1px solid rgba(255,255,255,.03);
+  border-radius:50%;
+  transform:translate(-50%,-50%) rotate(-8deg);
+  box-shadow:0 0 0 60px rgba(99,102,241,.01);
+  opacity:0.55;
+  pointer-events:none;
+}
 
 .landing-footer { min-height:120px; padding:30px; display:flex; align-items:center; justify-content:space-between; gap:20px; border-top:1px solid #20231f; color:#5d625a; font:9px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
 .landing-footer a { color:#757a72; text-decoration:none; }
@@ -2673,7 +2741,6 @@ code {
 @keyframes stage-scan { 0%,100% { top:18%; opacity:0; } 15%,85% { opacity:.8; } 90% { top:82%; opacity:0; } }
 @keyframes cursor-roam { 0%,100% { transform:translate(0,0); } 45% { transform:translate(-70px,-35px); } 70% { transform:translate(-28px,42px); } }
 @keyframes badge-float { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-5px); } }
-@keyframes final-orbit { from { left:12%; top:24%; } to { left:84%; top:68%; } }
 
 @media (max-width: 900px) {
   .landing__nav { display:none; }

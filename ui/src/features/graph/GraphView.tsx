@@ -18,7 +18,7 @@ import { StateNodeView, type StateFlowNode } from "./StateNode";
 type GraphFlowNode = StateFlowNode | FamilyFlowNode;
 
 const nodeTypes = { state: StateNodeView, family: FamilyGroupView };
-const LIVE_LAYOUT_DEBOUNCE_MS = 150;
+const LIVE_LAYOUT_DEBOUNCE_MS = 300;
 const FIT_PADDING = 0.18;
 
 interface GraphViewProps {
@@ -48,13 +48,30 @@ function GraphCanvas({
   const fitFrameRef = useRef<number | null>(null);
   const explicitFitDurationRef = useRef<number | null>(null);
   const [following, setFollowing] = useState(true);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const nodesInitialized = useNodesInitialized();
   const { fitView } = useReactFlow<GraphFlowNode, Edge>();
 
   const layout = useMemo(
     () => layoutTopology(displayTopology),
-    [displayTopology],
+    [displayTopology.layoutKey],
   );
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const focusedNodeIds = useMemo(() => {
+    if (!selectedId) return null;
+    const focused = new Set<string>([selectedId]);
+    let cursor = selectedId;
+    while (true) {
+      const inbound = Object.values(edges).find((edge) => edge.to === cursor);
+      if (!inbound || focused.has(inbound.from)) break;
+      focused.add(inbound.from);
+      cursor = inbound.from;
+    }
+    return focused;
+  }, [edges, selectedId]);
 
   const rfNodes = useMemo<GraphFlowNode[]>(
     () => [
@@ -62,8 +79,19 @@ function GraphCanvas({
         id: family.id,
         type: "family",
         position: family.position,
-        data: { pattern: family.pattern, memberCount: family.memberIds.length },
-        selectable: false,
+        data: {
+          pattern: family.pattern,
+          memberCount: family.memberIds.length,
+          label: family.label,
+          kind: family.kind,
+          discoveredCount: family.discoveredCount,
+          checkedCount: family.checkedCount,
+          representedCount: family.representedCount,
+          skippedCount: family.skippedCount,
+          sampleLabels: family.sampleLabels,
+        },
+        selected: family.id === selectedFamilyId,
+        selectable: true,
         draggable: false,
         connectable: false,
         focusable: false,
@@ -71,7 +99,8 @@ function GraphCanvas({
         style: {
           width: family.width,
           height: family.height,
-          pointerEvents: "none",
+          pointerEvents: "auto",
+          opacity: normalizedQuery && !`${family.label} ${family.pattern}`.toLowerCase().includes(normalizedQuery) ? 0.2 : 1,
         },
       })),
       ...displayTopology.nodeIds.flatMap((id): StateFlowNode[] => {
@@ -85,15 +114,23 @@ function GraphCanvas({
           selected: id === selectedId,
           zIndex: 1,
           data: { state, current: id === currentId },
+          style: {
+            opacity:
+              (normalizedQuery
+                && !`${state.label ?? state.title} ${state.url}`.toLowerCase().includes(normalizedQuery))
+              || (focusedNodeIds && !focusedNodeIds.has(id))
+                ? 0.2
+                : 1,
+          },
         }];
       }),
     ],
-    [currentId, displayTopology.nodeIds, layout, nodes, selectedId],
+    [currentId, displayTopology.nodeIds, focusedNodeIds, layout, nodes, normalizedQuery, selectedFamilyId, selectedId],
   );
 
   const rfEdges = useMemo(
-    () => buildFlowEdges(displayTopology, edges),
-    [displayTopology, edges],
+    () => buildFlowEdges(displayTopology, edges, selectedEdgeId),
+    [displayTopology, edges, selectedEdgeId],
   );
 
   const fitGraph = useCallback((duration: number) => {
@@ -129,7 +166,7 @@ function GraphCanvas({
       explicitFitDurationRef.current = null;
       scheduleFit(duration);
     }
-  }, [displayTopology.key, following, nodesInitialized, rfNodes.length, scheduleFit]);
+  }, [displayTopology.layoutKey, following, nodesInitialized, rfNodes.length, scheduleFit]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -189,8 +226,19 @@ function GraphCanvas({
           if (event) setFollowing(false);
         }}
         onNodeClick={(_, node) => {
-          if (node.type === "state") onSelect(node.id);
+          if (node.type === "state") {
+            setSelectedFamilyId(null);
+            onSelect(node.id);
+          } else if (node.type === "family") {
+            setSelectedFamilyId(node.id);
+          }
         }}
+        onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
+        onPaneClick={() => {
+          setSelectedEdgeId(null);
+          setSelectedFamilyId(null);
+        }}
+        onlyRenderVisibleElements
         minZoom={0.1}
         maxZoom={1.8}
         proOptions={{ hideAttribution: true }}
@@ -200,6 +248,15 @@ function GraphCanvas({
         <Panel position="top-left" className="graph-label">
           <span>State topology</span>
           <strong>{displayTopology.nodeIds.length} nodes · {rfEdges.length} edges</strong>
+        </Panel>
+        <Panel position="bottom-left" className="graph-search">
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Find state, family, or URL"
+            aria-label="Find state, family, or URL"
+          />
         </Panel>
         <Panel position="top-right">
           <button

@@ -82,6 +82,12 @@ _OBSERVE_JS = """
     signals: {
       modal_open: visibleAll('[role="dialog"], dialog[open], [aria-modal="true"]').length > 0,
       password_fields: visibleAll('input[type="password"]').length,
+      username_fields: visibleAll([
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+        'input[name*="user" i]',
+        'input[name*="login" i]',
+      ].join(', ')).length,
       payment_fields: paymentFields,
       form_count: visibleAll('form').length,
     },
