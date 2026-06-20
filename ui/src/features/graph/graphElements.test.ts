@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphEdge, GraphState } from "../../types/graph";
-import { buildFlowEdges, createGraphTopology, layoutTopology } from "./graphElements";
+import { buildFlowEdges, collectNodeEdgeFocus, createGraphTopology, layoutTopology } from "./graphElements";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 
 function state(id: string, index: number, title = id): GraphState {
@@ -132,6 +132,74 @@ describe("graph element derivation", () => {
     const topology = createGraphTopology({ lone, substate }, {});
     expect(topology.families).toEqual([]);
     expect(layoutTopology(topology).familyBoxes).toEqual([]);
+  });
+
+  it("highlights inbound and outbound edge bundles for a selected node", () => {
+    const graphNodes = { a: state("a", 0), b: state("b", 1), c: state("c", 2) };
+    const edges = {
+      in: edge("in", "a", "b"),
+      out: edge("out", "b", "c"),
+      other: edge("other", "a", "c"),
+    };
+    const topology = createGraphTopology(graphNodes, edges);
+    const focus = collectNodeEdgeFocus(topology, graphNodes, edges, "b");
+    const flowEdges = buildFlowEdges(topology, edges, null, "b", graphNodes);
+
+    expect(focus?.nodeIds).toEqual(new Set(["a", "b", "c"]));
+    expect(focus?.bundleDirections.get("bundle:a>b")).toBe("inbound");
+    expect(focus?.bundleDirections.get("bundle:b>c")).toBe("outbound");
+    expect(focus?.bundleIds.has("bundle:a>c")).toBe(false);
+
+    const inbound = flowEdges.find((item) => item.id === "bundle:a>b");
+    const outbound = flowEdges.find((item) => item.id === "bundle:b>c");
+    const unrelated = flowEdges.find((item) => item.id === "bundle:a>c");
+    expect(inbound?.className).toBe("graph-edge--inbound");
+    expect(outbound?.className).toBe("graph-edge--outbound");
+    expect(inbound?.label).toBeTruthy();
+    expect(outbound?.label).toBeTruthy();
+    expect(unrelated?.className).toBe("graph-edge--dimmed");
+    expect(inbound?.style).toMatchObject({ stroke: "var(--edge-inbound)", strokeWidth: 2.5, opacity: 1 });
+  });
+
+  it("treats child-target edges as inbound when the parent hub is selected", () => {
+    const tab = state("tab", 2);
+    tab.parent_state_id = "hub";
+    tab.type = "tab";
+    const graphNodes = {
+      root: state("root", 0),
+      hub: state("hub", 1),
+      tab,
+    };
+    const edges = { rootTab: edge("rootTab", "root", "tab") };
+    const topology = createGraphTopology(graphNodes, edges);
+    const focus = collectNodeEdgeFocus(topology, graphNodes, edges, "hub");
+    const flowEdges = buildFlowEdges(topology, edges, null, "hub", graphNodes);
+
+    expect(focus?.bundleIds.has("bundle:root>tab")).toBe(true);
+    expect(focus?.nodeIds).toEqual(new Set(["root", "hub", "tab"]));
+    expect(flowEdges[0].className).toBe("graph-edge--connected");
+    expect(flowEdges[0].style).toMatchObject({ stroke: "var(--edge-connected)" });
+  });
+
+  it("highlights inbound bundles into a selected family member", () => {
+    const family = "https://example.com/game/:id/:param";
+    const graphNodes = {
+      hub: state("hub", 0),
+      first: state("first", 1, "Games Stats"),
+      second: state("second", 2, "Avatar Items Stats"),
+    };
+    graphNodes.first.exploration = { route_family: family };
+    graphNodes.second.exploration = { route_family: family };
+    const edges = { hubSecond: edge("hubSecond", "hub", "second") };
+    const topology = createGraphTopology(graphNodes, edges);
+    const focus = collectNodeEdgeFocus(topology, graphNodes, edges, "first");
+    const flowEdges = buildFlowEdges(topology, edges, null, "first", graphNodes);
+
+    expect(focus?.bundleIds.size).toBe(1);
+    expect([...focus!.bundleIds][0].startsWith("bundle:hub>family-")).toBe(true);
+    const inbound = flowEdges.find((item) => item.className === "graph-edge--inbound");
+    expect(inbound).toBeTruthy();
+    expect(focus?.nodeIds.has("hub")).toBe(true);
   });
 
   it("boxes one retained representative when a repeated cohort was discovered", () => {

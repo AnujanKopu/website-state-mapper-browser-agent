@@ -10,6 +10,9 @@
   --accent: #2563eb;
   --green: #5bbf8a;
   --amber: #d8a657;
+  --edge-inbound: #a78bfa;
+  --edge-outbound: #e8944a;
+  --edge-connected: #6ea8fe;
   --red: #e06c75;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -858,6 +861,15 @@ code {
   opacity: 0.45;
 }
 
+.graph-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.graph-view .react-flow__controls {
+  bottom: 56px;
+}
+
 .state-node {
   width: 210px;
   height: 78px;
@@ -885,7 +897,26 @@ code {
 }
 
 .react-flow__edge-path {
-  transition: stroke 0.15s ease;
+  transition: stroke 0.15s ease, opacity 0.15s ease, stroke-width 0.15s ease;
+}
+
+.react-flow__edge.graph-edge--inbound .react-flow__edge-path {
+  stroke: var(--edge-inbound) !important;
+  stroke-width: 2.5px;
+}
+
+.react-flow__edge.graph-edge--outbound .react-flow__edge-path {
+  stroke: var(--edge-outbound) !important;
+  stroke-width: 2px;
+}
+
+.react-flow__edge.graph-edge--connected .react-flow__edge-path {
+  stroke: var(--edge-connected) !important;
+  stroke-width: 2px;
+}
+
+.react-flow__edge.graph-edge--dimmed .react-flow__edge-path {
+  opacity: 0.16;
 }
 
 .state-node__top {
@@ -1850,6 +1881,15 @@ code {
 
 .graph-follow:hover:not(:disabled) { transform: translateY(-1px); }
 
+.graph-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.graph-view .react-flow__controls {
+  bottom: 56px;
+}
+
 .react-flow__controls {
   overflow: hidden;
   border: 1px solid var(--border-2);
@@ -1895,6 +1935,25 @@ code {
 .react-flow__edge:hover .react-flow__edge-path {
   stroke: #737a6f;
   stroke-width: 1.5;
+}
+
+.react-flow__edge.graph-edge--inbound .react-flow__edge-path {
+  stroke: var(--edge-inbound) !important;
+  stroke-width: 2.5px;
+}
+
+.react-flow__edge.graph-edge--outbound .react-flow__edge-path {
+  stroke: var(--edge-outbound) !important;
+  stroke-width: 2px;
+}
+
+.react-flow__edge.graph-edge--connected .react-flow__edge-path {
+  stroke: var(--edge-connected) !important;
+  stroke-width: 2px;
+}
+
+.react-flow__edge.graph-edge--dimmed .react-flow__edge-path {
+  opacity: 0.16;
 }
 
 .node-panel {

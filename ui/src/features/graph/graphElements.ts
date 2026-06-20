@@ -185,20 +185,137 @@ export function layoutTopology(topology: GraphTopology): GraphLayout {
   return { nodePositions, familyBoxes };
 }
 
+function edgeBundleId(topology: GraphTopology, edge: GraphEdge): string | null {
+  const source = topology.ownerByNode[edge.from] ?? edge.from;
+  const target = topology.ownerByNode[edge.to] ?? edge.to;
+  if (source === target) return null;
+  return `bundle:${source}>${target}`;
+}
+
+function layoutUnit(topology: GraphTopology, nodeId: string): string {
+  return topology.ownerByNode[nodeId] ?? nodeId;
+}
+
+function isDescendantOf(
+  nodes: Record<string, GraphState>,
+  nodeId: string,
+  ancestorId: string,
+): boolean {
+  return nodes[nodeId]?.parent_state_id === ancestorId;
+}
+
+function edgeTargetsNode(
+  topology: GraphTopology,
+  nodes: Record<string, GraphState>,
+  edge: GraphEdge,
+  nodeId: string,
+): boolean {
+  if (edge.to === nodeId) return true;
+  if (isDescendantOf(nodes, edge.to, nodeId)) return true;
+  return layoutUnit(topology, edge.to) === layoutUnit(topology, nodeId);
+}
+
+function edgeSourcesNode(
+  topology: GraphTopology,
+  nodes: Record<string, GraphState>,
+  edge: GraphEdge,
+  nodeId: string,
+): boolean {
+  if (edge.from === nodeId) return true;
+  if (isDescendantOf(nodes, edge.from, nodeId)) return true;
+  return layoutUnit(topology, edge.from) === layoutUnit(topology, nodeId);
+}
+
+export type EdgeFocusDirection = "inbound" | "outbound" | "both";
+
+export interface NodeEdgeFocus {
+  nodeIds: Set<string>;
+  bundleIds: Set<string>;
+  bundleDirections: Map<string, EdgeFocusDirection>;
+}
+
+/** Selected node, its ancestor paths, neighbors, and connected edge bundles. */
+export function collectNodeEdgeFocus(
+  topology: GraphTopology,
+  nodes: Record<string, GraphState>,
+  edges: Record<string, GraphEdge>,
+  selectedId: string | null,
+): NodeEdgeFocus | null {
+  if (!selectedId) return null;
+
+  const nodeIds = new Set<string>([selectedId]);
+  const bundleIds = new Set<string>();
+  const bundleDirections = new Map<string, EdgeFocusDirection>();
+
+  const markBundle = (edge: GraphEdge, direction: Exclude<EdgeFocusDirection, "both">) => {
+    const bundleId = edgeBundleId(topology, edge);
+    if (!bundleId) return;
+    bundleIds.add(bundleId);
+    nodeIds.add(edge.from);
+    nodeIds.add(edge.to);
+    const existing = bundleDirections.get(bundleId);
+    if (!existing || existing === direction) bundleDirections.set(bundleId, direction);
+    else bundleDirections.set(bundleId, "both");
+  };
+
+  for (const edge of Object.values(edges)) {
+    const outbound = edgeSourcesNode(topology, nodes, edge, selectedId);
+    const inbound = edgeTargetsNode(topology, nodes, edge, selectedId);
+    if (outbound) markBundle(edge, "outbound");
+    if (inbound) markBundle(edge, "inbound");
+  }
+
+  const queue = [selectedId];
+  const visited = new Set<string>([selectedId]);
+  while (queue.length > 0) {
+    const cursor = queue.shift()!;
+    for (const edge of Object.values(edges)) {
+      if (!edgeTargetsNode(topology, nodes, edge, cursor)) continue;
+      markBundle(edge, "inbound");
+      if (visited.has(edge.from)) continue;
+      visited.add(edge.from);
+      queue.push(edge.from);
+    }
+  }
+
+  return { nodeIds, bundleIds, bundleDirections };
+}
+
+function bundleVisualRole(
+  nodes: Record<string, GraphState>,
+  bundle: GraphEdge[],
+  focusedNodeId: string | null,
+  direction: EdgeFocusDirection | undefined,
+): EdgeFocusDirection | null {
+  if (!direction) return null;
+  if (direction === "both") return "both";
+  if (
+    focusedNodeId
+    && bundle.some((item) =>
+      isDescendantOf(nodes, item.to, focusedNodeId)
+      || isDescendantOf(nodes, item.from, focusedNodeId),
+    )
+  ) {
+    return "both";
+  }
+  return direction;
+}
+
 /** Presentation details are derived separately so metadata updates do not re-run Dagre. */
 export function buildFlowEdges(
   topology: GraphTopology,
   edges: Record<string, GraphEdge>,
   selectedBundleId: string | null = null,
+  focusedNodeId: string | null = null,
+  graphNodes: Record<string, GraphState> = {},
 ): Edge[] {
+  const focus = collectNodeEdgeFocus(topology, graphNodes, edges, focusedNodeId);
   const bundles = new Map<string, GraphEdge[]>();
   for (const id of topology.edgeIds) {
     const edge = edges[id];
     if (!edge) continue;
-    const source = topology.ownerByNode[edge.from] ?? edge.from;
-    const target = topology.ownerByNode[edge.to] ?? edge.to;
-    if (source === target) continue;
-    const bundleId = `bundle:${source}>${target}`;
+    const bundleId = edgeBundleId(topology, edge);
+    if (!bundleId) continue;
     const bucket = bundles.get(bundleId) ?? [];
     bucket.push(edge);
     bundles.set(bundleId, bucket);
@@ -206,7 +323,21 @@ export function buildFlowEdges(
   return [...bundles.entries()].map(([id, bundle]) => {
     const edge = bundle[0];
     const inferred = bundle.every((item) => item.via === "inferred");
-    const stroke = inferred ? "var(--text-muted)" : "var(--border-2)";
+    const connected = focus?.bundleIds.has(id) ?? false;
+    const direction = focus?.bundleDirections.get(id);
+    const visualRole = connected
+      ? bundleVisualRole(graphNodes, bundle, focusedNodeId, direction)
+      : null;
+    const dimmed = Boolean(focus && !connected);
+    const stroke = visualRole === "inbound"
+      ? "var(--edge-inbound)"
+      : visualRole === "outbound"
+        ? "var(--edge-outbound)"
+        : visualRole === "both"
+          ? "var(--edge-connected)"
+          : inferred
+            ? "var(--text-muted)"
+            : "var(--border-2)";
     const label = bundle.length > 1
       ? `${bundle.length} paths: ${truncate(edge.label, 30)}`
       : truncate(edge.label, 42);
@@ -215,19 +346,30 @@ export function buildFlowEdges(
       source: topology.ownerByNode[edge.from] ?? edge.from,
       target: topology.ownerByNode[edge.to] ?? edge.to,
       type: "smoothstep",
-      label: selectedBundleId === id ? label : undefined,
-      animated: inferred,
+      label: selectedBundleId === id || connected ? label : undefined,
+      animated: inferred && !connected,
+      className: visualRole === "inbound"
+        ? "graph-edge--inbound"
+        : visualRole === "outbound"
+          ? "graph-edge--outbound"
+          : visualRole === "both"
+            ? "graph-edge--connected"
+            : dimmed
+              ? "graph-edge--dimmed"
+              : undefined,
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       style: {
         stroke,
-        strokeWidth: inferred ? 1 : 1.25,
-        strokeDasharray: inferred ? "5 4" : undefined,
+        strokeWidth: visualRole === "inbound" ? 2.5 : visualRole ? 2 : inferred ? 1 : 1.25,
+        strokeDasharray: inferred && !connected ? "5 4" : undefined,
+        opacity: dimmed ? 0.16 : 1,
       },
       labelStyle: { fill: "var(--text-secondary)", fontSize: 10 },
       labelBgPadding: [4, 2] as [number, number],
       labelBgBorderRadius: 3,
       labelBgStyle: { fill: "var(--bg)", fillOpacity: 0.9 },
       data: { edgeIds: bundle.map((item) => item.id), count: bundle.length },
+      zIndex: visualRole === "inbound" ? 3 : visualRole ? 2 : 0,
     };
   });
 }
