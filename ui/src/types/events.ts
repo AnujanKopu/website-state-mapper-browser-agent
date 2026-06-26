@@ -1,6 +1,6 @@
 // Mirrors the backend SSE contract v1 (engine/events.py + api/manager.py).
 
-import type { FamilyMetadata, NameMetadata } from "./graph";
+import type { FamilyMetadata, NameMetadata, NavCapability } from "./graph";
 
 export type EventType =
   | "run_started"
@@ -47,6 +47,7 @@ export interface Counters {
   failed: number;
   actions_performed: number;
   frontier_size: number;
+  surface_pending?: number;
 }
 
 export interface SurfaceItemLite {
@@ -101,6 +102,8 @@ export interface StateDiscoveredPayload extends BasePayload {
   label?: string;
   name?: NameMetadata;
   family?: FamilyMetadata | null;
+  nav_capabilities?: NavCapability[];
+  surface_families?: FamilyMetadata[];
 }
 
 export interface EdgeDiscoveredPayload extends BasePayload {
@@ -162,12 +165,14 @@ export interface AuthGatePayload extends BasePayload {
 export interface RunCompletedPayload extends BasePayload {
   status: string;
   stop_reason: string | null;
+  completion_status?: string | null;
   stats: Record<string, unknown>;
 }
 
 export interface RunFailedPayload extends BasePayload {
   error: string;
   stop_reason: string | null;
+  completion_status?: string | null;
 }
 
 export interface SSEEnvelope<P = BasePayload> {

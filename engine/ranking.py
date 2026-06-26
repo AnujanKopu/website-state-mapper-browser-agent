@@ -46,6 +46,11 @@ _SCORE_ASIDE_NAV = 12.0
 _SCORE_AUTH_ENTRY = 25.0  # on top of flow keyword — reach login before content nav
 
 _AUTH_ENTRY = re.compile(r"\b(log\s?in|sign\s?in|sign\s?up|register|create\s+account)\b", re.I)
+_CONTENT_FAMILY_HINT = re.compile(
+    r"\b(game|games|video|videos|product|products|post|posts|blog|article|articles|"
+    r"news|profile|profiles|user|users|player|players|item|items|card|cards)\b",
+    re.I,
+)
 
 
 @dataclass
@@ -62,6 +67,23 @@ class ActionCandidate:
     family_id: str | None = None
     family_label: str | None = None
     family_kind: str | None = None
+
+
+@dataclass
+class SurfaceFamily:
+    """Repeated dynamic-content route family visible on a state surface."""
+
+    pattern: str
+    family_id: str
+    label: str
+    kind: str
+    item_ids: list[str]
+    sample_labels: list[str]
+    sample_urls: list[str]
+
+    @property
+    def discovered_count(self) -> int:
+        return len(self.item_ids)
 
 
 def loose_url_pattern(url: str) -> str:
@@ -112,7 +134,7 @@ def _infer_family_pattern(items: list[Interactable]) -> str | None:
         else:
             pattern_segments.append(":param")
             varied = True
-    if not varied or shared_literals == 0:
+    if shared_literals == 0:
         return None
 
     query_rows = [dict(parse_qsl(part.query, keep_blank_values=True)) for part in normalized]
@@ -120,7 +142,13 @@ def _infer_family_pattern(items: list[Interactable]) -> str | None:
     pattern_query: list[tuple[str, str]] = []
     for key in query_keys:
         values = {row.get(key, "") for row in query_rows}
-        pattern_query.append((key, next(iter(values)) if len(values) == 1 else ":param"))
+        if len(values) == 1:
+            pattern_query.append((key, next(iter(values))))
+        else:
+            varied = True
+            pattern_query.append((key, ":param"))
+    if not varied:
+        return None
 
     first = normalized[0]
     path = "/" + "/".join(pattern_segments) if pattern_segments else "/"
@@ -144,7 +172,10 @@ def _family_display(pattern: str, items: list[Interactable]) -> tuple[str, str, 
         ("game", "Games"),
         ("video", "Videos"),
         ("product", "Products"),
+        ("news", "News"),
+        ("article", "Articles"),
         ("post", "Posts"),
+        ("player", "Players"),
         ("profile", "Profiles"),
         ("user", "Profiles"),
         ("item", "Items"),
@@ -175,6 +206,69 @@ def group_signature(item: Interactable) -> str:
     return hashlib.sha1("|".join(_group_key(item)).encode("utf-8")).hexdigest()[:12]
 
 
+def _content_family_bucket(item: Interactable) -> str | None:
+    href = urlsplit(item.href or "")
+    path = href.path
+    if href.scheme == "file":
+        parts = [part for part in path.split("/") if part]
+        path = "/".join(parts[-2:])
+    haystack = " ".join(
+        filter(None, [item.label, item.context_label, path])
+    )
+    match = _CONTENT_FAMILY_HINT.search(haystack)
+    if not match:
+        return None
+    value = match.group(1).lower()
+    if value.endswith("s"):
+        value = value[:-1]
+    if value == "blog":
+        return "post"
+    if value == "article":
+        return "news"
+    return value
+
+
+def detect_surface_families(items: list[Interactable]) -> list[SurfaceFamily]:
+    """Find repeated dynamic route families across all visible surface links.
+
+    Unlike ``collapse_siblings``, this is not selector-cohort limited. It lets
+    the explorer keep family/group context even when only one representative is
+    sampled or when skipped links never become states.
+    """
+    cohorts: dict[tuple, list[Interactable]] = {}
+    for item in items:
+        shape = _href_shape(item)
+        if shape is None:
+            continue
+        bucket = _content_family_bucket(item)
+        if bucket is None:
+            continue
+        cohorts.setdefault((*shape, bucket), []).append(item)
+
+    families: list[SurfaceFamily] = []
+    seen_patterns: set[str] = set()
+    for cohort in cohorts.values():
+        pattern = _infer_family_pattern(cohort)
+        if pattern is None or pattern in seen_patterns:
+            continue
+        family_id, family_label, family_kind = _family_display(pattern, cohort)
+        for item in cohort:
+            item.group_id = family_id
+        families.append(
+            SurfaceFamily(
+                pattern=pattern,
+                family_id=family_id,
+                label=family_label,
+                kind=family_kind,
+                item_ids=[item.item_id or item.selector for item in cohort],
+                sample_labels=[item.label for item in cohort[:8]],
+                sample_urls=[item.href or "" for item in cohort[:8] if item.href],
+            )
+        )
+        seen_patterns.add(pattern)
+    return families
+
+
 def is_auth_entry(candidate: ActionCandidate) -> bool:
     """True when the action likely opens a login/signup flow."""
     item = candidate.interactable
@@ -196,8 +290,11 @@ def collapse_siblings(items: list[Interactable]) -> list[ActionCandidate]:
         shape = _href_shape(item)
         if shape is None:
             continue
+        bucket = _content_family_bucket(item)
+        if bucket is None:
+            continue
         selector_key = (item.tag, item.role or "", strip_positional_selector(item.selector))
-        selector_cohorts.setdefault((*selector_key, *shape), []).append(item)
+        selector_cohorts.setdefault((*selector_key, *shape, bucket), []).append(item)
 
     family_by_item: dict[
         str, tuple[str, int, list[str], str, str, str]

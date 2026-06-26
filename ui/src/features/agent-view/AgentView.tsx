@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { runStatusLabel, stateTypeLabel } from "../../lib/format";
+import type { GraphState } from "../../types/graph";
 import type { RunState } from "../runs/runState";
 import { CountersBar } from "./CountersBar";
 import type { CounterFilterKey } from "./eventLogFilter";
@@ -10,6 +11,7 @@ import type { ExpandedScreenshot } from "./ScreenshotOverlay";
 
 interface AgentViewProps {
   run: RunState;
+  inspectedState?: GraphState | null;
   onExpandScreenshot: (screenshot: ExpandedScreenshot) => void;
 }
 
@@ -26,11 +28,13 @@ const FILTER_LABELS: Record<CounterFilterKey, string> = {
   failed: "failed",
   noop: "noop",
   frontier_size: "pending",
+  surface_pending: "surface",
 };
 
-export function AgentView({ run, onExpandScreenshot }: AgentViewProps) {
+export function AgentView({ run, inspectedState = null, onExpandScreenshot }: AgentViewProps) {
   const [logFilter, setLogFilter] = useState<CounterFilterKey | null>(null);
-  const current = run.viewportStateId ? run.nodes[run.viewportStateId] : null;
+  const liveCurrent = run.viewportStateId ? run.nodes[run.viewportStateId] : null;
+  const current = inspectedState ?? liveCurrent;
   const isLive = RUNNING.has(run.runStatus) && run.connection === "live";
   const action = run.currentAction;
   const filterLabel = useMemo(
@@ -40,11 +44,16 @@ export function AgentView({ run, onExpandScreenshot }: AgentViewProps) {
 
   return (
     <section className="agent-view">
-      <div className="agent-view__kicker"><span>Agent viewport</span><span>Capture stream</span></div>
+      <div className="agent-view__kicker">
+        <span>{inspectedState ? "Selected state" : "Agent viewport"}</span>
+        <span>{inspectedState ? "Graph inspection" : "Capture stream"}</span>
+      </div>
       <header className="agent-view__header">
         <div className="agent-view__status">
           <span className={`pulse pulse--${isLive ? "live" : run.runStatus}`} aria-hidden />
-          <span className="agent-view__status-text">{runStatusLabel(run.runStatus)}</span>
+          <span className="agent-view__status-text">
+            {runStatusLabel(run.completionStatus ?? run.runStatus)}
+          </span>
           {run.stopReason && <span className="agent-view__stop">{run.stopReason}</span>}
         </div>
         {current && (

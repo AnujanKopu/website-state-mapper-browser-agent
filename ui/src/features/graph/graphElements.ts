@@ -77,21 +77,58 @@ export function createGraphTopology(
 ): GraphTopology {
   const nodeIds = Object.values(nodes).sort(stateOrder).map((state) => state.id);
   const nodeSet = new Set(nodeIds);
-  const familyMembers = new Map<string, GraphState[]>();
+  const familyMembers = new Map<
+    string,
+    { members: GraphState[]; metadata?: NonNullable<GraphState["exploration"]>["family"] }
+  >();
+  const registerFamily = (
+    pattern: string,
+    metadata?: NonNullable<GraphState["exploration"]>["family"],
+  ) => {
+    const current = familyMembers.get(pattern) ?? { members: [] };
+    if (metadata) {
+      const existing = current.metadata;
+      current.metadata = {
+        ...existing,
+        ...metadata,
+        discovered_count: Math.max(
+          existing?.discovered_count ?? 0,
+          metadata.discovered_count ?? 0,
+        ),
+        checked_count: Math.max(existing?.checked_count ?? 0, metadata.checked_count ?? 0),
+        represented_count: Math.max(
+          existing?.represented_count ?? 0,
+          metadata.represented_count ?? 0,
+        ),
+        skipped_count: Math.max(existing?.skipped_count ?? 0, metadata.skipped_count ?? 0),
+        sample_labels: Array.from(
+          new Set([...(existing?.sample_labels ?? []), ...(metadata.sample_labels ?? [])]),
+        ).slice(0, 8),
+        sample_urls: Array.from(
+          new Set([...(existing?.sample_urls ?? []), ...(metadata.sample_urls ?? [])]),
+        ).slice(0, 8),
+      };
+    }
+    familyMembers.set(pattern, current);
+    return current;
+  };
   for (const state of Object.values(nodes).sort(stateOrder)) {
+    for (const family of state.exploration?.surface_families ?? []) {
+      if (family.pattern) registerFamily(family.pattern, family);
+    }
     const pattern = state.parent_state_id ? null : state.exploration?.route_family;
     if (!pattern) continue;
-    const members = familyMembers.get(pattern) ?? [];
-    members.push(state);
-    familyMembers.set(pattern, members);
+    const entry = registerFamily(pattern, state.exploration?.family);
+    entry.members.push(state);
   }
   const families: FamilyGroup[] = [...familyMembers.entries()]
-    .filter(([, members]) => {
-      const discovered = members[0]?.exploration?.family?.discovered_count ?? 0;
-      return members.length >= 2 || discovered > 1;
+    .filter(([, entry]) => {
+      const discovered = entry.metadata?.discovered_count ?? 0;
+      return entry.members.length > 0 && (entry.members.length >= 2 || discovered > 1);
     })
-    .map(([pattern, members]) => {
-      const metadata = members[0]?.exploration?.family;
+    .map(([pattern, entry]) => {
+      const members = entry.members.sort(stateOrder);
+      const metadata = entry.metadata;
       return {
         id: metadata?.id ? `family-${metadata.id}` : familyId(pattern),
         pattern,
@@ -100,7 +137,7 @@ export function createGraphTopology(
         kind: metadata?.kind ?? "items",
         discoveredCount: metadata?.discovered_count ?? members.length,
         checkedCount: metadata?.checked_count ?? members.length,
-        representedCount: metadata?.represented_count ?? members.length,
+        representedCount: Math.max(metadata?.represented_count ?? members.length, members.length),
         skippedCount: metadata?.skipped_count ?? 0,
         sampleLabels: metadata?.sample_labels ?? [],
         ...familyDimensions(members.length),
@@ -122,9 +159,7 @@ export function createGraphTopology(
   const seenLayoutEdges = new Set<string>();
   const layoutEdges: Edge[] = [];
   for (const edge of validEdges) {
-    const inferredOnly = edge.via === "inferred"
-      && !(edge.provenance ?? []).includes("performed");
-    if (edge.scope === "global_navigation" && inferredOnly) continue;
+    if (edge.scope === "global_navigation") continue;
     const source = ownerByNode[edge.from];
     const target = ownerByNode[edge.to];
     if (source === target) continue;
@@ -300,14 +335,7 @@ export function buildFlowEdges(
   for (const id of topology.edgeIds) {
     const edge = edges[id];
     if (!edge) continue;
-    const inferredOnly = edge.via === "inferred"
-      && !(edge.provenance ?? []).includes("performed");
-    if (
-      edge.scope === "global_navigation"
-      && inferredOnly
-      && !focusedNodeId
-      && selectedBundleId !== edgeBundleId(topology, edge)
-    ) continue;
+    if (edge.scope === "global_navigation") continue;
     const bundleId = edgeBundleId(topology, edge);
     if (!bundleId) continue;
     const bucket = bundles.get(bundleId) ?? [];

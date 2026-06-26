@@ -49,7 +49,13 @@ from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.events import ActionOutcome, EventType
 from engine.identity import normalize_url
 from engine.organize import heuristic_name, infer_page_role
-from engine.ranking import ActionCandidate, is_auth_entry, score_action
+from engine.ranking import (
+    ActionCandidate,
+    SurfaceFamily,
+    detect_surface_families,
+    is_auth_entry,
+    score_action,
+)
 from engine.safety import evaluate_action, is_same_origin
 from engine.schemas import (
     ActionStep,
@@ -120,6 +126,8 @@ class StateMeta:
     # Exact canonical state expected after closing/cancelling a local surface.
     # This is intentionally separate from the organizational page parent.
     return_state_id: str | None = None
+    nav_capabilities: list[dict] = field(default_factory=list)
+    surface_families: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -224,6 +232,42 @@ _AUTH_RETURN_PARAMS = {
     "returnurl",
 }
 
+_PERIPHERAL_ACTION = re.compile(
+    r"\b("
+    r"about|advertis(e|ing)|brand|careers?|community\s+guidelines|copyright|"
+    r"cookie|developers?|feedback|help|imprint|jobs?|legal|press|privacy|"
+    r"policy|report(\s+history)?|safety|terms?"
+    r")\b",
+    re.I,
+)
+_GENERIC_EXPANSION = re.compile(
+    r"\b(show|see|view|load)\s+more\b|\bmore\b|\bexpand\b", re.I
+)
+
+
+def _canonical_scope_host(url: str) -> str:
+    host = urlsplit(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _effective_scope_url(requested_url: str, resolved_url: str) -> str:
+    """Use the post-redirect URL for canonical same-site redirects.
+
+    This keeps youtube.com -> www.youtube.com and http -> https redirects in
+    scope without treating an arbitrary cross-domain redirect as the app.
+    """
+    requested = urlsplit(requested_url)
+    resolved = urlsplit(resolved_url)
+    if requested.scheme == resolved.scheme == "file":
+        return resolved_url
+    if (
+        requested.scheme in {"http", "https"}
+        and resolved.scheme in {"http", "https"}
+        and _canonical_scope_host(requested_url) == _canonical_scope_host(resolved_url)
+    ):
+        return resolved_url
+    return requested_url
+
 
 def _journey_slug(label: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
@@ -268,6 +312,7 @@ class Explorer:
         and return the id before exploration starts.
         """
         self._run_id = run_id or new_id()
+        self._requested_url = url
         self._root_url = url
         self._budget = Budget(self._config.budgets)
         self._frontier = Frontier()
@@ -317,6 +362,8 @@ class Explorer:
             "restoration_checks": 0,
             "global_navigation_edges": 0,
             "reversible_edges": 0,
+            "surface_pending_items": 0,
+            "frontier_actions": 0,
         }
 
         engine = create_db_engine(self._settings.database_url)
@@ -369,6 +416,7 @@ class Explorer:
         )
         await page.goto(url)
         await dismiss_cookie_banner(page)
+        self._root_url = _effective_scope_url(url, page.url)
 
         observation = await observe_page(
             page, self._config, auth_context=self._auth_context
@@ -413,6 +461,7 @@ class Explorer:
             "failed": self._stats["failed_actions"],
             "actions_performed": self._budget.actions,
             "frontier_size": len(self._frontier),
+            "surface_pending": self._stats.get("surface_pending_items", 0),
         }
 
     def _emit_frontier(self) -> None:
@@ -439,9 +488,47 @@ class Explorer:
             )
         )
 
+    @staticmethod
+    def _is_global_chrome_item(item: Interactable) -> bool:
+        return bool(item.in_nav or item.region in {"nav", "header", "aside"})
+
+    @staticmethod
+    def _is_peripheral_action(item: Interactable) -> bool:
+        if item.region == "footer":
+            return True
+        href_path = urlsplit(item.href).path if item.href else ""
+        return bool(_PERIPHERAL_ACTION.search(f"{item.label} {href_path}"))
+
+    @staticmethod
+    def _is_generic_expansion(item: Interactable) -> bool:
+        if item.href:
+            return False
+        return bool(_GENERIC_EXPANSION.search(item.label))
+
+    def _known_target_id(self, auth_context: AuthContext, target_norm: str) -> str | None:
+        target_id = self._url_to_state.get((auth_context, target_norm))
+        if target_id is None:
+            target_id = self._url_to_state.get(target_norm)  # legacy unit fixtures
+        return target_id
+
+    def _should_materialize_inferred_edge(
+        self, source: StateMeta, item: Interactable
+    ) -> bool:
+        """Keep inferred edges useful without turning shared chrome into a sitemap.
+
+        Root/global hub navigation is valuable. The same sidebar/header control
+        repeated from every later state is capability evidence, not a primary
+        product transition for V1.
+        """
+        if not self._is_global_chrome_item(item):
+            return True
+        return source.depth == 0 or source.page_role == PageRole.HOME
+
     def _inferred_target(self, source: StateMeta, item: Interactable) -> str | None:
         """If `item` is a plain same-origin link to an already-known URL state,
         return that state's id so we can record the edge without clicking."""
+        if not self._should_materialize_inferred_edge(source, item):
+            return None
         if item.tag != "a" or not item.href:
             return None
         href = item.href
@@ -452,9 +539,7 @@ class Explorer:
         target_norm = normalize_url(href)
         if target_norm == source.url_normalized:
             return None
-        target_id = self._url_to_state.get((source.auth_context, target_norm))
-        if target_id is None:
-            target_id = self._url_to_state.get(target_norm)  # legacy unit fixtures
+        target_id = self._known_target_id(source.auth_context, target_norm)
         if target_id is None or target_id == source.id:
             return None
         return target_id
@@ -493,16 +578,16 @@ class Explorer:
             return None
         return normalize_url(href)
 
-    def _global_key(
-        self, source: StateMeta, item: Interactable, target_hint: str | None
+    def _global_key_for(
+        self, auth_context: AuthContext, item: Interactable, target_hint: str | None
     ) -> str | None:
-        if not (item.in_nav or item.region in {"nav", "header", "aside"}):
+        if not self._is_global_chrome_item(item):
             return None
         origin = urlsplit(self._root_url)
         return self._stable_hash(
             origin.scheme,
             origin.netloc,
-            source.auth_context.value,
+            auth_context.value,
             item.container_key,
             item.kind,
             item.label,
@@ -510,6 +595,141 @@ class Explorer:
             identity.strip_positional_selector(item.selector),
             length=24,
         )
+
+    def _global_key(
+        self, source: StateMeta, item: Interactable, target_hint: str | None
+    ) -> str | None:
+        return self._global_key_for(source.auth_context, item, target_hint)
+
+    def _nav_capabilities_for(
+        self, auth_context: AuthContext, items: list[Interactable]
+    ) -> list[dict]:
+        """Compact reusable navigation evidence stored on the source state.
+
+        These capabilities are context for the state machine/LLM. They are not
+        automatically materialized as graph edges from every source state.
+        """
+        capabilities: list[dict] = []
+        seen: set[str] = set()
+        for item in items:
+            if not self._is_global_chrome_item(item):
+                continue
+            if not evaluate_action(item, base_url=self._root_url).allowed:
+                continue
+            target_hint = self._target_hint(item)
+            global_key = self._global_key_for(auth_context, item, target_hint)
+            if global_key is None or global_key in seen:
+                continue
+            seen.add(global_key)
+            capabilities.append(
+                {
+                    "id": global_key,
+                    "label": item.label,
+                    "kind": item.kind,
+                    "href": item.href,
+                    "target_url": target_hint,
+                    "target_state_id": (
+                        self._known_target_id(auth_context, target_hint)
+                        if target_hint is not None
+                        else None
+                    ),
+                    "region": item.region,
+                    "control_key": self._control_key(item),
+                    "container_key": item.container_key,
+                    "surface_item_id": item.item_id or None,
+                }
+            )
+        return capabilities
+
+    @staticmethod
+    def _family_payload(family: SurfaceFamily) -> dict:
+        return {
+            "id": family.family_id,
+            "label": family.label,
+            "kind": family.kind,
+            "pattern": family.pattern,
+            "label_source": "heuristic",
+            "confidence": 0.85,
+            "discovered_count": family.discovered_count,
+            "sample_labels": family.sample_labels,
+            "sample_urls": family.sample_urls,
+        }
+
+    def _family_runtime_payload(self, pattern: str) -> dict:
+        info = dict(self._family_info.get(pattern, {}))
+        info["checked_count"] = len(self._family_sampled_urls.get(pattern, []))
+        info["represented_count"] = len(self._family_variants.get(pattern, {}))
+        info["skipped_count"] = self._family_skipped.get(pattern, 0)
+        info["sample_urls"] = list(
+            dict.fromkeys(
+                [
+                    *info.get("sample_urls", []),
+                    *self._family_sampled_urls.get(pattern, []),
+                ]
+            )
+        )[:8]
+        return info
+
+    def _apply_surface_families(
+        self, observation: Observation, analysis: StateAnalysis
+    ) -> list[dict]:
+        """Register repeated content families visible from a state surface."""
+        families = detect_surface_families(observation.interactables)
+        if not families:
+            return []
+
+        item_to_family: dict[str, SurfaceFamily] = {}
+        for family in families:
+            payload = self._family_payload(family)
+            existing = self._family_info.get(family.pattern, {})
+            sample_labels = list(
+                dict.fromkeys(
+                    [
+                        *existing.get("sample_labels", []),
+                        *payload.get("sample_labels", []),
+                    ]
+                )
+            )[:8]
+            sample_urls = list(
+                dict.fromkeys(
+                    [
+                        *existing.get("sample_urls", []),
+                        *payload.get("sample_urls", []),
+                    ]
+                )
+            )[:8]
+            self._family_info[family.pattern] = {
+                **existing,
+                **payload,
+                "discovered_count": max(
+                    int(existing.get("discovered_count", 0)),
+                    family.discovered_count,
+                ),
+                "sample_labels": sample_labels,
+                "sample_urls": sample_urls,
+            }
+            for item_id in family.item_ids:
+                item_to_family[item_id] = family
+
+        first_for_pattern: set[str] = set()
+        for candidate in analysis.candidates:
+            item_id = candidate.interactable.item_id or candidate.interactable.selector
+            family = item_to_family.get(item_id)
+            if family is None:
+                continue
+            if candidate.family_pattern is None:
+                candidate.family_pattern = family.pattern
+                candidate.family_id = family.family_id
+                candidate.family_label = family.label
+                candidate.family_kind = family.kind
+            if family.pattern not in first_for_pattern:
+                candidate.collapsed_count = max(
+                    candidate.collapsed_count, family.discovered_count
+                )
+                candidate.grouped_labels = family.sample_labels
+                first_for_pattern.add(family.pattern)
+
+        return [self._family_payload(family) for family in families]
 
     def _is_global_capability(self, capability: TransitionCapability) -> bool:
         if capability.global_key is None:
@@ -535,24 +755,15 @@ class Explorer:
         source = self._states.get(capability.source_id)
         if source is None:
             return
+        if capability.global_key is not None:
+            return
 
         target_id: str | None = None
         if capability.target_hint is not None:
-            target_id = self._url_to_state.get(
-                (source.auth_context, capability.target_hint)
-            )
-            if target_id is None:
-                target_id = self._url_to_state.get(capability.target_hint)
+            target_id = self._known_target_id(source.auth_context, capability.target_hint)
         if target_id is None and capability.item.kind == "tab":
             page_id = self._page_ancestor(source)
             target_id = self._tab_targets.get((page_id, capability.control_key))
-        if (
-            target_id is None
-            and capability.global_key is not None
-            and capability.global_key not in self._ambiguous_global_targets
-            and self._is_global_capability(capability)
-        ):
-            target_id = self._global_targets.get(capability.global_key)
 
         if target_id == source.id:
             return
@@ -561,6 +772,11 @@ class Explorer:
                 self._waiting_by_target[
                     (source.auth_context, capability.target_hint)
                 ].add(ref)
+            return
+        if (
+            capability.global_key is not None
+            and not self._should_materialize_inferred_edge(source, capability.item)
+        ):
             return
 
         await self._add_edge(
@@ -661,8 +877,6 @@ class Explorer:
         if global_key in self._ambiguous_global_targets:
             return
         self._global_targets[global_key] = destination.id
-        for ref in tuple(self._global_capabilities[global_key]):
-            await self._resolve_capability(ref)
 
     async def _execute(self, page: Page, pending: PendingAction) -> None:
         source = pending.from_state
@@ -813,6 +1027,21 @@ class Explorer:
         observation = await observe_page(
             page, self._config, auth_context=self._auth_context
         )
+        if (
+            observation.url_normalized == source.url_normalized
+            and self._is_generic_expansion(item)
+            and not observation.snapshot.signals.modal_open
+        ):
+            self._stats["noop_actions"] += 1
+            self._current_state_id = source.id
+            self._item_outcome[(source.id, item.item_id)] = "noop"
+            self._edges_done.add(edge_key)
+            self._emit_action_finished(
+                ActionOutcome.NOOP,
+                f"'{item.label}' is a generic expansion, not a durable state",
+                from_state_id=source.id,
+            )
+            return
         if family_pattern is not None:
             self._family_sampled_urls.setdefault(family_pattern, []).append(
                 observation.snapshot.url
@@ -981,9 +1210,15 @@ class Explorer:
         if trigger is not None:
             if trigger.role == "tab" or trigger.kind == "tab":
                 return StateType.TAB
-            if trigger.tag == "summary" or trigger.kind in ("disclosure", "menuitem"):
+            label = trigger.label.lower()
+            if (
+                trigger.tag == "summary"
+                or trigger.kind in ("disclosure", "menuitem")
+                or trigger.aria_expanded is not None
+                or re.search(r"\b(menu|settings?|account|profile|filter|sort)\b", label)
+            ):
                 return StateType.DROPDOWN
-        return StateType.TAB
+        return StateType.DROPDOWN
 
     async def _register_state(
         self,
@@ -1001,6 +1236,10 @@ class Explorer:
         page_depth_override: int | None = None,
     ) -> StateMeta:
         analysis = analyze_state(observation, base_url=self._root_url)
+        surface_families = self._apply_surface_families(observation, analysis)
+        nav_capabilities = self._nav_capabilities_for(
+            observation.auth_context, observation.interactables
+        )
         state_type = analysis.state_type
         if not is_same_origin(observation.snapshot.url, self._root_url):
             state_type = StateType.EXTERNAL  # reached via script redirect; never expanded
@@ -1071,6 +1310,8 @@ class Explorer:
                 "page_role": page_role.value,
                 "page_depth": page_depth,
                 "substate_depth": substate_depth,
+                "nav_capabilities": nav_capabilities,
+                "surface_families": surface_families,
                 **({"return_state_id": return_state_id} if return_state_id else {}),
                 "name": naming,
                 **({"route_family": route_family} if route_family else {}),
@@ -1102,6 +1343,8 @@ class Explorer:
             page_role=page_role,
             display_label=naming["text"],
             return_state_id=return_state_id,
+            nav_capabilities=nav_capabilities,
+            surface_families=surface_families,
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
@@ -1150,6 +1393,8 @@ class Explorer:
                     "substate_depth": substate_depth,
                     "return_state_id": return_state_id,
                     "family": family,
+                    "nav_capabilities": nav_capabilities,
+                    "surface_families": surface_families,
                     "denied_count": len(analysis.denied),
                     "surface_items": self._surface_summary(meta),
                     "counters": self._counters(),
@@ -1202,12 +1447,16 @@ class Explorer:
 
     def _enqueue_actions(self, meta: StateMeta, analysis: StateAnalysis) -> None:
         if meta.page_depth >= self._config.budgets.max_depth:
+            meta.representative_ids = set()
             return
         if meta.substate_depth >= self._config.exploration.max_substate_depth:
+            meta.representative_ids = set()
             return
         if meta.state_type in _TERMINAL_TYPES:
+            meta.representative_ids = set()
             return
         if meta.state_type in _GATE_TYPES:
+            meta.representative_ids = set()
             return  # expanded only after auth_gate resolution via _handle_auth_wall
         eligible: list[ActionCandidate] = []
         parent_selector_shapes: set[str] = set()
@@ -1222,6 +1471,51 @@ class Explorer:
         seen_semantic_actions: set[tuple[str, str | None]] = set()
         for candidate in analysis.safe:
             item = candidate.interactable
+            target_hint = self._target_hint(item)
+            known_target = (
+                self._known_target_id(meta.auth_context, target_hint)
+                if target_hint is not None
+                else None
+            )
+            if target_hint == meta.url_normalized:
+                self._item_outcome[(meta.id, item.item_id)] = "noop"
+                continue
+            if (
+                self._is_peripheral_action(item)
+                and not is_auth_entry(candidate)
+            ):
+                self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                continue
+            if (
+                self._is_global_chrome_item(item)
+                and meta.depth > 0
+                and meta.page_role != PageRole.HOME
+                and not is_auth_entry(candidate)
+            ):
+                self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                continue
+            if (
+                meta.auth_context == AuthContext.GUEST
+                and re.search(r"\bsettings?\b", item.label, re.I)
+            ):
+                self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                continue
+            if (
+                self._is_generic_expansion(item)
+                and self._is_global_chrome_item(item)
+                and not meta.return_state_id
+            ):
+                self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                continue
+            if (
+                known_target is not None
+                and self._is_global_chrome_item(item)
+                and not self._should_materialize_inferred_edge(meta, item)
+            ):
+                # Repeated navbar/sidebar links are capability evidence. Do not
+                # spend frontier budget or create another inferred primary edge.
+                self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                continue
             if (
                 item.label.lower().startswith("unlabelled ")
                 and item.region not in {"nav", "header", "modal"}
@@ -1235,7 +1529,11 @@ class Explorer:
                 parent_selector_shapes
                 and identity.strip_positional_selector(item.selector)
                 in parent_selector_shapes
-                and not (item.kind == "tab" or item.in_modal or item.region == "modal")
+                and not (
+                    (item.kind == "tab" and meta.state_type == StateType.TAB)
+                    or item.in_modal
+                    or item.region == "modal"
+                )
             ):
                 # Unchanged navigation/footer chrome belongs to the parent.
                 continue
@@ -1287,7 +1585,12 @@ class Explorer:
                 top = [return_pick, *top][
                     : self._config.exploration.max_actions_per_state
                 ]
-        meta.representative_ids = {c.interactable.item_id for c in eligible}
+        queued_ids = {c.interactable.item_id for c in top}
+        meta.representative_ids = queued_ids
+        for candidate in eligible:
+            item_id = candidate.interactable.item_id
+            if item_id not in queued_ids:
+                self._item_outcome.setdefault((meta.id, item_id), "skipped_duplicate")
         for candidate in top:
             journey_key = meta.journey_key
             if meta.depth == 0:
@@ -1743,6 +2046,8 @@ class Explorer:
             "provenance": provenance,
             "evidence": evidence_rows,
         }
+        if previous == record:
+            return
         self._edge_records[edge_id] = record
 
         async with self._sessions() as session:
@@ -1915,26 +2220,22 @@ class Explorer:
                 if row is not None:
                     family = None
                     if meta.route_family is not None:
-                        family = {
-                            **self._family_info.get(meta.route_family, {}),
-                            "checked_count": len(
-                                self._family_sampled_urls.get(meta.route_family, [])
-                            ),
-                            "represented_count": len(
-                                self._family_variants.get(meta.route_family, {})
-                            ),
-                            "skipped_count": self._family_skipped.get(
-                                meta.route_family, 0
-                            ),
-                            "sample_urls": self._family_sampled_urls.get(
-                                meta.route_family, []
-                            ),
-                        }
+                        family = self._family_runtime_payload(meta.route_family)
+                    nav_capabilities = self._nav_capabilities_for(
+                        meta.auth_context, meta.interactables
+                    )
+                    surface_families = [
+                        self._family_runtime_payload(item["pattern"])
+                        for item in meta.surface_families
+                        if item.get("pattern") in self._family_info
+                    ]
                     existing_exploration = dict(row.exploration or {})
                     row.interactables = items
                     row.exploration = {
                         **existing_exploration,
                         **counts,
+                        "nav_capabilities": nav_capabilities,
+                        "surface_families": surface_families,
                         **(
                             {
                                 "route_family": meta.route_family,
@@ -1960,13 +2261,24 @@ class Explorer:
 
         self._stats["pending_actions"] = pending_actions
         self._stats["pending_states"] = pending_states
+        self._stats["surface_pending_items"] = pending_actions
 
     async def _finish_run(self, status: str, *, error: str | None = None) -> None:
         with contextlib.suppress(Exception):
             await self._flush_state_details()
         self._stats["actions_performed"] = self._budget.actions
         self._stats["duration_seconds"] = round(self._budget.elapsed_seconds, 2)
+        self._stats["frontier_actions"] = len(self._frontier)
         stop_reason = self._stats.get("stop_reason")
+        if status == "failed":
+            completion_status = "failed"
+        elif stop_reason == "frontier_exhausted":
+            completion_status = "complete"
+        elif stop_reason == "novelty_exhausted":
+            completion_status = "novelty_exhausted"
+        else:
+            completion_status = "budget_limited"
+        self._stats["completion_status"] = completion_status
         async with self._sessions() as session:
             run = await session.get(db.Run, self._run_id)
             run.status = status
@@ -1981,7 +2293,12 @@ class Explorer:
                 ExplorerEvent(
                     EventType.RUN_FAILED,
                     f"Run failed: {error}",
-                    {"error": error, "stop_reason": stop_reason, "stats": dict(self._stats)},
+                    {
+                        "error": error,
+                        "stop_reason": stop_reason,
+                        "completion_status": completion_status,
+                        "stats": dict(self._stats),
+                    },
                 )
             )
             return
@@ -1990,11 +2307,12 @@ class Explorer:
             ExplorerEvent(
                 EventType.RUN_COMPLETED,
                 f"{status}: {self._stats['states']} states, {self._stats['edges']} edges, "
-                f"{self._stats['actions_performed']} actions "
-                f"in {self._stats['duration_seconds']}s",
+                    f"{self._stats['actions_performed']} actions "
+                    f"in {self._stats['duration_seconds']}s",
                 {
                     "status": status,
                     "stop_reason": stop_reason,
+                    "completion_status": completion_status,
                     "stats": dict(self._stats),
                     "counters": self._counters(),
                 },

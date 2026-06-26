@@ -200,7 +200,7 @@ describe("graph element derivation", () => {
     expect(focus?.nodeIds.has("hub")).toBe(false);
   });
 
-  it("hides repeated inferred global navigation until a connected node is selected", () => {
+  it("keeps global navigation capabilities out of canvas topology", () => {
     const graphNodes = { a: state("a", 0), b: state("b", 1), c: state("c", 2) };
     const global = edge("global", "a", "b", "inferred");
     global.scope = "global_navigation";
@@ -211,9 +211,8 @@ describe("graph element derivation", () => {
 
     expect(buildFlowEdges(topology, edges)).toHaveLength(1);
     const focused = buildFlowEdges(topology, edges, null, "a", graphNodes);
-    expect(focused).toHaveLength(2);
-    expect(focused.find((item) => item.id === "bundle:a>b")?.className)
-      .toBe("graph-edge--outbound");
+    expect(focused).toHaveLength(1);
+    expect(focused.some((item) => item.id === "bundle:a>b")).toBe(false);
   });
 
   it("marks opposing directed transitions as a visible cycle", () => {
@@ -244,5 +243,38 @@ describe("graph element derivation", () => {
       },
     };
     expect(createGraphTopology({ game: representative }, {}).families).toHaveLength(1);
+  });
+
+  it("derives one-representative family boxes from source surface families", () => {
+    const hub = state("hub", 0);
+    const representative = state("game", 1);
+    const pattern = "https://example.com/games/:param";
+    hub.exploration = {
+      surface_families: [{
+        id: "games",
+        label: "Games",
+        kind: "game",
+        pattern,
+        label_source: "heuristic",
+        confidence: 0.9,
+        discovered_count: 12,
+        represented_count: 1,
+        skipped_count: 9,
+        sample_labels: ["Game A", "Game B"],
+      }],
+    };
+    representative.exploration = { route_family: pattern };
+
+    const topology = createGraphTopology({ hub, game: representative }, {});
+
+    expect(topology.families).toHaveLength(1);
+    expect(topology.families[0]).toMatchObject({
+      id: "family-games",
+      label: "Games",
+      discoveredCount: 12,
+      representedCount: 1,
+      skippedCount: 9,
+      memberIds: ["game"],
+    });
   });
 });

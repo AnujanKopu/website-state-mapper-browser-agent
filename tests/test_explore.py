@@ -45,6 +45,7 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert stats["states"] == len(states)
     assert stats["edges"] == len(edges)
     assert stats["actions_denied"] > 0
+    assert stats["completion_status"] == "complete"
 
     # --- graph integrity ---
     assert all(e["from"] in by_id and e["to"] in by_id for e in edges)
@@ -56,7 +57,6 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert any(u.endswith("pricing.html") for u in urls)
     assert any(u.endswith("docs.html") for u in urls)
     assert any(u.endswith("checkout.html") for u in urls)
-    assert any(u.endswith("about.html") for u in urls)
 
     # --- modal is a first-class state (same URL as root, different node) ---
     modal_states = [s for s in states if s["type"] == "modal"]
@@ -84,10 +84,16 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert all(e["transition_kind"] == "back" for e in checkout_out)
     assert all(e["reversible"] for e in checkout_out)
 
-    # --- dead end detected ---
-    dead_ends = [s for s in states if s["type"] == "dead_end"]
-    assert dead_ends
-    assert all(s["url_normalized"].endswith("about.html") for s in dead_ends)
+    # --- peripheral resources are recorded as skipped surface items instead
+    # of consuming the main product-state budget.
+    skipped_about = [
+        item
+        for state in states
+        for item in state["surface_items"]
+        if item["label"] == "About the project"
+    ]
+    assert skipped_about
+    assert any(item["status"] == "skipped_duplicate" for item in skipped_about)
 
     # --- sibling collapse: one representative post state, one x3 edge ---
     post_states = [s for s in states if "post" in s["url_normalized"]]
@@ -107,23 +113,26 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert all(e["from"] in by_id and e["to"] in by_id for e in inferred)
     assert all(e["via"] in {"performed", "inferred"} for e in edges)
 
-    # --- cyclic state-machine semantics: persistent navbar capabilities are
-    # reconciled after their destinations become known, not just when clicked.
+    # --- cyclic state-machine semantics remain, but V1 avoids materializing a
+    # full shared-navbar clique as primary graph structure.
     home = root
     pricing = next(s for s in states if s["url_normalized"].endswith("pricing.html"))
     docs = next(s for s in states if s["url_normalized"].endswith("docs.html"))
-    global_pairs = {
-        (e["from"], e["to"])
-        for e in edges
-        if e["scope"] == "global_navigation"
+    pairs = {(e["from"], e["to"]) for e in edges}
+    assert (home["id"], pricing["id"]) in pairs
+    assert (home["id"], docs["id"]) in pairs
+    global_pairs = {(e["from"], e["to"]) for e in edges if e["scope"] == "global_navigation"}
+    full_nav_clique = {
+        (source["id"], destination["id"])
+        for source in (home, pricing, docs)
+        for destination in (home, pricing, docs)
+        if source["id"] != destination["id"]
     }
-    for source in (home, pricing, docs):
-        for destination in (home, pricing, docs):
-            if source["id"] != destination["id"]:
-                assert (source["id"], destination["id"]) in global_pairs
+    assert global_pairs != full_nav_clique
 
-    # The home -> Docs control is inferred when Docs is registered and then
-    # upgraded in place when its original pending action executes.
+    # The home -> Docs control is represented once as a performed transition;
+    # reusable navbar capability evidence lives in state metadata instead of
+    # being expanded into inferred all-pairs topology.
     home_docs = [
         e
         for e in edges
@@ -133,7 +142,10 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
         and "Docs" in e["label"]
     ]
     assert len(home_docs) == 1
-    assert set(home_docs[0]["provenance"]) == {"inferred", "performed"}
+    assert "performed" in set(home_docs[0]["provenance"])
+    nav_capabilities = root["exploration"].get("nav_capabilities", [])
+    assert any(item["label"] == "Docs" and item["target_state_id"] == docs["id"]
+               for item in nav_capabilities)
 
     # Browser back edges exist only as validated restoration evidence.
     history_edges = [e for e in edges if e["transition_kind"] == "back"]

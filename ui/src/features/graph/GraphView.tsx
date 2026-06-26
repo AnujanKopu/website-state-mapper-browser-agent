@@ -306,6 +306,12 @@ function GraphCanvas({
   }, [onSelect]);
 
   useEffect(() => {
+    if (selectedId !== null) return;
+    setSelectedEdgeId(null);
+    setSelectedFamilyId(null);
+  }, [selectedId]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       const target = event.target;

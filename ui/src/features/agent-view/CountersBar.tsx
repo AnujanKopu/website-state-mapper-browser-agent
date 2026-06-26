@@ -19,6 +19,7 @@ const TILES: Tile[] = [
   { key: "edges", label: "Edges" },
   { key: "inferred_edges", label: "Inferred" },
   { key: "frontier", label: "Pending" },
+  { key: "surface_pending", label: "Surface" },
   { key: "actions_performed", label: "Actions" },
   { key: "deduped", label: "Deduped" },
   { key: "denied", label: "Denied", tone: "warn" },
@@ -34,7 +35,7 @@ export function CountersBar({
   return (
     <div className="counters" role="group" aria-label="Run counters">
       {TILES.map((tile) => {
-        const value = tile.key === "frontier" ? frontierSize : counters[tile.key];
+        const value = tile.key === "frontier" ? frontierSize : (counters[tile.key] ?? 0);
         const isActive = activeFilter === tile.key;
         return (
           <button

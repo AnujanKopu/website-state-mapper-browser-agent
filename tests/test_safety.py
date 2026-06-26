@@ -134,5 +134,10 @@ class TestOrigin:
         assert is_same_origin("https://demo.test/a", "https://demo.test/b")
         assert not is_same_origin("https://evil.test/a", "https://demo.test/b")
 
+    def test_www_and_https_redirect_scope_is_allowed(self):
+        assert is_same_origin("https://www.youtube.com/", "https://youtube.com/")
+        assert is_same_origin("https://demo.test/a", "http://www.demo.test/b")
+        assert not is_same_origin("https://studio.demo.test/a", "https://demo.test/b")
+
     def test_all_file_urls_are_one_origin(self):
         assert is_same_origin("file:///C:/site/a.html", "file:///C:/site/b.html")

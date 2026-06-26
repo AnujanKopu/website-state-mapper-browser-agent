@@ -54,7 +54,7 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
         <div className="topbar__right">
           <span className={`topbar__status topbar__status--${run.runStatus}`}>
             <i aria-hidden />
-            {runStatusLabel(run.runStatus)}
+            {runStatusLabel(run.completionStatus ?? run.runStatus)}
           </span>
           <details className="export-menu" ref={exportMenuRef}>
             <summary className="button button--ghost">Export {"\u25BE"}</summary>
@@ -103,7 +103,11 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
 
       <div className="panes">
         <div className="panes__left">
-          <AgentView run={run} onExpandScreenshot={setExpandedScreenshot} />
+          <AgentView
+            run={run}
+            inspectedState={selected}
+            onExpandScreenshot={setExpandedScreenshot}
+          />
         </div>
         <div className="panes__right">
           <GraphView

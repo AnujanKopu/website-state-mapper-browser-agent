@@ -12,6 +12,17 @@ __pycache__/
 # Runtime artifacts (sqlite db, screenshots, DOM snapshots)
 data/
 
+# Local scratch / smoke-test output
+smoke-tmp-*/
+.test-tmp/
+
+# Logs and Codex tool artifacts
+*.log
+.codex-*
+
+# Package manager cache
+.uv-cache/
+
 # Node (UI, added in a later milestone)
 node_modules/
 dist/

@@ -102,10 +102,26 @@ def origin_of(url: str) -> tuple[str, str]:
     return (parts.scheme.lower(), parts.netloc.lower())
 
 
+def _canonical_web_host(host: str) -> str:
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
 def is_same_origin(url: str, base_url: str) -> bool:
-    """Scheme+host origin check. All file:// URLs count as one origin so
-    local fixture sites behave like a single site."""
-    return origin_of(url) == origin_of(base_url)
+    """Safe same-site scope check for the mapper.
+
+    For browser-app mapping, a canonical redirect such as youtube.com ->
+    www.youtube.com, or http -> https on the same host, should stay in scope.
+    All file:// URLs count as one origin so local fixture sites behave like a
+    single site. Other subdomains remain out of scope.
+    """
+    scheme, host = origin_of(url)
+    base_scheme, base_host = origin_of(base_url)
+    if scheme == base_scheme == "file":
+        return True
+    if scheme in {"http", "https"} and base_scheme in {"http", "https"}:
+        return _canonical_web_host(host) == _canonical_web_host(base_host)
+    return (scheme, host) == (base_scheme, base_host)
 
 
 def evaluate_action(item: Interactable, *, base_url: str) -> SafetyDecision:

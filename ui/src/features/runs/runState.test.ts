@@ -152,16 +152,20 @@ describe("runReducer", () => {
         stats: {
           states: 1,
           edges: 0,
-          pending_actions: 17,
+          frontier_actions: 3,
+          surface_pending_items: 17,
           failed_actions: 2,
+          completion_status: "budget_limited",
         },
       }),
     });
     const closed = runReducer(finished, { type: "terminalReconciled" });
 
     expect(started.url).toBe("https://example.com");
-    expect(finished.counters.frontier_size).toBe(17);
+    expect(finished.counters.frontier_size).toBe(3);
+    expect(finished.counters.surface_pending).toBe(17);
     expect(finished.counters.failed).toBe(2);
+    expect(finished.completionStatus).toBe("budget_limited");
     expect(closed.connection).toBe("closed");
 
     const retrying = runReducer(started, { type: "streamReconnecting" });

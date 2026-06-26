@@ -15,6 +15,7 @@ export function matchesCounterFilter(entry: LogEntry, filter: CounterFilterKey):
         (entry.type === "edge_discovered" && entry.message.includes("Links to"))
       );
     case "frontier":
+    case "surface_pending":
       return entry.type === "frontier_updated";
     case "actions_performed":
       return entry.type === "action_started";

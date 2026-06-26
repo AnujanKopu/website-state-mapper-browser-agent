@@ -1,6 +1,12 @@
 """Unit tests for action ranking and sibling collapse."""
 
-from engine.ranking import ActionCandidate, collapse_siblings, is_auth_entry, score_action
+from engine.ranking import (
+    ActionCandidate,
+    collapse_siblings,
+    detect_surface_families,
+    is_auth_entry,
+    score_action,
+)
 from engine.schemas import BoundingBox, Interactable
 
 
@@ -87,6 +93,33 @@ class TestCollapseSiblings:
         collapsed = collapse_siblings(repeated)
         assert len(collapsed) == 1
         assert collapsed[0].collapsed_count == 2
+
+    def test_non_content_routes_do_not_become_dynamic_families(self):
+        links = [
+            _item("#plan-docs", text="Read the docs", href="https://demo.test/docs"),
+            _item("#checkout", text="Checkout", href="https://demo.test/checkout"),
+        ]
+
+        candidates = collapse_siblings(links)
+
+        assert len(candidates) == 2
+        assert all(candidate.family_pattern is None for candidate in candidates)
+
+
+class TestSurfaceFamilies:
+    def test_repeated_content_routes_are_detected_across_selector_shapes(self):
+        links = [
+            _item("#hero-game", text="Blade Ball", href="https://demo.test/games/blade-ball"),
+            _item("#table-row-1 a", text="Grow a Garden", href="https://demo.test/games/grow-a-garden"),
+            _item("#card-news", text="Patch notes", href="https://demo.test/news/patch-notes"),
+            _item("#docs", text="Docs", href="https://demo.test/docs"),
+        ]
+
+        families = detect_surface_families(links)
+
+        assert {family.kind for family in families} == {"game"}
+        assert families[0].discovered_count == 2
+        assert families[0].pattern == "https://demo.test/games/:param"
 
 
 class TestScoreAction:

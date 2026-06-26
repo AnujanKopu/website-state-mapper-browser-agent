@@ -78,8 +78,14 @@ export function NodePanel({ state, parent, states, edges, onClose, onExpandScree
   const formCount = typeof state.flags.form_count === "number" ? state.flags.form_count : 0;
   const surface = groupSurface(state.surface_items ?? []);
   const exploration = state.exploration;
-  const incoming = Object.values(edges).filter((edge) => edge.to === state.id);
-  const outgoing = Object.values(edges).filter((edge) => edge.from === state.id);
+  const navCapabilities = exploration?.nav_capabilities ?? [];
+  const surfaceFamilies = exploration?.surface_families ?? [];
+  const incoming = Object.values(edges).filter(
+    (edge) => edge.to === state.id && edge.scope !== "global_navigation",
+  );
+  const outgoing = Object.values(edges).filter(
+    (edge) => edge.from === state.id && edge.scope !== "global_navigation",
+  );
 
   const transitionList = (items: GraphEdge[], endpoint: "from" | "to") => (
     <ul className="transition-list">
@@ -180,6 +186,61 @@ export function NodePanel({ state, parent, states, edges, onClose, onExpandScree
               </span>
             ))}
           </div>
+        </section>
+      )}
+
+      {surfaceFamilies.length > 0 && (
+        <section className="node-panel__section">
+          <h3>Repeated content families</h3>
+          <ul className="transition-list">
+            {surfaceFamilies.map((family) => (
+              <li key={family.id}>
+                <span className="transition-list__label">{family.label}</span>
+                <span className="transition-list__peer">{family.pattern}</span>
+                <span className="chips">
+                  <span className="chip">{family.kind}</span>
+                  <span className="chip chip--ok">
+                    {family.discovered_count} discovered
+                  </span>
+                  {typeof family.represented_count === "number" && (
+                    <span className="chip">{family.represented_count} represented</span>
+                  )}
+                  {Boolean(family.skipped_count) && (
+                    <span className="chip chip--skip">{family.skipped_count} skipped</span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {navCapabilities.length > 0 && (
+        <section className="node-panel__section">
+          <h3>Global nav available</h3>
+          <ul className="transition-list">
+            {navCapabilities.map((capability) => {
+              const target = capability.target_state_id
+                ? states[capability.target_state_id]
+                : null;
+              return (
+                <li key={capability.id}>
+                  <span className="transition-list__label">{capability.label}</span>
+                  <span className="transition-list__peer">
+                    {target?.label
+                      || target?.title
+                      || capability.target_url
+                      || capability.href
+                      || "unresolved"}
+                  </span>
+                  <span className="chips">
+                    <span className="chip">capability</span>
+                    {target && <span className="chip chip--ok">resolved</span>}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
         </section>
       )}
 

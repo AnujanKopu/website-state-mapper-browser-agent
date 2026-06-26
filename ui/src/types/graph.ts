@@ -74,6 +74,8 @@ export interface ExplorationSummary {
   substate_depth?: number;
   name?: NameMetadata;
   family?: FamilyMetadata;
+  nav_capabilities?: NavCapability[];
+  surface_families?: FamilyMetadata[];
   return_state_id?: string;
 }
 
@@ -97,6 +99,19 @@ export interface FamilyMetadata {
   skipped_count?: number;
   sample_labels?: string[];
   sample_urls?: string[];
+}
+
+export interface NavCapability {
+  id: string;
+  label: string;
+  kind?: string | null;
+  href?: string | null;
+  target_url?: string | null;
+  target_state_id?: string | null;
+  region?: string | null;
+  control_key?: string;
+  container_key?: string | null;
+  surface_item_id?: string | null;
 }
 
 export interface GraphState {

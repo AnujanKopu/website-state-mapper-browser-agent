@@ -16,7 +16,7 @@ from engine.safety import SafetyDecision, evaluate_action
 from engine.schemas import Observation, PageSignals, StateType
 
 _PRICE = re.compile(r"[$\u20ac\u00a3]\s?\d")
-_PAYWALL_WORDS = re.compile(r"\b(upgrade|premium|unlock|subscribe|members?\s+only)\b", re.I)
+_PAYWALL_WORDS = re.compile(r"\b(upgrade|premium|unlock|members?\s+only)\b", re.I)
 _LOGIN_WORDS = re.compile(r"\b(log\s?in|sign\s?in|password|authenticate)\b", re.I)
 
 
@@ -71,7 +71,9 @@ def classify_state(
     ):
         state_type = StateType.AUTH_WALL
     elif signals.payment_fields > 0 or (
-        _PRICE.search(visible_text) and _PAYWALL_WORDS.search(visible_text)
+        _PRICE.search(visible_text)
+        and _PAYWALL_WORDS.search(visible_text)
+        and safe_candidates <= 3
     ):
         state_type = StateType.PAYWALL
     else:

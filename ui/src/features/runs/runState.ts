@@ -54,6 +54,7 @@ export interface RunState {
   runId: string | null;
   url: string;
   runStatus: string;
+  completionStatus: string | null;
   connection: ConnectionStatus;
   nodes: Record<string, GraphState>;
   edges: Record<string, GraphEdge>;
@@ -81,12 +82,14 @@ export const emptyCounters: Counters = {
   failed: 0,
   actions_performed: 0,
   frontier_size: 0,
+  surface_pending: 0,
 };
 
 export const initialRunState: RunState = {
   runId: null,
   url: "",
   runStatus: "running",
+  completionStatus: null,
   connection: "connecting",
   nodes: {},
   edges: {},
@@ -172,6 +175,8 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
       ...(p.return_state_id ? { return_state_id: p.return_state_id } : {}),
       ...(p.name ? { name: p.name } : {}),
       ...(p.family ? { family: p.family } : {}),
+      ...(p.nav_capabilities ? { nav_capabilities: p.nav_capabilities } : {}),
+      ...(p.surface_families ? { surface_families: p.surface_families } : {}),
     },
     flags: { ...base.flags, ...((p.flags ?? {}) as StateFlags) },
   };
@@ -193,7 +198,8 @@ function countersFromStats(
     noop: num("noop_actions", 0),
     failed: num("failed_actions", 0),
     actions_performed: num("actions_performed", 0),
-    frontier_size: num("pending_actions", 0),
+    frontier_size: num("frontier_actions", num("pending_actions", 0)),
+    surface_pending: num("surface_pending_items", 0),
   };
 }
 
@@ -204,7 +210,20 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
     : state.counters;
   const connection: ConnectionStatus = "live";
 
-  let { url, nodes, edges, order, viewportStateId, currentAction, runStatus, stopReason, error, config, authGate } =
+  let {
+    url,
+    nodes,
+    edges,
+    order,
+    viewportStateId,
+    currentAction,
+    runStatus,
+    completionStatus,
+    stopReason,
+    error,
+    config,
+    authGate,
+  } =
     state;
 
   switch (env.type) {
@@ -213,6 +232,7 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
       config = p.config ?? null;
       url = p.url || url;
       runStatus = "running";
+      completionStatus = null;
       break;
     }
     case "state_discovered": {
@@ -283,6 +303,7 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
     case "run_completed": {
       const p = payload as unknown as RunCompletedPayload;
       runStatus = p.status || "done";
+      completionStatus = p.completion_status ?? null;
       stopReason = p.stop_reason ?? null;
       authGate = null;
       break;
@@ -290,6 +311,7 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
     case "run_failed": {
       const p = payload as unknown as RunFailedPayload;
       runStatus = "failed";
+      completionStatus = p.completion_status ?? "failed";
       stopReason = p.stop_reason ?? null;
       error = p.error || (typeof payload.message === "string" ? payload.message : "Run failed");
       authGate = null;
@@ -333,6 +355,7 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
     viewportStateId,
     currentAction,
     runStatus,
+    completionStatus,
     stopReason,
     error,
     config,
@@ -350,6 +373,7 @@ function freshRunState(runId: string): RunState {
     edges: {},
     order: [],
     counters: { ...emptyCounters },
+    completionStatus: null,
     log: [],
   };
 }
@@ -375,6 +399,10 @@ export function runReducer(state: RunState, action: RunAction): RunState {
         ...state,
         url: graph.run.url || state.url,
         runStatus: graph.run.status || state.runStatus,
+        completionStatus:
+          typeof graph.run.stats?.completion_status === "string"
+            ? (graph.run.stats.completion_status as string)
+            : state.completionStatus,
         nodes,
         edges,
         order,
@@ -419,7 +447,7 @@ export function runReducer(state: RunState, action: RunAction): RunState {
     case "terminalReconciled":
       return { ...state, connection: "closed" };
     case "authResolved":
-      return { ...state, authGate: null, runStatus: "running" };
+      return { ...state, authGate: null, runStatus: "running", completionStatus: null };
     default:
       return state;
   }
