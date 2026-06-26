@@ -59,6 +59,57 @@ function familyId(pattern: string): string {
   return `family-${(hash >>> 0).toString(36)}`;
 }
 
+const optionalSlugPrefixes = new Set([
+  "game",
+  "games",
+  "product",
+  "products",
+  "post",
+  "posts",
+  "article",
+  "articles",
+  "news",
+]);
+const entityPrefixes = new Set([
+  ...optionalSlugPrefixes,
+  "video",
+  "videos",
+  "short",
+  "shorts",
+  "watch",
+  "profile",
+  "profiles",
+  "user",
+  "users",
+  "player",
+  "players",
+  "item",
+  "items",
+]);
+
+function canonicalFamilyPattern(pattern: string): string {
+  try {
+    const url = new URL(pattern);
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (url.pathname === "/watch" && url.searchParams.get("v") === ":param") {
+      return pattern.replace("v=:param", "v=:id");
+    }
+    const prefixIndex = segments.findIndex((segment) => entityPrefixes.has(segment.toLowerCase()));
+    if (prefixIndex >= 0 && segments[prefixIndex + 1]?.startsWith(":")) {
+      const prefix = segments[prefixIndex].toLowerCase();
+      segments[prefixIndex + 1] = ":id";
+      if (optionalSlugPrefixes.has(prefix) && segments.length === prefixIndex + 2) {
+        segments.push(":param");
+      }
+      url.pathname = `/${segments.join("/")}`;
+      return url.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // Keep non-URL or legacy custom patterns untouched.
+  }
+  return pattern;
+}
+
 function familyDimensions(memberCount: number): { width: number; height: number } {
   return {
     width: Math.max(FAMILY_MIN_WIDTH, NODE_WIDTH + FAMILY_PAD_X * 2),
@@ -85,12 +136,14 @@ export function createGraphTopology(
     pattern: string,
     metadata?: NonNullable<GraphState["exploration"]>["family"],
   ) => {
-    const current = familyMembers.get(pattern) ?? { members: [] };
+    const canonicalPattern = canonicalFamilyPattern(pattern);
+    const current = familyMembers.get(canonicalPattern) ?? { members: [] };
     if (metadata) {
       const existing = current.metadata;
       current.metadata = {
         ...existing,
         ...metadata,
+        id: existing?.id ?? metadata.id,
         discovered_count: Math.max(
           existing?.discovered_count ?? 0,
           metadata.discovered_count ?? 0,
@@ -108,8 +161,9 @@ export function createGraphTopology(
           new Set([...(existing?.sample_urls ?? []), ...(metadata.sample_urls ?? [])]),
         ).slice(0, 8),
       };
+      current.metadata.pattern = canonicalPattern;
     }
-    familyMembers.set(pattern, current);
+    familyMembers.set(canonicalPattern, current);
     return current;
   };
   for (const state of Object.values(nodes).sort(stateOrder)) {

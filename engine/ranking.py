@@ -51,6 +51,72 @@ _CONTENT_FAMILY_HINT = re.compile(
     r"news|profile|profiles|user|users|player|players|item|items|card|cards)\b",
     re.I,
 )
+_DETAIL_PREFIXES: dict[str, tuple[str, str]] = {
+    "game": ("Games", "game"),
+    "games": ("Games", "game"),
+    "video": ("Videos", "video"),
+    "videos": ("Videos", "video"),
+    "short": ("Shorts", "video"),
+    "shorts": ("Shorts", "video"),
+    "watch": ("Videos", "video"),
+    "product": ("Products", "product"),
+    "products": ("Products", "product"),
+    "post": ("Posts", "post"),
+    "posts": ("Posts", "post"),
+    "blog": ("Posts", "post"),
+    "article": ("Articles", "news"),
+    "articles": ("Articles", "news"),
+    "news": ("News", "news"),
+    "profile": ("Profiles", "profile"),
+    "profiles": ("Profiles", "profile"),
+    "user": ("Profiles", "profile"),
+    "users": ("Profiles", "profile"),
+    "player": ("Players", "player"),
+    "players": ("Players", "player"),
+    "item": ("Items", "item"),
+    "items": ("Items", "item"),
+}
+_COLLECTION_SEGMENTS = {
+    "all",
+    "search",
+    "category",
+    "categories",
+    "collections",
+    "trending",
+    "top",
+    "new",
+    "latest",
+    "popular",
+}
+_OPTIONAL_SLUG_PREFIXES = {
+    "game",
+    "games",
+    "product",
+    "products",
+    "post",
+    "posts",
+    "article",
+    "articles",
+    "news",
+}
+
+
+def _dynamic_placeholder(
+    value: str,
+    *,
+    prefix: str | None = None,
+    first_after_prefix: bool = False,
+) -> str:
+    """Semantic placeholder for dynamic route pieces.
+
+    Repeated content URLs commonly use an entity id/slug immediately after a
+    content prefix, then optional human-readable slug pieces after that. Keeping
+    the first slot as ``:id`` makes one route family stable across numeric ids,
+    non-English slugs, and older surface-family payloads.
+    """
+    if first_after_prefix and prefix in _DETAIL_PREFIXES:
+        return ":id"
+    return ":id" if value.isdigit() else ":param"
 
 
 @dataclass
@@ -84,6 +150,14 @@ class SurfaceFamily:
     @property
     def discovered_count(self) -> int:
         return len(self.item_ids)
+
+
+@dataclass(frozen=True)
+class UrlFamily:
+    pattern: str
+    family_id: str
+    label: str
+    kind: str
 
 
 def loose_url_pattern(url: str) -> str:
@@ -125,14 +199,30 @@ def _infer_family_pattern(items: list[Interactable]) -> str | None:
     pattern_segments: list[str] = []
     shared_literals = 0
     varied = False
+    active_prefix: str | None = None
+    dynamic_index_after_prefix = 0
     for column in zip(*segments, strict=True):
         if len(set(column)) == 1:
             value = column[0]
             pattern_segments.append(value)
             if value not in {":id", "#"}:
                 shared_literals += 1
+            if value.lower() in _DETAIL_PREFIXES:
+                active_prefix = value.lower()
+                dynamic_index_after_prefix = 0
         else:
-            pattern_segments.append(":param")
+            first_after_prefix = active_prefix is not None and dynamic_index_after_prefix == 0
+            pattern_segments.append(
+                ":id"
+                if all(value.isdigit() for value in column)
+                else _dynamic_placeholder(
+                    column[0],
+                    prefix=active_prefix,
+                    first_after_prefix=first_after_prefix,
+                )
+            )
+            if active_prefix is not None:
+                dynamic_index_after_prefix += 1
             varied = True
     if shared_literals == 0:
         return None
@@ -146,11 +236,17 @@ def _infer_family_pattern(items: list[Interactable]) -> str | None:
             pattern_query.append((key, next(iter(values))))
         else:
             varied = True
-            pattern_query.append((key, ":param"))
+            pattern_query.append((key, ":id" if all(value for value in values) else ":param"))
     if not varied:
         return None
 
     first = normalized[0]
+    if (
+        len(pattern_segments) >= 2
+        and pattern_segments[-1] == ":id"
+        and pattern_segments[-2].lower() in _OPTIONAL_SLUG_PREFIXES
+    ):
+        pattern_segments.append(":param")
     path = "/" + "/".join(pattern_segments) if pattern_segments else "/"
     return urlunsplit((first.scheme, first.netloc, path, urlencode(pattern_query, safe=":"), ""))
 
@@ -186,6 +282,70 @@ def _family_display(pattern: str, items: list[Interactable]) -> tuple[str, str, 
         canonical = next((name for needle, name in kinds if needle == kind), None)
         label = canonical or (label if label.endswith("s") else f"{label}s")
     return family_id, label, kind
+
+
+def _family_id(pattern: str) -> str:
+    return hashlib.sha1(f"route-family|{pattern}".encode()).hexdigest()[:12]
+
+
+def _parameterized_path(segments: list[str], prefix_index: int) -> str | None:
+    if prefix_index + 1 >= len(segments):
+        return None
+    first_dynamic = segments[prefix_index + 1].lower()
+    if first_dynamic in _COLLECTION_SEGMENTS:
+        return None
+    prefix = segments[prefix_index].lower()
+    pattern_segments = []
+    for index, segment in enumerate(segments):
+        if index <= prefix_index:
+            pattern_segments.append(segment)
+        else:
+            pattern_segments.append(
+                _dynamic_placeholder(
+                    segment,
+                    prefix=prefix,
+                    first_after_prefix=index == prefix_index + 1,
+                )
+            )
+    if (
+        len(segments) == prefix_index + 2
+        and pattern_segments[-1] == ":id"
+        and prefix in _OPTIONAL_SLUG_PREFIXES
+    ):
+        pattern_segments.append(":param")
+    return "/" + "/".join(pattern_segments)
+
+
+def infer_url_family(url: str) -> UrlFamily | None:
+    """Infer a dynamic detail-page family from a retained state's URL.
+
+    This catches sampled pages that were reached from different surfaces or
+    whose labels are non-English, while avoiding broad static pages such as
+    /docs, /checkout, or /games/all.
+    """
+    parts = urlsplit(normalize_url(url))
+    if parts.scheme not in {"http", "https", "file"}:
+        return None
+    segments = [segment for segment in parts.path.split("/") if segment]
+
+    if parts.netloc.endswith("youtube.com") and parts.path == "/watch":
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if query.get("v"):
+            pattern = urlunsplit((parts.scheme, parts.netloc, "/watch", "v=:id", ""))
+            return UrlFamily(pattern, _family_id(pattern), "Videos", "video")
+
+    for index, segment in enumerate(segments):
+        key = segment.lower()
+        if key not in _DETAIL_PREFIXES:
+            continue
+        path = _parameterized_path(segments, index)
+        if path is None:
+            continue
+        label, kind = _DETAIL_PREFIXES[key]
+        pattern = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+        return UrlFamily(pattern, _family_id(pattern), label, kind)
+
+    return None
 
 
 def _group_key(item: Interactable) -> tuple[str, str, str, str]:

@@ -4,6 +4,7 @@ from engine.ranking import (
     ActionCandidate,
     collapse_siblings,
     detect_surface_families,
+    infer_url_family,
     is_auth_entry,
     score_action,
 )
@@ -73,7 +74,7 @@ class TestCollapseSiblings:
 
         assert len(candidates) == 3
         assert {candidate.family_pattern for candidate in candidates} == {
-            "https://demo.test/users/:param"
+            "https://demo.test/users/:id"
         }
         assert len({item.group_id for item in profiles}) == 1
         assert candidates[0].collapsed_count == 3
@@ -119,7 +120,41 @@ class TestSurfaceFamilies:
 
         assert {family.kind for family in families} == {"game"}
         assert families[0].discovered_count == 2
-        assert families[0].pattern == "https://demo.test/games/:param"
+        assert families[0].pattern == "https://demo.test/games/:id/:param"
+
+
+class TestUrlFamilies:
+    def test_game_detail_urls_infer_same_family_without_english_labels(self):
+        urls = [
+            "https://rotrends.com/game/10104979519/SUPERMOTO-2",
+            "https://rotrends.com/game/987654321/UNDERWATER-BARRYS-PRISON",
+            "https://rotrends.com/game/123456789/%D8%B4%D8%A7%D8%A7%D8%A7%D9%84%D9%8A%D8%A9",
+            "https://rotrends.com/game/10260434203/",
+        ]
+
+        families = [infer_url_family(url) for url in urls]
+
+        assert {family.pattern for family in families if family} == {
+            "https://rotrends.com/game/:id/:param"
+        }
+        assert all(family and family.label == "Games" for family in families)
+
+    def test_youtube_watch_and_shorts_infer_video_families(self):
+        watch = infer_url_family("https://www.youtube.com/watch?v=abc123&t=42")
+        short = infer_url_family("https://www.youtube.com/shorts/xyz987")
+
+        assert watch is not None
+        assert watch.pattern == "https://www.youtube.com/watch?v=:id"
+        assert watch.label == "Videos"
+        assert short is not None
+        assert short.pattern == "https://www.youtube.com/shorts/:id"
+        assert short.label == "Shorts"
+        assert short.kind == "video"
+
+    def test_collection_and_checkout_urls_do_not_infer_families(self):
+        assert infer_url_family("https://rotrends.com/games/all?sort=-playing") is None
+        assert infer_url_family("https://demo.test/checkout") is None
+        assert infer_url_family("https://demo.test/docs") is None
 
 
 class TestScoreAction:

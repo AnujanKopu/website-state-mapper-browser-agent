@@ -122,6 +122,45 @@ describe("graph element derivation", () => {
     expect(layout.nodePositions.other.x).toBeLessThan(box.position.x);
   });
 
+  it("canonicalizes equivalent dynamic family patterns into one box", () => {
+    const nodes = {
+      withSlug: state("withSlug", 1),
+      legacySlug: state("legacySlug", 2),
+      noSlug: state("noSlug", 3),
+    };
+    nodes.withSlug.exploration = { route_family: "https://example.com/game/:id/:param" };
+    nodes.legacySlug.exploration = { route_family: "https://example.com/game/:param/:param" };
+    nodes.noSlug.exploration = { route_family: "https://example.com/game/:param" };
+
+    const topology = createGraphTopology(nodes, {});
+
+    expect(topology.families).toHaveLength(1);
+    expect(topology.families[0]).toMatchObject({
+      pattern: "https://example.com/game/:id/:param",
+      memberIds: ["withSlug", "legacySlug", "noSlug"],
+    });
+  });
+
+  it("canonicalizes legacy video and shorts family placeholders", () => {
+    const nodes = {
+      shortA: state("shortA", 1),
+      shortB: state("shortB", 2),
+      watchA: state("watchA", 3),
+      watchB: state("watchB", 4),
+    };
+    nodes.shortA.exploration = { route_family: "https://www.youtube.com/shorts/:param" };
+    nodes.shortB.exploration = { route_family: "https://www.youtube.com/shorts/:id" };
+    nodes.watchA.exploration = { route_family: "https://www.youtube.com/watch?v=:param" };
+    nodes.watchB.exploration = { route_family: "https://www.youtube.com/watch?v=:id" };
+
+    const topology = createGraphTopology(nodes, {});
+
+    expect(topology.families.map((family) => family.pattern).sort()).toEqual([
+      "https://www.youtube.com/shorts/:id",
+      "https://www.youtube.com/watch?v=:id",
+    ]);
+  });
+
   it("does not create a box for one-member families or substates", () => {
     const lone = state("lone", 1);
     lone.exploration = { route_family: "https://example.com/users/:param" };

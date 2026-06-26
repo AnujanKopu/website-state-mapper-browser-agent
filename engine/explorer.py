@@ -53,6 +53,7 @@ from engine.ranking import (
     ActionCandidate,
     SurfaceFamily,
     detect_surface_families,
+    infer_url_family,
     is_auth_entry,
     score_action,
 )
@@ -653,6 +654,20 @@ class Explorer:
             "discovered_count": family.discovered_count,
             "sample_labels": family.sample_labels,
             "sample_urls": family.sample_urls,
+        }
+
+    @staticmethod
+    def _url_family_payload(family) -> dict:
+        return {
+            "id": family.family_id,
+            "label": family.label,
+            "kind": family.kind,
+            "pattern": family.pattern,
+            "label_source": "heuristic",
+            "confidence": 0.8,
+            "discovered_count": 1,
+            "sample_labels": [],
+            "sample_urls": [],
         }
 
     def _family_runtime_payload(self, pattern: str) -> dict:
@@ -1269,6 +1284,39 @@ class Explorer:
             page_depth = source.page_depth + 1
         if page_depth_override is not None:
             page_depth = page_depth_override
+
+        if route_family is None and parent_state_id is None:
+            url_family = infer_url_family(observation.snapshot.url)
+            if url_family is not None:
+                route_family = url_family.pattern
+                existing_family = self._family_info.get(route_family, {})
+                url_payload = self._url_family_payload(url_family)
+                sample_label = observation.snapshot.title or observation.snapshot.url
+                family = {
+                    **url_payload,
+                    **existing_family,
+                    "discovered_count": max(
+                        int(existing_family.get("discovered_count", 0)),
+                        int(url_payload.get("discovered_count", 1)),
+                    ),
+                    "sample_labels": list(
+                        dict.fromkeys(
+                            [
+                                *existing_family.get("sample_labels", []),
+                                sample_label,
+                            ]
+                        )
+                    )[:8],
+                    "sample_urls": list(
+                        dict.fromkeys(
+                            [
+                                *existing_family.get("sample_urls", []),
+                                observation.snapshot.url,
+                            ]
+                        )
+                    )[:8],
+                }
+                self._family_info[route_family] = dict(family)
 
         page_role = infer_page_role(
             observation,
