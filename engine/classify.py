@@ -71,9 +71,7 @@ def classify_state(
     ):
         state_type = StateType.AUTH_WALL
     elif signals.payment_fields > 0 or (
-        _PRICE.search(visible_text)
-        and _PAYWALL_WORDS.search(visible_text)
-        and safe_candidates <= 3
+        _PRICE.search(visible_text) and _PAYWALL_WORDS.search(visible_text) and safe_candidates <= 3
     ):
         state_type = StateType.PAYWALL
     else:
@@ -82,11 +80,16 @@ def classify_state(
     return state_type, flags
 
 
-def analyze_state(observation: Observation, *, base_url: str) -> StateAnalysis:
+def analyze_state(
+    observation: Observation,
+    *,
+    base_url: str,
+    preserve_item_ids: set[str] | None = None,
+) -> StateAnalysis:
     """Full candidate pipeline for one observed state:
     collapse siblings -> modal scoping -> safety verdicts -> classification.
     """
-    candidates = collapse_siblings(observation.interactables)
+    candidates = collapse_siblings(observation.interactables, preserve_item_ids=preserve_item_ids)
 
     # When a modal is open it owns the interaction: elements behind the
     # backdrop are not actionable (clicks would be intercepted anyway).

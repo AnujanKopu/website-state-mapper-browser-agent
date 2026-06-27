@@ -4,9 +4,14 @@ import { getGraph } from "../../api/client";
 import { openRunStream, type RunStreamHandle } from "../../api/eventStream";
 import { initialRunState, runReducer } from "./runState";
 import type { RunState } from "./runState";
+import type { GraphDocument } from "../../types/graph";
 
 /** Runs that are persisted and no longer have a live in-memory event stream. */
 const FINISHED_STATUSES = new Set(["done", "failed", "cancelled"]);
+
+function shouldStream(graph: GraphDocument): boolean {
+  return !FINISHED_STATUSES.has(graph.run.status) && graph.sync?.authoritative !== true;
+}
 
 export interface RunStreamResult {
   run: RunState;
@@ -23,15 +28,19 @@ export function useRunStream(runId: string | null): RunStreamResult {
 
   useEffect(() => {
     if (!runId) return;
+    const activeRunId = runId;
     let cancelled = false;
     let stream: RunStreamHandle | null = null;
     let hydrateInFlight: ReturnType<typeof getGraph> | null = null;
+    let lastSequence = -1;
+    let recovering = false;
+    let settled = false;
 
-    dispatch({ type: "reset", runId });
+    dispatch({ type: "reset", runId: activeRunId });
 
     const hydrate = () => {
       if (hydrateInFlight) return hydrateInFlight;
-      hydrateInFlight = getGraph(runId)
+      hydrateInFlight = getGraph(activeRunId)
         .then((graph) => {
           if (!cancelled) dispatch({ type: "hydrate", graph });
           return graph;
@@ -42,9 +51,34 @@ export function useRunStream(runId: string | null): RunStreamResult {
       return hydrateInFlight;
     };
 
-    const attachStream = () => {
+    const recoverStream = (failureMessage: string) => {
+      if (cancelled || recovering) return;
+      recovering = true;
+      stream?.close();
+      stream = null;
+      hydrate()
+        .then((graph) => {
+          if (cancelled) return;
+          if (shouldStream(graph)) attachStream();
+          else {
+            settled = true;
+            dispatch({ type: "streamClosed" });
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            dispatch({ type: "hydrateFailed", message: failureMessage });
+            dispatch({ type: "streamClosed" });
+          }
+        })
+        .finally(() => {
+          recovering = false;
+        });
+    };
+
+    function attachStream() {
       if (cancelled || stream) return;
-      stream = openRunStream(runId, {
+      stream = openRunStream(activeRunId, {
         onOpen: () => {
           if (!cancelled) dispatch({ type: "streamOpen" });
         },
@@ -52,9 +86,22 @@ export function useRunStream(runId: string | null): RunStreamResult {
           if (!cancelled) dispatch({ type: "streamReconnecting" });
         },
         onEvent: (envelope) => {
-          if (!cancelled) dispatch({ type: "sse", envelope });
+          if (cancelled || envelope.sequence <= lastSequence) return;
+          if (envelope.sequence !== lastSequence + 1) {
+            recoverStream("Graph recovery failed after an event gap.");
+            return;
+          }
+          lastSequence = envelope.sequence;
+          // Heartbeats carry no graph mutation; frontier/action events already
+          // deliver counters. Keep the transport cursor without rerendering the UI.
+          if (envelope.type === "heartbeat") return;
+          dispatch({ type: "sse", envelope });
+        },
+        onProtocolError: () => {
+          recoverStream("Graph recovery failed after an invalid event.");
         },
         onTerminal: () => {
+          settled = true;
           stream = null;
           hydrate()
             .catch(() => {
@@ -68,24 +115,16 @@ export function useRunStream(runId: string | null): RunStreamResult {
         },
         onClosed: () => {
           stream = null;
-          hydrate()
-            .catch(() => {
-              if (!cancelled) {
-                dispatch({ type: "hydrateFailed", message: "Graph refresh failed." });
-              }
-            })
-            .finally(() => {
-              if (!cancelled) dispatch({ type: "streamClosed" });
-            });
+          recoverStream("Graph refresh failed.");
         },
-      });
-    };
+      }, lastSequence);
+    }
 
     const reconcileForeground = () => {
-      if (cancelled || document.hidden) return;
+      if (cancelled || document.hidden || stream || recovering || settled) return;
       hydrate()
         .then((graph) => {
-          if (!cancelled && !FINISHED_STATUSES.has(graph.run.status) && !stream) {
+          if (!cancelled && shouldStream(graph) && !stream) {
             attachStream();
           }
         })
@@ -106,7 +145,8 @@ export function useRunStream(runId: string | null): RunStreamResult {
     hydrate()
       .then((graph) => {
         if (cancelled) return;
-        if (FINISHED_STATUSES.has(graph.run.status)) {
+        if (!shouldStream(graph)) {
+          settled = true;
           dispatch({ type: "terminalReconciled" });
           return;
         }

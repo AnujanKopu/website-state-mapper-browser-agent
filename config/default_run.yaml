@@ -38,6 +38,12 @@ exploration:
   # Distinct states kept per loose URL family (e.g. /post/#); further siblings
   # fold into the family representative as skipped items + inferred edges.
   url_family_cap: 3
+  # Cross-surface support needed before a URL cohort becomes provisional.
+  url_family_min_support: 5
+  # Same repeated container/selector support needed for early promotion.
+  url_family_strong_support: 3
+  # Maximum conflicting destinations inspected before rejecting a candidate.
+  url_family_validation_cap: 5
   # Header/menu actions allowed while looking for a hidden login entry.
   auth_discovery_action_cap: 6
   # Same-URL tabs/menus are bounded separately from page navigation depth.

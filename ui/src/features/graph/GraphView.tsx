@@ -26,9 +26,7 @@ import { StateNodeView, type StateFlowNode } from "./StateNode";
 type GraphFlowNode = StateFlowNode | FamilyFlowNode;
 
 const nodeTypes = { state: StateNodeView, family: FamilyGroupView };
-const LIVE_LAYOUT_DEBOUNCE_MS = 300;
 const FIT_PADDING = 0.18;
-const FOLLOW_PADDING = 0.35;
 
 function layoutBounds(layout: GraphLayout, topology: GraphTopology) {
   let minX = Infinity;
@@ -71,6 +69,7 @@ interface GraphViewProps {
 
 interface GraphCanvasProps extends GraphViewProps {
   displayTopology: ReturnType<typeof createGraphTopology>;
+  onInteractionChange: (active: boolean) => void;
 }
 
 function GraphCanvas({
@@ -81,6 +80,7 @@ function GraphCanvas({
   isLive,
   onSelect,
   displayTopology,
+  onInteractionChange,
 }: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const pendingFitRef = useRef(true);
@@ -90,8 +90,10 @@ function GraphCanvas({
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [interacting, setInteracting] = useState(false);
+  const manualInteractionRef = useRef(false);
   const nodesInitialized = useNodesInitialized();
-  const { fitBounds } = useReactFlow<GraphFlowNode, Edge>();
+  const { fitBounds, getZoom, setCenter } = useReactFlow<GraphFlowNode, Edge>();
 
   const layout = useMemo(
     () => layoutTopology(displayTopology),
@@ -127,6 +129,9 @@ function GraphCanvas({
         connectable: false,
         focusable: false,
         zIndex: 0,
+        width: family.width,
+        height: family.height,
+        measured: { width: family.width, height: family.height },
         style: {
           width: family.width,
           height: family.height,
@@ -144,13 +149,16 @@ function GraphCanvas({
           position,
           selected: id === selectedId,
           zIndex: 1,
+          width: NODE_WIDTH,
+          height: NODE_HEIGHT,
+          measured: { width: NODE_WIDTH, height: NODE_HEIGHT },
           data: { state, current: id === currentId },
           style: {
             opacity:
               (normalizedQuery
                 && !`${state.label ?? state.title} ${state.url}`.toLowerCase().includes(normalizedQuery))
               || (nodeEdgeFocus && !nodeEdgeFocus.nodeIds.has(id))
-                ? 0.2
+                ? 0.38
                 : 1,
           },
         }];
@@ -160,8 +168,15 @@ function GraphCanvas({
   );
 
   const rfEdges = useMemo(
-    () => buildFlowEdges(displayTopology, edges, selectedEdgeId, selectedId, nodes),
-    [displayTopology, edges, nodes, selectedEdgeId, selectedId],
+    () => buildFlowEdges(
+      displayTopology,
+      edges,
+      selectedEdgeId,
+      selectedId,
+      nodes,
+      !interacting && !document.hidden,
+    ),
+    [displayTopology, edges, interacting, nodes, selectedEdgeId, selectedId],
   );
 
   const canViewport = useCallback(() => {
@@ -202,11 +217,11 @@ function GraphCanvas({
       return;
     }
     pendingFitRef.current = false;
-    void fitBounds(
-      { x: position.x, y: position.y, width: NODE_WIDTH, height: NODE_HEIGHT },
-      { duration, padding: FOLLOW_PADDING },
-    );
-  }, [canViewport, currentId, displayTopology.nodeIds, fitBounds, layout.nodePositions]);
+    void setCenter(position.x + NODE_WIDTH / 2, position.y + NODE_HEIGHT / 2, {
+      duration,
+      zoom: getZoom(),
+    });
+  }, [canViewport, currentId, displayTopology.nodeIds, getZoom, layout.nodePositions, setCenter]);
 
   const scheduleViewport = useCallback((mode: "fit" | "follow", duration = 0) => {
     if (fitFrameRef.current !== null) window.cancelAnimationFrame(fitFrameRef.current);
@@ -262,10 +277,13 @@ function GraphCanvas({
 
   useEffect(() => {
     const refitOnForeground = () => {
-      if (document.hidden) {
-        pendingFitRef.current = true;
-      } else if (following && nodesInitialized && rfNodes.length > 0) {
-        pendingFitRef.current = true;
+      if (
+        !document.hidden
+        && pendingFitRef.current
+        && following
+        && nodesInitialized
+        && rfNodes.length > 0
+      ) {
         scheduleFollowingViewport(0);
       }
     };
@@ -305,6 +323,25 @@ function GraphCanvas({
     onSelect(null);
   }, [onSelect]);
 
+  const endInteraction = useCallback(() => {
+    if (!manualInteractionRef.current) return;
+    manualInteractionRef.current = false;
+    setInteracting(false);
+    onInteractionChange(false);
+  }, [onInteractionChange]);
+
+  useEffect(() => {
+    const releaseOnVisibilityLoss = () => {
+      if (document.hidden) endInteraction();
+    };
+    window.addEventListener("blur", endInteraction);
+    document.addEventListener("visibilitychange", releaseOnVisibilityLoss);
+    return () => {
+      window.removeEventListener("blur", endInteraction);
+      document.removeEventListener("visibilitychange", releaseOnVisibilityLoss);
+    };
+  }, [endInteraction]);
+
   useEffect(() => {
     if (selectedId !== null) return;
     setSelectedEdgeId(null);
@@ -333,9 +370,20 @@ function GraphCanvas({
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
+        panOnDrag
+        selectionOnDrag={false}
+        zoomOnScroll
+        zoomOnPinch
         onMoveStart={(event) => {
-          if (event) setFollowing(false);
+          // fitBounds/setCenter also emit move callbacks, but without a source
+          // event. Only real user input should freeze the live topology.
+          if (!event) return;
+          manualInteractionRef.current = true;
+          setFollowing(false);
+          setInteracting(true);
+          onInteractionChange(true);
         }}
+        onMoveEnd={endInteraction}
         onNodeClick={(_, node) => {
           if (node.type === "state") {
             setSelectedEdgeId(null);
@@ -348,7 +396,6 @@ function GraphCanvas({
         }}
         onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
         onPaneClick={clearSelection}
-        onlyRenderVisibleElements
         minZoom={0.1}
         maxZoom={1.8}
         proOptions={{ hideAttribution: true }}
@@ -359,7 +406,9 @@ function GraphCanvas({
           <span>State topology</span>
           <strong>
             {displayTopology.nodeIds.length} nodes · {Object.keys(edges).length} transitions
-            {rfEdges.length !== Object.keys(edges).length ? ` · ${rfEdges.length} visible` : ""}
+            {rfEdges.length !== Object.keys(edges).length
+              ? ` · ${rfEdges.length} visible transition bundles`
+              : ""}
           </strong>
         </Panel>
         <Panel position="bottom-left" className="graph-search">
@@ -409,19 +458,37 @@ export function GraphView(props: GraphViewProps) {
     [props.nodes, props.edges],
   );
   const [displayTopology, setDisplayTopology] = useState(topology);
+  const [interacting, setInteracting] = useState(false);
+  const pendingTopologyRef = useRef(topology);
+  const topologyFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
+    pendingTopologyRef.current = topology;
+    if (interacting) return;
     if (!props.isLive || topology.nodeIds.length === 0) {
       setDisplayTopology(topology);
       return;
     }
-    const timer = window.setTimeout(() => setDisplayTopology(topology), LIVE_LAYOUT_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
-  }, [props.isLive, topology.key]);
+    if (topologyFrameRef.current !== null) window.cancelAnimationFrame(topologyFrameRef.current);
+    topologyFrameRef.current = window.requestAnimationFrame(() => {
+      topologyFrameRef.current = null;
+      setDisplayTopology(pendingTopologyRef.current);
+    });
+    return () => {
+      if (topologyFrameRef.current !== null) {
+        window.cancelAnimationFrame(topologyFrameRef.current);
+        topologyFrameRef.current = null;
+      }
+    };
+  }, [interacting, props.isLive, topology.key]);
 
   return (
     <ReactFlowProvider>
-      <GraphCanvas {...props} displayTopology={displayTopology} />
+      <GraphCanvas
+        {...props}
+        displayTopology={displayTopology}
+        onInteractionChange={setInteracting}
+      />
     </ReactFlowProvider>
   );
 }

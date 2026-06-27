@@ -59,51 +59,32 @@ function familyId(pattern: string): string {
   return `family-${(hash >>> 0).toString(36)}`;
 }
 
-const optionalSlugPrefixes = new Set([
-  "game",
-  "games",
-  "product",
-  "products",
-  "post",
-  "posts",
-  "article",
-  "articles",
-  "news",
-]);
-const entityPrefixes = new Set([
-  ...optionalSlugPrefixes,
-  "video",
-  "videos",
-  "short",
-  "shorts",
-  "watch",
-  "profile",
-  "profiles",
-  "user",
-  "users",
-  "player",
-  "players",
-  "item",
-  "items",
-]);
+const placeholder = /^(?::(?:id|param|slug|value)|\{[^}]+\})$/i;
+const optionalPlaceholder = /^(?::optional|:(?:id|param|slug|value)\?|\{[^}]+\?\})$/i;
 
 function canonicalFamilyPattern(pattern: string): string {
   try {
     const url = new URL(pattern);
-    const segments = url.pathname.split("/").filter(Boolean);
-    if (url.pathname === "/watch" && url.searchParams.get("v") === ":param") {
-      return pattern.replace("v=:param", "v=:id");
-    }
-    const prefixIndex = segments.findIndex((segment) => entityPrefixes.has(segment.toLowerCase()));
-    if (prefixIndex >= 0 && segments[prefixIndex + 1]?.startsWith(":")) {
-      const prefix = segments[prefixIndex].toLowerCase();
-      segments[prefixIndex + 1] = ":id";
-      if (optionalSlugPrefixes.has(prefix) && segments.length === prefixIndex + 2) {
-        segments.push(":param");
-      }
-      url.pathname = `/${segments.join("/")}`;
-      return url.toString().replace(/\/$/, "");
-    }
+    const segments = url.pathname.split("/").filter(Boolean).map((segment) => {
+      const decoded = decodeURIComponent(segment);
+      if (optionalPlaceholder.test(decoded)) return ":optional";
+      if (placeholder.test(decoded)) return ":param";
+      return decoded;
+    });
+    url.pathname = segments.length ? `/${segments.join("/")}` : "/";
+    const query = [...url.searchParams.entries()]
+      .map(([key, value]) => [
+        key,
+        optionalPlaceholder.test(value)
+          ? ":optional"
+          : placeholder.test(value) ? ":param" : value,
+      ] as const)
+      .sort(([left], [right]) => left.localeCompare(right));
+    url.search = "";
+    for (const [key, value] of query) url.searchParams.append(key, value);
+    return url.toString()
+      .replace(/%3A(param|optional)/gi, ":$1")
+      .replace(/\/$/, "");
   } catch {
     // Keep non-URL or legacy custom patterns untouched.
   }
@@ -130,14 +111,36 @@ export function createGraphTopology(
   const nodeSet = new Set(nodeIds);
   const familyMembers = new Map<
     string,
-    { members: GraphState[]; metadata?: NonNullable<GraphState["exploration"]>["family"] }
+    {
+      pattern: string;
+      members: GraphState[];
+      metadata?: NonNullable<GraphState["exploration"]>["family"];
+    }
   >();
+  const familyKeyByPattern = new Map<string, string>();
   const registerFamily = (
     pattern: string,
     metadata?: NonNullable<GraphState["exploration"]>["family"],
   ) => {
     const canonicalPattern = canonicalFamilyPattern(pattern);
-    const current = familyMembers.get(canonicalPattern) ?? { members: [] };
+    const previousKey = familyKeyByPattern.get(canonicalPattern);
+    const key = metadata?.id
+      ? `id:${metadata.id}`
+      : previousKey ?? `pattern:${canonicalPattern}`;
+    if (previousKey && previousKey !== key) {
+      const previous = familyMembers.get(previousKey);
+      const authoritative = familyMembers.get(key);
+      if (previous) {
+        familyMembers.set(key, {
+          pattern: canonicalPattern,
+          members: [...(authoritative?.members ?? []), ...previous.members],
+          metadata: authoritative?.metadata ?? previous.metadata,
+        });
+        familyMembers.delete(previousKey);
+      }
+    }
+    familyKeyByPattern.set(canonicalPattern, key);
+    const current = familyMembers.get(key) ?? { pattern: canonicalPattern, members: [] };
     if (metadata) {
       const existing = current.metadata;
       current.metadata = {
@@ -163,7 +166,7 @@ export function createGraphTopology(
       };
       current.metadata.pattern = canonicalPattern;
     }
-    familyMembers.set(canonicalPattern, current);
+    familyMembers.set(key, current);
     return current;
   };
   for (const state of Object.values(nodes).sort(stateOrder)) {
@@ -177,10 +180,12 @@ export function createGraphTopology(
   }
   const families: FamilyGroup[] = [...familyMembers.entries()]
     .filter(([, entry]) => {
+      if (entry.metadata?.status && entry.metadata.status !== "confirmed") return false;
       const discovered = entry.metadata?.discovered_count ?? 0;
       return entry.members.length > 0 && (entry.members.length >= 2 || discovered > 1);
     })
-    .map(([pattern, entry]) => {
+    .map(([, entry]) => {
+      const pattern = entry.pattern;
       const members = entry.members.sort(stateOrder);
       const metadata = entry.metadata;
       return {
@@ -223,10 +228,22 @@ export function createGraphTopology(
     layoutEdges.push({ id: `layout:${key}`, source, target });
   }
   const edgeIds = validEdges.map((edge) => edge.id);
+  const familyKey = families
+    .map((family) => [
+      family.id,
+      family.label,
+      family.discoveredCount,
+      family.checkedCount,
+      family.representedCount,
+      family.skippedCount,
+    ].join(":"))
+    .join("|");
   const key = `${nodeIds.map((id) => `${id}@${ownerByNode[id]}`).join("|")}::${validEdges
     .map((edge) => `${edge.id}:${edge.from}>${edge.to}`)
+    .join("|")}::${familyKey}`;
+  const layoutKey = `${nodeIds.map((id) => `${id}@${ownerByNode[id]}`).join("|")}::${layoutEdges
+    .map((edge) => `${edge.source}>${edge.target}`)
     .join("|")}`;
-  const layoutKey = nodeIds.map((id) => `${id}@${ownerByNode[id]}`).join("|");
 
   return { key, layoutKey, nodeIds, edgeIds, layoutEdges, ownerByNode, families };
 }
@@ -383,6 +400,7 @@ export function buildFlowEdges(
   selectedBundleId: string | null = null,
   focusedNodeId: string | null = null,
   graphNodes: Record<string, GraphState> = {},
+  animateInferred = true,
 ): Edge[] {
   const focus = collectNodeEdgeFocus(topology, graphNodes, edges, focusedNodeId);
   const bundles = new Map<string, GraphEdge[]>();
@@ -429,7 +447,7 @@ export function buildFlowEdges(
       target: topology.ownerByNode[edge.to] ?? edge.to,
       type: cyclic ? "default" : "smoothstep",
       label: selectedBundleId === id || connected ? label : undefined,
-      animated: inferred && !connected,
+      animated: animateInferred && inferred && !connected,
       className: visualRole === "inbound"
         ? "graph-edge--inbound"
         : visualRole === "outbound"

@@ -1346,6 +1346,10 @@ code {
   max-width: 100%;
 }
 
+.overlay__body img.overlay__image--actual {
+  max-width: none;
+}
+
 /* ---------- Animations ---------- */
 
 @keyframes pulse-anim {

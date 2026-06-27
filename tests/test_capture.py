@@ -34,6 +34,14 @@ async def test_single_capture_end_to_end(settings: Settings):
     assert state.signals.modal_open is False
     assert state.signals.form_count >= 1
     assert state.state_type.value == "page"
+    assert state.evidence["page"]["viewport"]["width"] > 0
+    assert state.evidence["forms"]
+    assert "visible_text" not in state.evidence
+    assert all(
+        "value" not in field
+        for form in state.evidence["forms"]
+        for field in form["fields"]
+    )
 
     # --- visible text (hidden elements must be excluded) ---
     assert "FlowState Demo" in state.visible_text

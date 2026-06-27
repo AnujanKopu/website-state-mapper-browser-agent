@@ -74,6 +74,15 @@ describe("graph element derivation", () => {
     expect(layoutTopology(after)).toEqual(layoutTopology(before));
   });
 
+  it("invalidates layout when a structural edge arrives after its nodes", () => {
+    const nodes = { a: state("a", 0), b: state("b", 1) };
+    const before = createGraphTopology(nodes, {});
+    const after = createGraphTopology(nodes, { e1: edge("e1", "a", "b") });
+
+    expect(after.layoutKey).not.toBe(before.layoutKey);
+    expect(after.layoutEdges).toHaveLength(1);
+  });
+
   it("produces finite fixed-dimension layouts and readable inferred edges", () => {
     const edges = { e1: edge("e1", "a", "b", "inferred") };
     const topology = createGraphTopology({ a: state("a", 0), b: state("b", 1) }, edges);
@@ -122,7 +131,7 @@ describe("graph element derivation", () => {
     expect(layout.nodePositions.other.x).toBeLessThan(box.position.x);
   });
 
-  it("canonicalizes equivalent dynamic family patterns into one box", () => {
+  it("canonicalizes placeholder names by position without inventing optional slots", () => {
     const nodes = {
       withSlug: state("withSlug", 1),
       legacySlug: state("legacySlug", 2),
@@ -136,12 +145,13 @@ describe("graph element derivation", () => {
 
     expect(topology.families).toHaveLength(1);
     expect(topology.families[0]).toMatchObject({
-      pattern: "https://example.com/game/:id/:param",
-      memberIds: ["withSlug", "legacySlug", "noSlug"],
+      pattern: "https://example.com/game/:param/:param",
+      memberIds: ["withSlug", "legacySlug"],
     });
+    expect(topology.ownerByNode.noSlug).toBe("noSlug");
   });
 
-  it("canonicalizes legacy video and shorts family placeholders", () => {
+  it("canonicalizes legacy path and query placeholders generically", () => {
     const nodes = {
       shortA: state("shortA", 1),
       shortB: state("shortB", 2),
@@ -156,9 +166,41 @@ describe("graph element derivation", () => {
     const topology = createGraphTopology(nodes, {});
 
     expect(topology.families.map((family) => family.pattern).sort()).toEqual([
-      "https://www.youtube.com/shorts/:id",
-      "https://www.youtube.com/watch?v=:id",
+      "https://www.youtube.com/shorts/:param",
+      "https://www.youtube.com/watch?v=:param",
     ]);
+  });
+
+  it("uses the backend family id as the authoritative grouping key", () => {
+    const first = state("first", 1);
+    const second = state("second", 2);
+    first.exploration = {
+      route_family: "https://example.com/entry/:param",
+      family: {
+        id: "authoritative",
+        label: "Entries",
+        kind: "items",
+        pattern: "https://example.com/entry/:param",
+        label_source: "heuristic",
+        confidence: 0.9,
+        discovered_count: 5,
+        status: "confirmed",
+      },
+    };
+    second.exploration = {
+      route_family: "https://example.com/legacy/:id",
+      family: {
+        ...first.exploration.family!,
+        pattern: "https://example.com/legacy/:id",
+      },
+    };
+
+    const topology = createGraphTopology({ first, second }, {});
+    expect(topology.families).toHaveLength(1);
+    expect(topology.families[0]).toMatchObject({
+      id: "family-authoritative",
+      memberIds: ["first", "second"],
+    });
   });
 
   it("does not create a box for one-member families or substates", () => {

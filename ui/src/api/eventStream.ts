@@ -13,6 +13,8 @@ export interface RunStreamHandlers {
   onTerminal?: (envelope: SSEEnvelope) => void;
   /** Fired when the stream closes hard (e.g. 404: run not live / unknown). */
   onClosed?: () => void;
+  /** Fired for malformed or cross-run envelopes. */
+  onProtocolError?: (message: string) => void;
 }
 
 export interface RunStreamHandle {
@@ -28,8 +30,13 @@ const isTerminal = (type: EventType): boolean => TERMINAL_EVENT_TYPES.includes(t
  * We close the EventSource ourselves on a terminal event so the browser does
  * not auto-reconnect and replay the whole history again.
  */
-export function openRunStream(runId: string, handlers: RunStreamHandlers): RunStreamHandle {
-  const source = new EventSource(`${API_BASE}/api/runs/${runId}/events`);
+export function openRunStream(
+  runId: string,
+  handlers: RunStreamHandlers,
+  afterSequence = -1,
+): RunStreamHandle {
+  const query = afterSequence >= 0 ? `?after_sequence=${afterSequence}` : "";
+  const source = new EventSource(`${API_BASE}/api/runs/${runId}/events${query}`);
   let closed = false;
 
   const close = () => {
@@ -43,6 +50,16 @@ export function openRunStream(runId: string, handlers: RunStreamHandlers): RunSt
     try {
       envelope = JSON.parse(raw) as SSEEnvelope;
     } catch {
+      handlers.onProtocolError?.("Malformed run event received.");
+      return;
+    }
+    if (
+      envelope.run_id !== runId
+      || !Number.isInteger(envelope.sequence)
+      || envelope.sequence < 0
+      || !EVENT_TYPES.includes(envelope.type)
+    ) {
+      handlers.onProtocolError?.("Invalid run event envelope received.");
       return;
     }
     handlers.onEvent(envelope);

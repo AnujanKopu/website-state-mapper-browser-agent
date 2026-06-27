@@ -116,6 +116,14 @@ class ExplorationConfig(StrictModel):
     # archives and card grids can't dominate the graph; further siblings fold
     # into the family representative as skipped surface items + inferred edges.
     url_family_cap: int = 3
+    # A cohort may be promoted from weaker cross-surface URL evidence only
+    # after this many distinct URLs have accumulated.
+    url_family_min_support: int = 5
+    # Repeated links from one stable container/selector shape are stronger
+    # evidence and may be promoted at this lower threshold.
+    url_family_strong_support: int = 3
+    # Conflicting destination structures are inspected only up to this bound.
+    url_family_validation_cap: int = 5
     # Login mode may inspect a few header/menu controls to reveal a hidden
     # authentication entry before general exploration starts.
     auth_discovery_action_cap: int = 6
@@ -173,6 +181,15 @@ class Interactable(BaseModel):
     aria_label: str | None = None
     aria_selected: bool | None = None
     aria_expanded: bool | None = None
+    aria_controls: str | None = None
+    aria_haspopup: str | None = None
+    aria_pressed: bool | None = None
+    checked: bool | None = None
+    input_type: str | None = None
+    required: bool = False
+    autocomplete: str | None = None
+    form_action: str | None = None
+    form_method: str | None = None
     title: str | None = None
     test_id: str | None = None
     context_label: str | None = None
@@ -227,6 +244,10 @@ class PageSnapshot(BaseModel):
     screenshot_png: bytes
     dom_skeleton: str
     signals: PageSignals = Field(default_factory=PageSignals)
+    # Persistable structural evidence excludes arbitrary page prose and values.
+    evidence: dict = Field(default_factory=dict)
+    # Ephemeral labels/headings for a future per-state LLM summarizer.
+    text_evidence: dict = Field(default_factory=dict)
 
 
 class Observation(BaseModel):
@@ -262,6 +283,9 @@ class ActionStep(BaseModel):
     url: str | None = None
     selector: str | None = None
     label: str | None = None
+    role: str | None = None
+    href: str | None = None
+    control_key: str | None = None
 
 
 class CapturedState(BaseModel):
@@ -281,6 +305,7 @@ class CapturedState(BaseModel):
     signals: PageSignals = Field(default_factory=PageSignals)
     state_type: StateType = StateType.PAGE
     detected_flags: dict = Field(default_factory=dict)
+    evidence: dict = Field(default_factory=dict)
     visible_text: str
     interactables: list[Interactable]
     screenshot_path: str

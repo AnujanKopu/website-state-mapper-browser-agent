@@ -137,6 +137,67 @@ describe("runReducer", () => {
     expect(hydrated.lastEventSequence).toBe(2);
   });
 
+  it("adds missing entities from a stale snapshot without overwriting newer live data", () => {
+    const live = runReducer(resetState(), {
+      type: "sse",
+      envelope: event(4, "state_discovered", {
+        state_id: "s1",
+        index: 1,
+        url: "https://example.com/one",
+        url_normalized: "https://example.com/one",
+        title: "Newest live title",
+        type: "page",
+        depth: 1,
+        parent_state_id: null,
+        screenshot: "live.png",
+        flags: {},
+        denied_count: 0,
+      }),
+    });
+    const stale = graph([graphState("s1", 1, { title: "Stale title" }), graphState("s2", 2)]);
+    stale.sync = {
+      schema_version: 2,
+      snapshot_sequence: 2,
+      authoritative: false,
+      latest_state_id: "s2",
+    };
+
+    const hydrated = runReducer(live, { type: "hydrate", graph: stale });
+    expect(hydrated.nodes.s1.title).toBe("Newest live title");
+    expect(hydrated.nodes.s2.title).toBe("State 2");
+    expect(hydrated.viewportStateId).toBe("s1");
+    expect(hydrated.order).toEqual(["s1", "s2"]);
+  });
+
+  it("uses a current snapshot's latest state for foreground catch-up", () => {
+    const live = runReducer(resetState(), {
+      type: "sse",
+      envelope: event(1, "state_discovered", {
+        state_id: "s1",
+        index: 1,
+        url: "https://example.com/one",
+        url_normalized: "https://example.com/one",
+        title: "One",
+        type: "page",
+        depth: 1,
+        parent_state_id: null,
+        screenshot: "",
+        flags: {},
+        denied_count: 0,
+      }),
+    });
+    const current = graph([graphState("s1", 1), graphState("s2", 2)]);
+    current.sync = {
+      schema_version: 2,
+      snapshot_sequence: 3,
+      authoritative: false,
+      latest_state_id: "s2",
+    };
+
+    const hydrated = runReducer(live, { type: "hydrate", graph: current });
+    expect(hydrated.viewportStateId).toBe("s2");
+  });
+
   it("applies run metadata, terminal stats, and explicit connection transitions", () => {
     const started = runReducer(resetState(), {
       type: "sse",

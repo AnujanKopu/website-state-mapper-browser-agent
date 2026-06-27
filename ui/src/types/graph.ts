@@ -36,6 +36,9 @@ export interface ActionStep {
   url?: string | null;
   selector?: string | null;
   label?: string | null;
+  role?: string | null;
+  href?: string | null;
+  control_key?: string | null;
 }
 
 export type SurfaceStatus = "pending" | "explored" | "blocked" | "noop" | "skipped_duplicate";
@@ -54,6 +57,15 @@ export interface SurfaceItem {
   in_modal?: boolean;
   aria_selected?: boolean | null;
   aria_expanded?: boolean | null;
+  aria_controls?: string | null;
+  aria_haspopup?: string | null;
+  aria_pressed?: boolean | null;
+  checked?: boolean | null;
+  input_type?: string | null;
+  required?: boolean;
+  autocomplete?: string | null;
+  form_action?: string | null;
+  form_method?: string | null;
   control_key?: string;
   container_key?: string | null;
 }
@@ -99,6 +111,10 @@ export interface FamilyMetadata {
   skipped_count?: number;
   sample_labels?: string[];
   sample_urls?: string[];
+  status?: "provisional" | "confirmed" | "rejected";
+  support_sources?: string[];
+  variant_count?: number;
+  dynamic_slots?: string[];
 }
 
 export interface NavCapability {
@@ -131,6 +147,7 @@ export interface GraphState {
   visible_ctas: string[];
   surface_items?: SurfaceItem[];
   exploration?: ExplorationSummary;
+  evidence?: StateEvidence;
   flags: StateFlags;
   path: ActionStep[];
 }
@@ -178,10 +195,56 @@ export interface RunInfo {
   finished_at: string | null;
 }
 
+export interface StateEvidence {
+  page?: {
+    language?: string | null;
+    canonical_url?: string | null;
+    viewport?: { width: number; height: number; dpr: number };
+    document?: { width: number; height: number };
+  };
+  forms?: Array<{
+    label?: string | null;
+    method: string;
+    action?: string | null;
+    fields: Array<{
+      label?: string | null;
+      tag: string;
+      type?: string | null;
+      name?: string | null;
+      required: boolean;
+      autocomplete?: string | null;
+    }>;
+  }>;
+  visuals?: Array<{
+    kind: string;
+    label?: string | null;
+    width: number;
+    height: number;
+  }>;
+  substate_hints?: Array<{
+    surface_item_id?: string | null;
+    label: string;
+    kind?: string | null;
+    controls?: string | null;
+    popup?: string | null;
+    expanded?: boolean | null;
+  }>;
+}
+
+export interface GraphSync {
+  schema_version: number;
+  /** Lower-bound SSE sequence represented by this database snapshot. */
+  snapshot_sequence: number | null;
+  /** True for terminal or persisted runs that have no newer live authority. */
+  authoritative: boolean;
+  latest_state_id: string | null;
+}
+
 export interface GraphDocument {
   run: RunInfo;
   states: GraphState[];
   edges: GraphEdge[];
+  sync?: GraphSync;
 }
 
 export interface CreateRunResponse {

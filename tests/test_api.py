@@ -14,6 +14,8 @@ from asgi_lifespan import LifespanManager
 from api.main import create_app
 from api.schemas import CreateRunRequest
 from engine.config import Settings
+from engine.db import models as db
+from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.schemas import BrowserConfig, BudgetConfig, RunConfig
 from tests.conftest import FIXTURE_SITE
 
@@ -67,6 +69,26 @@ async def test_health(client: httpx.AsyncClient):
     assert response.json() == {"status": "ok"}
 
 
+async def test_startup_cancels_runs_that_cannot_be_resumed(settings: Settings):
+    engine = create_db_engine(settings.database_url)
+    await init_db(engine)
+    sessions = create_session_factory(engine)
+    async with sessions.begin() as session:
+        session.add(db.Run(id="orphaned", url="https://example.com", status="running"))
+    await engine.dispose()
+
+    app = create_app(settings=settings, run_config=_fast_config())
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            response = await http.get("/api/runs/orphaned")
+
+    body = response.json()
+    assert body["status"] == "cancelled"
+    assert body["finished_at"]
+    assert "API restart" in body["error"]
+
+
 async def test_create_run_returns_identifiers(client: httpx.AsyncClient):
     response = await client.post("/api/runs", json={"url": FIXTURE_URL})
     assert response.status_code == 202
@@ -109,6 +131,10 @@ async def test_full_lifecycle_graph_and_export(client: httpx.AsyncClient):
     assert status["finished_at"]
 
     graph = (await client.get(f"/api/runs/{run_id}/graph")).json()
+    assert graph["sync"]["schema_version"] == 2
+    assert graph["sync"]["authoritative"] is True
+    assert [state["index"] for state in graph["states"]] == list(range(len(graph["states"])))
+    assert all("evidence" in state for state in graph["states"])
     assert graph["run"]["id"] == run_id
     assert len(graph["states"]) == status["stats"]["states"]
     assert len(graph["edges"]) >= 1
@@ -152,6 +178,14 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
     sequences = [e["sequence"] for e in events]
     assert sequences == sorted(sequences)
     assert len(set(sequences)) == len(sequences)
+
+    resumed = await _read_sse(
+        client,
+        f"/api/runs/{run_id}/events?after_sequence={sequences[-3]}",
+        stop_kind="run_completed",
+    )
+    assert resumed
+    assert all(event["sequence"] > sequences[-3] for event in resumed)
 
     # Every state_discovered payload identifies a node.
     node_events = [e["payload"] for e in events if e["type"] == "state_discovered"]

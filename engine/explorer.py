@@ -24,6 +24,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engine import identity
 from engine.browser.actions import (
@@ -39,7 +41,7 @@ from engine.capture import (
     build_state_row,
     new_id,
     observe_page,
-    persist_state,
+    persist_state_async,
     with_auth_context,
 )
 from engine.classify import StateAnalysis, analyze_state
@@ -47,14 +49,13 @@ from engine.config import Settings
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.events import ActionOutcome, EventType
+from engine.families import FamilyCandidate, FamilyRegistry
 from engine.identity import normalize_url
 from engine.organize import heuristic_name, infer_page_role
 from engine.ranking import (
     ActionCandidate,
-    SurfaceFamily,
-    detect_surface_families,
-    infer_url_family,
     is_auth_entry,
+    loose_url_pattern,
     score_action,
 )
 from engine.safety import evaluate_action, is_same_origin
@@ -70,14 +71,12 @@ from engine.schemas import (
     RunConfig,
     StateType,
 )
-from engine.storage import LocalStorage
+from engine.storage import LocalStorage, StorageBackend
 
 # Stop when this many consecutive actions produce no new state (novelty collapse).
 NOVELTY_PATIENCE = 30
 
-_TERMINAL_TYPES = frozenset(
-    {StateType.EXTERNAL, StateType.DEAD_END, StateType.RISKY_TERMINAL}
-)
+_TERMINAL_TYPES = frozenset({StateType.EXTERNAL, StateType.DEAD_END, StateType.RISKY_TERMINAL})
 
 # Gate states: discovered and recorded but not expanded by default.
 # The auth_gate_hook decides whether to expand them after user interaction.
@@ -97,6 +96,7 @@ class ExplorerEvent:
 
 
 EventSink = Callable[[ExplorerEvent], None]
+TextEvidenceSink = Callable[[dict], Awaitable[None] | None]
 
 
 @dataclass
@@ -129,6 +129,7 @@ class StateMeta:
     return_state_id: str | None = None
     nav_capabilities: list[dict] = field(default_factory=list)
     surface_families: list[dict] = field(default_factory=list)
+    family_template_key: tuple | None = None
 
 
 @dataclass
@@ -209,18 +210,14 @@ class Frontier:
 
         index = min(range(len(self._items)), key=lambda i: priority(self._items[i]))
         item = self._items.pop(index)
-        self._journey_pops[item.journey_key] = (
-            self._journey_pops.get(item.journey_key, 0) + 1
-        )
+        self._journey_pops[item.journey_key] = self._journey_pops.get(item.journey_key, 0) + 1
         return item
 
     def __len__(self) -> int:
         return len(self._items)
 
 
-_AUTH_SUCCESS = re.compile(
-    r"\b(log\s*out|sign\s*out|my\s+account|profile|dashboard)\b", re.I
-)
+_AUTH_SUCCESS = re.compile(r"\b(log\s*out|sign\s*out|my\s+account|profile|dashboard)\b", re.I)
 _AUTH_PATH = re.compile(r"/(log-?in|sign-?in|sign-?up|register|auth)(/|$)", re.I)
 _AUTH_RETURN_PARAMS = {
     "after",
@@ -241,9 +238,7 @@ _PERIPHERAL_ACTION = re.compile(
     r")\b",
     re.I,
 )
-_GENERIC_EXPANSION = re.compile(
-    r"\b(show|see|view|load)\s+more\b|\bmore\b|\bexpand\b", re.I
-)
+_GENERIC_EXPANSION = re.compile(r"\b(show|see|view|load)\s+more\b|\bmore\b|\bexpand\b", re.I)
 
 
 def _canonical_scope_host(url: str) -> str:
@@ -298,6 +293,9 @@ class Explorer:
         on_event: EventSink | None = None,
         auth_gate_hook: AuthGateHook | None = None,
         credentials: Credentials | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        store: StorageBackend | None = None,
+        text_evidence_sink: TextEvidenceSink | None = None,
     ) -> None:
         self._settings = settings
         self._config = config
@@ -305,6 +303,15 @@ class Explorer:
         self._auth_gate_hook = auth_gate_hook
         self._credentials = credentials
         self._auth_mode = config.authentication.mode
+        self._provided_sessions = session_factory
+        self._provided_store = store
+        self._text_evidence_sink = text_evidence_sink
+        self._family_registry = FamilyRegistry(
+            min_support=config.exploration.url_family_min_support,
+            strong_support=config.exploration.url_family_strong_support,
+            sample_cap=config.exploration.url_family_cap,
+            validation_cap=config.exploration.url_family_validation_cap,
+        )
 
     async def run(self, url: str, *, run_id: str | None = None) -> str:
         """Explore `url` until budgets exhaust; returns the run id.
@@ -324,25 +331,30 @@ class Explorer:
         # First state registered for each normalized URL (inferred-edge target).
         self._url_to_state: dict[tuple[AuthContext, str], str] = {}
         self._auth_surface_to_state: dict[tuple[AuthContext, str], str] = {}
-        # Structure-confirmed representatives and bounded sampling per
-        # content-like route family inferred from repeated link cohorts.
+        # Run-level URL evidence is provisional until sampled destinations
+        # demonstrate compatible structure.
+        family_config = self._config.exploration
+        self._family_registry = FamilyRegistry(
+            min_support=family_config.url_family_min_support,
+            strong_support=family_config.url_family_strong_support,
+            sample_cap=family_config.url_family_cap,
+            validation_cap=family_config.url_family_validation_cap,
+        )
         self._family_variants: dict[str, dict[tuple, str]] = {}
-        self._family_attempts: dict[str, int] = {}
         self._family_sampled_urls: dict[str, list[str]] = {}
         self._family_skipped: dict[str, int] = {}
         self._family_info: dict[str, dict] = {}
+        self._family_deferred: dict[str, list[PendingAction]] = defaultdict(list)
         self._edges_done: set[tuple[str, str]] = set()
         self._capabilities: dict[tuple[str, str], TransitionCapability] = {}
         self._capability_by_item: dict[tuple[str, str], str] = {}
-        self._waiting_by_target: dict[
-            tuple[AuthContext, str], set[tuple[str, str]]
-        ] = defaultdict(set)
+        self._waiting_by_target: dict[tuple[AuthContext, str], set[tuple[str, str]]] = defaultdict(
+            set
+        )
         self._global_capabilities: dict[str, set[tuple[str, str]]] = defaultdict(set)
         self._global_targets: dict[str, str] = {}
         self._ambiguous_global_targets: set[str] = set()
-        self._tab_capabilities: dict[
-            tuple[str, str], set[tuple[str, str]]
-        ] = defaultdict(set)
+        self._tab_capabilities: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
         self._tab_targets: dict[tuple[str, str], str] = {}
         self._edge_records: dict[str, dict] = {}
         self._validated_history: set[tuple[str, str]] = set()
@@ -360,23 +372,31 @@ class Explorer:
             "actions_denied": 0,
             "family_dedup_hits": 0,
             "family_urls_skipped": 0,
+            "family_candidates_provisional": 0,
+            "family_candidates_confirmed": 0,
+            "family_candidates_rejected": 0,
+            "family_urls_sampled": 0,
+            "family_urls_deferred": 0,
             "restoration_checks": 0,
             "global_navigation_edges": 0,
             "reversible_edges": 0,
             "surface_pending_items": 0,
             "frontier_actions": 0,
         }
+        self._timings: dict[str, float] = defaultdict(float)
 
-        engine = create_db_engine(self._settings.database_url)
-        await init_db(engine)
-        self._sessions = create_session_factory(engine)
-        self._store = LocalStorage(self._settings.data_dir)
+        engine = None
+        if self._provided_sessions is None:
+            engine = create_db_engine(self._settings.database_url)
+            await init_db(engine)
+            self._sessions = create_session_factory(engine)
+        else:
+            self._sessions = self._provided_sessions
+        self._store = self._provided_store or LocalStorage(self._settings.data_dir)
 
         async with self._sessions() as session:
             session.add(
-                db.Run(
-                    id=self._run_id, url=url, status="running", config=self._config.model_dump()
-                )
+                db.Run(id=self._run_id, url=url, status="running", config=self._config.model_dump())
             )
             await session.commit()
 
@@ -386,11 +406,13 @@ class Explorer:
                 await self._explore(page, url)
         except Exception as exc:
             await self._finish_run("failed", error=str(exc))
-            await engine.dispose()
+            if engine is not None:
+                await engine.dispose()
             raise
 
         await self._finish_run("done")
-        await engine.dispose()
+        if engine is not None:
+            await engine.dispose()
         return self._run_id
 
     # ------------------------------------------------------------------
@@ -419,9 +441,9 @@ class Explorer:
         await dismiss_cookie_banner(page)
         self._root_url = _effective_scope_url(url, page.url)
 
-        observation = await observe_page(
-            page, self._config, auth_context=self._auth_context
-        )
+        observe_started = time.perf_counter()
+        observation = await observe_page(page, self._config, auth_context=self._auth_context)
+        self._timings["observe_seconds"] += time.perf_counter() - observe_started
         root = await self._register_state(
             observation,
             depth=0,
@@ -440,15 +462,18 @@ class Explorer:
 
         self._emit_frontier()
 
-        while len(self._frontier):
+        while True:
+            if not len(self._frontier):
+                if self._reject_unresolved_families():
+                    continue
+                self._stats["stop_reason"] = "frontier_exhausted"
+                break
             reason = self._budget.stop_reason(len(self._states), self._actions_since_new)
             if reason:
                 self._stats["stop_reason"] = reason
                 break
             await self._execute(page, self._frontier.pop())
             self._emit_frontier()
-        else:
-            self._stats["stop_reason"] = "frontier_exhausted"
 
     def _counters(self) -> dict:
         """UI-friendly snapshot of live progress counters."""
@@ -463,6 +488,12 @@ class Explorer:
             "actions_performed": self._budget.actions,
             "frontier_size": len(self._frontier),
             "surface_pending": self._stats.get("surface_pending_items", 0),
+            "family_provisional": self._stats.get("family_candidates_provisional", 0),
+            "family_confirmed": self._stats.get("family_candidates_confirmed", 0),
+            "family_rejected": self._stats.get("family_candidates_rejected", 0),
+            "family_sampled": self._stats.get("family_urls_sampled", 0),
+            "family_deferred": self._stats.get("family_urls_deferred", 0),
+            "family_skipped": self._stats.get("family_urls_skipped", 0),
         }
 
     def _emit_frontier(self) -> None:
@@ -478,9 +509,7 @@ class Explorer:
             )
         )
 
-    def _emit_action_finished(
-        self, outcome: ActionOutcome, message: str, **extra: object
-    ) -> None:
+    def _emit_action_finished(self, outcome: ActionOutcome, message: str, **extra: object) -> None:
         self._emit(
             ExplorerEvent(
                 EventType.ACTION_FINISHED,
@@ -512,9 +541,7 @@ class Explorer:
             target_id = self._url_to_state.get(target_norm)  # legacy unit fixtures
         return target_id
 
-    def _should_materialize_inferred_edge(
-        self, source: StateMeta, item: Interactable
-    ) -> bool:
+    def _should_materialize_inferred_edge(self, source: StateMeta, item: Interactable) -> bool:
         """Keep inferred edges useful without turning shared chrome into a sitemap.
 
         Root/global hub navigation is valuable. The same sidebar/header control
@@ -642,38 +669,46 @@ class Explorer:
             )
         return capabilities
 
-    @staticmethod
-    def _family_payload(family: SurfaceFamily) -> dict:
-        return {
-            "id": family.family_id,
-            "label": family.label,
-            "kind": family.kind,
-            "pattern": family.pattern,
-            "label_source": "heuristic",
-            "confidence": 0.85,
-            "discovered_count": family.discovered_count,
-            "sample_labels": family.sample_labels,
-            "sample_urls": family.sample_urls,
-        }
+    def _record_timing(self, key: str, started: float) -> None:
+        self._timings[key] += time.perf_counter() - started
 
     @staticmethod
-    def _url_family_payload(family) -> dict:
+    def _state_evidence(observation: Observation) -> dict:
+        """Actionable structure retained independently from ranking decisions."""
+        substate_hints = []
+        for item in observation.interactables:
+            if not (
+                item.kind in {"tab", "menuitem", "disclosure"}
+                or item.aria_controls
+                or item.aria_haspopup
+                or item.aria_expanded is not None
+            ):
+                continue
+            substate_hints.append(
+                {
+                    "surface_item_id": item.item_id or None,
+                    "label": item.label,
+                    "kind": item.kind,
+                    "controls": item.aria_controls,
+                    "popup": item.aria_haspopup,
+                    "expanded": item.aria_expanded,
+                }
+            )
         return {
-            "id": family.family_id,
-            "label": family.label,
-            "kind": family.kind,
-            "pattern": family.pattern,
-            "label_source": "heuristic",
-            "confidence": 0.8,
-            "discovered_count": 1,
-            "sample_labels": [],
-            "sample_urls": [],
+            **observation.snapshot.evidence,
+            "substate_hints": substate_hints,
         }
 
     def _family_runtime_payload(self, pattern: str) -> dict:
-        info = dict(self._family_info.get(pattern, {}))
+        candidate = self._family_registry.candidates.get(pattern)
+        info = (
+            candidate.payload()
+            if candidate is not None
+            else dict(self._family_info.get(pattern, {}))
+        )
         info["checked_count"] = len(self._family_sampled_urls.get(pattern, []))
         info["represented_count"] = len(self._family_variants.get(pattern, {}))
+        info["variant_count"] = info["represented_count"]
         info["skipped_count"] = self._family_skipped.get(pattern, 0)
         info["sample_urls"] = list(
             dict.fromkeys(
@@ -685,79 +720,161 @@ class Explorer:
         )[:8]
         return info
 
+    def _sync_family_stats(self) -> None:
+        if hasattr(self, "_stats"):
+            self._stats.update(self._family_registry.stats())
+        for pattern, candidate in self._family_registry.candidates.items():
+            if hasattr(self, "_family_sampled_urls"):
+                self._family_sampled_urls[pattern] = list(candidate.samples)
+            if hasattr(self, "_family_skipped"):
+                self._family_skipped[pattern] = len(candidate.skipped_urls)
+            if hasattr(self, "_family_info"):
+                self._family_info[pattern] = candidate.payload()
+
+    def _observe_surface_families(
+        self, observation: Observation
+    ) -> tuple[list[FamilyCandidate], set[str]]:
+        families = self._family_registry.observe_surface(
+            source_key=f"{observation.url_normalized}|{observation.fingerprint}",
+            source_structure=observation.skeleton_hash,
+            base_url=observation.snapshot.url,
+            items=observation.interactables,
+        )
+        sibling_counts: dict[tuple[str, str, str, str], int] = defaultdict(int)
+        for item in observation.interactables:
+            target = loose_url_pattern(item.href) if item.href else item.label.strip().lower()
+            sibling_counts[
+                (
+                    item.tag,
+                    item.role or "",
+                    identity.strip_positional_selector(item.selector),
+                    target,
+                )
+            ] += 1
+        preserve: set[str] = set()
+        for item in observation.interactables:
+            family = self._family_registry.family_for_url(
+                item.href or "", base_url=observation.snapshot.url
+            )
+            if family is None:
+                continue
+            item.group_id = family.family_id
+            target = loose_url_pattern(item.href) if item.href else item.label.strip().lower()
+            sibling_key = (
+                item.tag,
+                item.role or "",
+                identity.strip_positional_selector(item.selector),
+                target,
+            )
+            if sibling_counts[sibling_key] == 1:
+                preserve.add(item.item_id or item.selector)
+        self._sync_family_stats()
+        return families, preserve
+
     def _apply_surface_families(
-        self, observation: Observation, analysis: StateAnalysis
+        self,
+        observation: Observation,
+        analysis: StateAnalysis,
+        families: list[FamilyCandidate],
     ) -> list[dict]:
-        """Register repeated content families visible from a state surface."""
-        families = detect_surface_families(observation.interactables)
+        """Attach run-level candidate evidence to this state's actions."""
         if not families:
             return []
 
-        item_to_family: dict[str, SurfaceFamily] = {}
-        for family in families:
-            payload = self._family_payload(family)
-            existing = self._family_info.get(family.pattern, {})
-            sample_labels = list(
-                dict.fromkeys(
-                    [
-                        *existing.get("sample_labels", []),
-                        *payload.get("sample_labels", []),
-                    ]
-                )
-            )[:8]
-            sample_urls = list(
-                dict.fromkeys(
-                    [
-                        *existing.get("sample_urls", []),
-                        *payload.get("sample_urls", []),
-                    ]
-                )
-            )[:8]
-            self._family_info[family.pattern] = {
-                **existing,
-                **payload,
-                "discovered_count": max(
-                    int(existing.get("discovered_count", 0)),
-                    family.discovered_count,
-                ),
-                "sample_labels": sample_labels,
-                "sample_urls": sample_urls,
-            }
-            for item_id in family.item_ids:
-                item_to_family[item_id] = family
-
         first_for_pattern: set[str] = set()
         for candidate in analysis.candidates:
-            item_id = candidate.interactable.item_id or candidate.interactable.selector
-            family = item_to_family.get(item_id)
+            family = self._family_registry.family_for_url(
+                candidate.interactable.href or "", base_url=observation.snapshot.url
+            )
             if family is None:
                 continue
-            if candidate.family_pattern is None:
-                candidate.family_pattern = family.pattern
-                candidate.family_id = family.family_id
-                candidate.family_label = family.label
-                candidate.family_kind = family.kind
+            candidate.family_pattern = family.pattern
+            candidate.family_id = family.family_id
+            candidate.family_label = family.label
+            candidate.family_kind = "items"
+            candidate.family_status = family.status
             if family.pattern not in first_for_pattern:
-                candidate.collapsed_count = max(
-                    candidate.collapsed_count, family.discovered_count
-                )
-                candidate.grouped_labels = family.sample_labels
+                candidate.collapsed_count = max(candidate.collapsed_count, len(family.urls))
+                candidate.grouped_labels = list(
+                    dict.fromkeys(item.label for item in family.evidences)
+                )[:8]
                 first_for_pattern.add(family.pattern)
 
-        return [self._family_payload(family) for family in families]
+        return [family.payload() for family in families if family.status != "rejected"]
+
+    def _adopt_confirmed_family(self, candidate: FamilyCandidate) -> None:
+        payload = candidate.payload()
+        self._family_info[candidate.pattern] = payload
+        variants = self._family_variants.setdefault(candidate.pattern, {})
+        for meta in self._states.values():
+            if meta.parent_state_id is not None:
+                continue
+            member = self._family_registry.family_for_url(meta.url)
+            if member is None or member.pattern != candidate.pattern:
+                continue
+            meta.route_family = candidate.pattern
+            meta.family = dict(payload)
+            meta.page_role = PageRole.DETAIL
+            if meta.family_template_key is not None:
+                variants.setdefault(meta.family_template_key, meta.id)
+        for meta in self._states.values():
+            supports_family = False
+            for item in meta.interactables:
+                member = self._family_registry.family_for_url(item.href or "", base_url=meta.url)
+                if member is not None and member.pattern == candidate.pattern:
+                    item.group_id = candidate.family_id
+                    supports_family = True
+            if supports_family and not any(
+                item.get("pattern") == candidate.pattern for item in meta.surface_families
+            ):
+                meta.surface_families.append(dict(payload))
+            if supports_family:
+                meta.page_role = PageRole.HUB
+
+    def _release_family_deferred(
+        self, candidate: FamilyCandidate, *, rejected: bool = False
+    ) -> int:
+        pending = self._family_deferred.pop(candidate.pattern, [])
+        still_deferred: list[PendingAction] = []
+        released = 0
+        for action in pending:
+            item = action.candidate.interactable
+            if rejected:
+                action.candidate.family_pattern = None
+                action.candidate.family_id = None
+                action.candidate.family_label = None
+                action.candidate.family_kind = None
+                action.candidate.family_status = None
+                self._frontier.push(action)
+                released += 1
+            elif self._family_registry.should_sample(candidate, item.href or ""):
+                self._frontier.push(action)
+                released += 1
+            elif candidate.status == "provisional":
+                still_deferred.append(action)
+            else:
+                self._family_registry.mark_skipped(candidate, item.href or "")
+                self._edges_done.add((action.from_state.id, item.selector))
+                self._item_outcome[(action.from_state.id, item.item_id)] = "skipped_duplicate"
+        if still_deferred:
+            self._family_deferred[candidate.pattern] = still_deferred
+        self._sync_family_stats()
+        return released
+
+    def _reject_unresolved_families(self) -> int:
+        released = 0
+        for candidate in self._family_registry.reject_unresolved():
+            released += self._release_family_deferred(candidate, rejected=True)
+        self._sync_family_stats()
+        return released
 
     def _is_global_capability(self, capability: TransitionCapability) -> bool:
         if capability.global_key is None:
             return False
-        sources = {
-            source_id
-            for source_id, _ in self._global_capabilities[capability.global_key]
-        }
+        sources = {source_id for source_id, _ in self._global_capabilities[capability.global_key]}
         return len(sources) >= 2
 
-    def _capability_for(
-        self, source: StateMeta, item: Interactable
-    ) -> TransitionCapability | None:
+    def _capability_for(self, source: StateMeta, item: Interactable) -> TransitionCapability | None:
         capability_id = self._capability_by_item.get((source.id, item.item_id))
         if capability_id is None:
             return None
@@ -784,13 +901,10 @@ class Explorer:
             return
         if target_id is None or target_id not in self._states:
             if capability.target_hint is not None:
-                self._waiting_by_target[
-                    (source.auth_context, capability.target_hint)
-                ].add(ref)
+                self._waiting_by_target[(source.auth_context, capability.target_hint)].add(ref)
             return
-        if (
-            capability.global_key is not None
-            and not self._should_materialize_inferred_edge(source, capability.item)
+        if capability.global_key is not None and not self._should_materialize_inferred_edge(
+            source, capability.item
         ):
             return
 
@@ -802,9 +916,7 @@ class Explorer:
             capability=capability,
         )
 
-    async def _register_transition_capabilities(
-        self, meta: StateMeta
-    ) -> None:
+    async def _register_transition_capabilities(self, meta: StateMeta) -> None:
         """Persist visible transition evidence independently from exploration.
 
         Ranking and substate delta filtering decide what to click; they must not
@@ -900,6 +1012,46 @@ class Explorer:
         if edge_key in self._edges_done:
             return
 
+        # Family evidence may have accumulated after this action was queued.
+        # Resolve it again at pop time so ordering is deterministic and stale
+        # candidate metadata never causes an eager skip.
+        family_candidate = self._family_registry.family_for_url(
+            item.href or "", base_url=source.url
+        )
+        family_pattern: str | None = None
+        if family_candidate is not None:
+            pending.candidate.family_pattern = family_candidate.pattern
+            pending.candidate.family_id = family_candidate.family_id
+            pending.candidate.family_label = family_candidate.label
+            pending.candidate.family_kind = "items"
+            pending.candidate.family_status = family_candidate.status
+            should_sample = self._family_registry.should_sample(family_candidate, item.href or "")
+            if family_candidate.status == "provisional" and not should_sample:
+                self._family_deferred[family_candidate.pattern].append(pending)
+                self._family_registry.mark_deferred(family_candidate, item.href or "")
+                self._sync_family_stats()
+                return
+            if family_candidate.status == "confirmed" and not should_sample:
+                self._family_registry.mark_skipped(family_candidate, item.href or "")
+                self._edges_done.add(edge_key)
+                self._item_outcome[(source.id, item.item_id)] = "skipped_duplicate"
+                self._sync_family_stats()
+                self._emit_action_finished(
+                    ActionOutcome.DEDUPED,
+                    f"Skipped '{item.label}' after validating route family "
+                    f"{family_candidate.pattern}",
+                    from_state_id=source.id,
+                    route_family=family_candidate.pattern,
+                )
+                return
+            family_pattern = family_candidate.pattern
+        else:
+            pending.candidate.family_pattern = None
+            pending.candidate.family_id = None
+            pending.candidate.family_label = None
+            pending.candidate.family_kind = None
+            pending.candidate.family_status = None
+
         # Cost-free shortcut: a link to a page we've already mapped becomes an
         # inferred edge -- no click, no action budget spent.
         self_page_id = self._self_link_target(item, source)
@@ -921,9 +1073,7 @@ class Explorer:
                 )
             else:
                 self._stats["dedup_hits"] += 1
-                await self._add_edge(
-                    source, destination, pending.candidate, via="inferred"
-                )
+                await self._add_edge(source, destination, pending.candidate, via="inferred")
                 self._emit_action_finished(
                     ActionOutcome.DEDUPED,
                     f"'{item.label}' links to known s{destination.index}",
@@ -947,42 +1097,6 @@ class Explorer:
             )
             return
 
-        family_pattern = pending.candidate.family_pattern
-        if family_pattern is not None:
-            self._family_info.setdefault(
-                family_pattern,
-                {
-                    "id": pending.candidate.family_id,
-                    "label": pending.candidate.family_label,
-                    "kind": pending.candidate.family_kind,
-                    "pattern": family_pattern,
-                    "label_source": "heuristic",
-                    "confidence": 0.85,
-                    "discovered_count": max(1, pending.candidate.collapsed_count),
-                    "sample_labels": list(pending.candidate.grouped_labels),
-                },
-            )
-            info = self._family_info[family_pattern]
-            info["discovered_count"] = max(
-                int(info.get("discovered_count", 1)), pending.candidate.collapsed_count
-            )
-            attempts = self._family_attempts.get(family_pattern, 0)
-            if attempts >= self._config.exploration.url_family_cap:
-                self._family_skipped[family_pattern] = (
-                    self._family_skipped.get(family_pattern, 0) + 1
-                )
-                self._stats["family_urls_skipped"] += 1
-                self._edges_done.add(edge_key)
-                self._item_outcome[(source.id, item.item_id)] = "skipped_duplicate"
-                self._emit_action_finished(
-                    ActionOutcome.DEDUPED,
-                    f"Skipped '{item.label}' after sampling route family {family_pattern}",
-                    from_state_id=source.id,
-                    route_family=family_pattern,
-                )
-                return
-            self._family_attempts[family_pattern] = attempts + 1
-
         self._budget.note_action()
         self._actions_since_new += 1
         self._emit(
@@ -999,7 +1113,10 @@ class Explorer:
             )
         )
 
-        if not await self._ensure_at(page, source):
+        phase_started = time.perf_counter()
+        ensured = await self._ensure_at(page, source)
+        self._record_timing("restore_seconds", phase_started)
+        if not ensured:
             self._stats["failed_actions"] += 1
             self._emit_action_finished(
                 ActionOutcome.FAILED,
@@ -1020,13 +1137,16 @@ class Explorer:
             return
 
         try:
+            phase_started = time.perf_counter()
             await click_interactable(
                 page,
                 item,
                 timeout_ms=self._config.exploration.action_timeout_ms,
                 base_url=self._root_url,
             )
+            self._record_timing("action_seconds", phase_started)
         except PlaywrightError:
+            self._record_timing("action_seconds", phase_started)
             self._current_state_id = None  # page state is now unknown
             self._stats["failed_actions"] += 1
             self._item_outcome[(source.id, item.item_id)] = "explored"
@@ -1039,9 +1159,9 @@ class Explorer:
             return
 
         await self._absorb_popups(page)
-        observation = await observe_page(
-            page, self._config, auth_context=self._auth_context
-        )
+        phase_started = time.perf_counter()
+        observation = await observe_page(page, self._config, auth_context=self._auth_context)
+        self._record_timing("observe_seconds", phase_started)
         if (
             observation.url_normalized == source.url_normalized
             and self._is_generic_expansion(item)
@@ -1057,10 +1177,21 @@ class Explorer:
                 from_state_id=source.id,
             )
             return
-        if family_pattern is not None:
-            self._family_sampled_urls.setdefault(family_pattern, []).append(
-                observation.snapshot.url
+        if family_candidate is not None and family_pattern is not None:
+            _old_status, new_status = self._family_registry.record_sample(
+                family_candidate, item.href or observation.snapshot.url, observation
             )
+            self._sync_family_stats()
+            if new_status == "confirmed":
+                self._adopt_confirmed_family(family_candidate)
+                self._release_family_deferred(family_candidate)
+            elif new_status == "rejected":
+                self._release_family_deferred(family_candidate, rejected=True)
+            else:
+                # Conflicting samples can expand the deterministic validation
+                # set up to the configured cap.
+                self._release_family_deferred(family_candidate)
+            family_pattern = family_candidate.pattern if new_status == "confirmed" else None
         key = identity.key_for(observation)
         existing_id = self._resolve_existing_state(observation, source, key)
         if existing_id is None and family_pattern is not None:
@@ -1094,7 +1225,7 @@ class Explorer:
             destination = await self._register_state(
                 observation,
                 depth=source.depth + 1,
-                path=self._path_for(observation, source, item.selector, item.label),
+                path=self._path_for(observation, source, item),
                 key=key,
                 source=source,
                 trigger=item,
@@ -1118,9 +1249,7 @@ class Explorer:
         # A family merge leaves the browser on an alternate instance URL.
         # Force replay before expanding the representative's actions.
         self._current_state_id = (
-            destination.id
-            if observation.url_normalized == destination.url_normalized
-            else None
+            destination.id if observation.url_normalized == destination.url_normalized else None
         )
         if self._current_state_id == destination.id:
             await self._validate_browser_back(page, source, destination)
@@ -1164,9 +1293,7 @@ class Explorer:
             return None
         if observation.snapshot.signals.modal_open:
             return None
-        existing = self._url_to_state.get(
-            (observation.auth_context, observation.url_normalized)
-        )
+        existing = self._url_to_state.get((observation.auth_context, observation.url_normalized))
         if existing is None:
             existing = self._url_to_state.get(observation.url_normalized)
         return existing
@@ -1197,10 +1324,11 @@ class Explorer:
             observation.action_sig,
         )
 
-    def _family_template_target(
-        self, observation: Observation, family_pattern: str
-    ) -> str | None:
+    def _family_template_target(self, observation: Observation, family_pattern: str) -> str | None:
         """Match only exact structure/affordances within an inferred family."""
+        candidate = self._family_registry.candidates.get(family_pattern)
+        if candidate is None or candidate.status != "confirmed":
+            return None
         return self._family_variants.get(family_pattern, {}).get(
             self._family_template_key(observation)
         )
@@ -1250,8 +1378,13 @@ class Explorer:
         family: dict | None = None,
         page_depth_override: int | None = None,
     ) -> StateMeta:
-        analysis = analyze_state(observation, base_url=self._root_url)
-        surface_families = self._apply_surface_families(observation, analysis)
+        detected_families, preserve_item_ids = self._observe_surface_families(observation)
+        analysis = analyze_state(
+            observation,
+            base_url=self._root_url,
+            preserve_item_ids=preserve_item_ids,
+        )
+        surface_families = self._apply_surface_families(observation, analysis, detected_families)
         nav_capabilities = self._nav_capabilities_for(
             observation.auth_context, observation.interactables
         )
@@ -1285,37 +1418,13 @@ class Explorer:
         if page_depth_override is not None:
             page_depth = page_depth_override
 
-        if route_family is None and parent_state_id is None:
-            url_family = infer_url_family(observation.snapshot.url)
-            if url_family is not None:
-                route_family = url_family.pattern
-                existing_family = self._family_info.get(route_family, {})
-                url_payload = self._url_family_payload(url_family)
-                sample_label = observation.snapshot.title or observation.snapshot.url
-                family = {
-                    **url_payload,
-                    **existing_family,
-                    "discovered_count": max(
-                        int(existing_family.get("discovered_count", 0)),
-                        int(url_payload.get("discovered_count", 1)),
-                    ),
-                    "sample_labels": list(
-                        dict.fromkeys(
-                            [
-                                *existing_family.get("sample_labels", []),
-                                sample_label,
-                            ]
-                        )
-                    )[:8],
-                    "sample_urls": list(
-                        dict.fromkeys(
-                            [
-                                *existing_family.get("sample_urls", []),
-                                observation.snapshot.url,
-                            ]
-                        )
-                    )[:8],
-                }
+        if route_family is not None:
+            candidate = self._family_registry.candidates.get(route_family)
+            if candidate is None or candidate.status != "confirmed":
+                route_family = None
+                family = None
+            else:
+                family = candidate.payload()
                 self._family_info[route_family] = dict(family)
 
         page_role = infer_page_role(
@@ -1331,8 +1440,10 @@ class Explorer:
             trigger_label=trigger.label if trigger else None,
             parent_label=source.display_label if source else None,
         )
+        state_evidence = self._state_evidence(observation)
 
-        state = persist_state(
+        phase_started = time.perf_counter()
+        state = await persist_state_async(
             observation,
             run_id=self._run_id,
             state_id=new_id(),
@@ -1341,6 +1452,7 @@ class Explorer:
             store=self._store,
             save_dom=self._config.capture.save_dom_snapshots,
         )
+        self._record_timing("artifact_write_seconds", phase_started)
         state.state_type = state_type
         state.detected_flags = {
             **analysis.flags,
@@ -1349,6 +1461,7 @@ class Explorer:
             "name": naming,
         }
 
+        phase_started = time.perf_counter()
         async with self._sessions() as session:
             row = build_state_row(state)
             row.parent_state_id = parent_state_id
@@ -1360,6 +1473,7 @@ class Explorer:
                 "substate_depth": substate_depth,
                 "nav_capabilities": nav_capabilities,
                 "surface_families": surface_families,
+                "evidence": state_evidence,
                 **({"return_state_id": return_state_id} if return_state_id else {}),
                 "name": naming,
                 **({"route_family": route_family} if route_family else {}),
@@ -1367,6 +1481,7 @@ class Explorer:
             }
             session.add(row)
             await session.commit()
+        self._record_timing("state_db_seconds", phase_started)
 
         representative_ids = {c.interactable.item_id for c in analysis.candidates}
         blocked_ids = {c.interactable.item_id for c, _ in analysis.denied}
@@ -1393,6 +1508,7 @@ class Explorer:
             return_state_id=return_state_id,
             nav_capabilities=nav_capabilities,
             surface_families=surface_families,
+            family_template_key=self._family_template_key(observation),
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
@@ -1412,6 +1528,19 @@ class Explorer:
             )
         self._stats["states"] += 1
         self._stats["actions_denied"] += len(analysis.denied)
+
+        if self._text_evidence_sink is not None:
+            result = self._text_evidence_sink(
+                {
+                    "state_id": meta.id,
+                    "url": observation.snapshot.url,
+                    "title": observation.snapshot.title,
+                    "visible_text": observation.snapshot.visible_text,
+                    **observation.snapshot.text_evidence,
+                }
+            )
+            if result is not None:
+                await result
 
         title = naming["text"]
         message = f"s{meta.index} [{state_type.value}] {title!r} (depth {depth})"
@@ -1443,6 +1572,7 @@ class Explorer:
                     "family": family,
                     "nav_capabilities": nav_capabilities,
                     "surface_families": surface_families,
+                    "evidence": state_evidence,
                     "denied_count": len(analysis.denied),
                     "surface_items": self._surface_summary(meta),
                     "counters": self._counters(),
@@ -1468,11 +1598,18 @@ class Explorer:
                 "group_id": item.group_id,
                 "aria_selected": item.aria_selected,
                 "aria_expanded": item.aria_expanded,
+                "aria_controls": item.aria_controls,
+                "aria_haspopup": item.aria_haspopup,
+                "aria_pressed": item.aria_pressed,
+                "checked": item.checked,
+                "input_type": item.input_type,
+                "required": item.required,
+                "autocomplete": item.autocomplete,
+                "form_action": item.form_action,
+                "form_method": item.form_method,
                 "control_key": item.control_key,
                 "container_key": item.container_key,
-                "status": (
-                    "blocked" if item.item_id in meta.blocked_ids else "pending"
-                ),
+                "status": ("blocked" if item.item_id in meta.blocked_ids else "pending"),
             }
             for item in meta.interactables
         ]
@@ -1481,8 +1618,7 @@ class Explorer:
         self,
         observation: Observation,
         source: StateMeta,
-        selector: str,
-        label: str | None,
+        item: Interactable,
     ) -> list[ActionStep]:
         """Replay path for a new state: URL-addressable states restart from a
         goto; sub-URL states (modals, tabs) extend the source state's path."""
@@ -1491,7 +1627,17 @@ class Explorer:
             and not observation.snapshot.signals.modal_open
         ):
             return [ActionStep(kind="goto", url=observation.snapshot.url)]
-        return [*source.path, ActionStep(kind="click", selector=selector, label=label)]
+        return [
+            *source.path,
+            ActionStep(
+                kind="click",
+                selector=item.selector,
+                label=item.label,
+                role=item.role or ("link" if item.tag == "a" else "button"),
+                href=item.href,
+                control_key=item.control_key or None,
+            ),
+        ]
 
     def _enqueue_actions(self, meta: StateMeta, analysis: StateAnalysis) -> None:
         if meta.page_depth >= self._config.budgets.max_depth:
@@ -1515,7 +1661,6 @@ class Explorer:
                     identity.strip_positional_selector(item.selector)
                     for item in parent.interactables
                 }
-        reserved_by_family: dict[str, int] = {}
         seen_semantic_actions: set[tuple[str, str | None]] = set()
         for candidate in analysis.safe:
             item = candidate.interactable
@@ -1528,10 +1673,7 @@ class Explorer:
             if target_hint == meta.url_normalized:
                 self._item_outcome[(meta.id, item.item_id)] = "noop"
                 continue
-            if (
-                self._is_peripheral_action(item)
-                and not is_auth_entry(candidate)
-            ):
+            if self._is_peripheral_action(item) and not is_auth_entry(candidate):
                 self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
                 continue
             if (
@@ -1542,9 +1684,8 @@ class Explorer:
             ):
                 self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
                 continue
-            if (
-                meta.auth_context == AuthContext.GUEST
-                and re.search(r"\bsettings?\b", item.label, re.I)
+            if meta.auth_context == AuthContext.GUEST and re.search(
+                r"\bsettings?\b", item.label, re.I
             ):
                 self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
                 continue
@@ -1564,19 +1705,19 @@ class Explorer:
                 # spend frontier budget or create another inferred primary edge.
                 self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
                 continue
-            if (
-                item.label.lower().startswith("unlabelled ")
-                and item.region not in {"nav", "header", "modal"}
-            ):
+            if item.label.lower().startswith("unlabelled ") and item.region not in {
+                "nav",
+                "header",
+                "modal",
+            }:
                 continue
             semantic_key = (item.label.strip().lower(), item.region)
-            if semantic_key in seen_semantic_actions:
+            if semantic_key in seen_semantic_actions and candidate.family_pattern is None:
                 continue
             seen_semantic_actions.add(semantic_key)
             if (
                 parent_selector_shapes
-                and identity.strip_positional_selector(item.selector)
-                in parent_selector_shapes
+                and identity.strip_positional_selector(item.selector) in parent_selector_shapes
                 and not (
                     (item.kind == "tab" and meta.state_type == StateType.TAB)
                     or item.in_modal
@@ -1585,18 +1726,6 @@ class Explorer:
             ):
                 # Unchanged navigation/footer chrome belongs to the parent.
                 continue
-            family = candidate.family_pattern
-            if family is not None:
-                reserved = reserved_by_family.get(family, 0)
-                attempted = self._family_attempts.get(family, 0)
-                if attempted + reserved >= self._config.exploration.url_family_cap:
-                    self._family_skipped[family] = self._family_skipped.get(family, 0) + 1
-                    self._stats["family_urls_skipped"] += 1
-                    self._item_outcome[(meta.id, candidate.interactable.item_id)] = (
-                        "skipped_duplicate"
-                    )
-                    continue
-                reserved_by_family[family] = reserved + 1
             candidate.score = score_action(candidate, visited_urls=self._visited_urls)
             eligible.append(candidate)
         ranked = sorted(eligible, key=lambda c: c.score, reverse=True)
@@ -1630,15 +1759,62 @@ class Explorer:
                 None,
             )
             if return_pick and return_pick not in top:
-                top = [return_pick, *top][
-                    : self._config.exploration.max_actions_per_state
-                ]
+                top = [return_pick, *top][: self._config.exploration.max_actions_per_state]
+        else:
+            return_pick = None
+
+        # Structural validation needs the registry's deterministic samples,
+        # even when ordinary ranking would place filters or chrome above them.
+        sample_picks = []
+        for candidate in ranked:
+            family = self._family_registry.family_for_url(
+                candidate.interactable.href or "", base_url=meta.url
+            )
+            if family is not None and self._family_registry.should_sample(
+                family, candidate.interactable.href or ""
+            ):
+                sample_picks.append(candidate)
+        required = [*sample_picks]
+        if auth_pick is not None:
+            required.insert(0, auth_pick)
+        if return_pick is not None:
+            required.insert(0, return_pick)
+        ordered: list[ActionCandidate] = []
+        for candidate in [*required, *top, *ranked]:
+            if candidate not in ordered:
+                ordered.append(candidate)
+        top = ordered[: max(self._config.exploration.max_actions_per_state, len(required))]
+
         queued_ids = {c.interactable.item_id for c in top}
-        meta.representative_ids = queued_ids
+        deferred_ids: set[str] = set()
         for candidate in eligible:
             item_id = candidate.interactable.item_id
             if item_id not in queued_ids:
-                self._item_outcome.setdefault((meta.id, item_id), "skipped_duplicate")
+                family = self._family_registry.family_for_url(
+                    candidate.interactable.href or "", base_url=meta.url
+                )
+                if family is not None and family.status == "provisional":
+                    journey_key = (
+                        _journey_slug(candidate.interactable.label)
+                        if meta.depth == 0
+                        else meta.journey_key
+                    )
+                    action = PendingAction(
+                        from_state=meta,
+                        candidate=candidate,
+                        journey_key=journey_key,
+                    )
+                    self._family_deferred[family.pattern].append(action)
+                    self._family_registry.mark_deferred(family, candidate.interactable.href or "")
+                    deferred_ids.add(item_id)
+                else:
+                    if family is not None and family.status == "confirmed":
+                        self._family_registry.mark_skipped(
+                            family, candidate.interactable.href or ""
+                        )
+                    self._item_outcome.setdefault((meta.id, item_id), "skipped_duplicate")
+        meta.representative_ids = queued_ids | deferred_ids
+        self._sync_family_stats()
         for candidate in top:
             journey_key = meta.journey_key
             if meta.depth == 0:
@@ -1651,9 +1827,7 @@ class Explorer:
                 )
             )
 
-    def _enqueue_auth_discovery(
-        self, meta: StateMeta, analysis: StateAnalysis
-    ) -> None:
+    def _enqueue_auth_discovery(self, meta: StateMeta, analysis: StateAnalysis) -> None:
         """Seed login mode with auth actions before any general journey."""
         ranked: list[ActionCandidate] = []
         revealers: list[ActionCandidate] = []
@@ -1695,9 +1869,7 @@ class Explorer:
     # Auth gate
     # ------------------------------------------------------------------
 
-    async def _handle_auth_wall(
-        self, page: Page, meta: StateMeta
-    ) -> StateMeta | None:
+    async def _handle_auth_wall(self, page: Page, meta: StateMeta) -> StateMeta | None:
         """Authenticate, retrying the checkpoint until success or explicit skip."""
         autofill_attempted = False
         while True:
@@ -1734,7 +1906,6 @@ class Explorer:
                                 arg=auth_page_url,
                                 timeout=self._config.browser.navigation_timeout_ms,
                             )
-                        await stabilize(page, self._config.browser.stabilize_quiet_ms)
                     observation = await observe_page(
                         page, self._config, auth_context=AuthContext.GUEST
                     )
@@ -1777,9 +1948,7 @@ class Explorer:
 
             # A headed run may have been authenticated manually while paused.
             try:
-                observation = await observe_page(
-                    page, self._config, auth_context=AuthContext.GUEST
-                )
+                observation = await observe_page(page, self._config, auth_context=AuthContext.GUEST)
             except Exception:  # noqa: BLE001
                 observation = None
             if observation is not None and self._auth_succeeded(observation, meta):
@@ -1840,9 +2009,7 @@ class Explorer:
                     row.detected_flags = flags
                     await session.commit()
 
-    async def _add_user_auth_edge(
-        self, source: StateMeta, destination: StateMeta
-    ) -> None:
+    async def _add_user_auth_edge(self, source: StateMeta, destination: StateMeta) -> None:
         """Record a user-authenticated transition (manual or credential autofill)."""
         await self._upsert_transition(
             source,
@@ -1879,6 +2046,9 @@ class Explorer:
                         page,
                         step.selector,
                         timeout_ms=self._config.exploration.action_timeout_ms,
+                        label=step.label,
+                        role=step.role,
+                        href=step.href,
                     )
                 await stabilize(page, self._config.browser.stabilize_quiet_ms)
         except PlaywrightError:
@@ -1919,10 +2089,7 @@ class Explorer:
                 timeout=self._config.exploration.action_timeout_ms,
             )
             went_back = True
-            await stabilize(page, self._config.browser.stabilize_quiet_ms)
-            restored = await observe_page(
-                page, self._config, auth_context=self._auth_context
-            )
+            restored = await observe_page(page, self._config, auth_context=self._auth_context)
             restored_id = self._resolve_existing_state(
                 restored, destination, identity.key_for(restored)
             )
@@ -1961,7 +2128,6 @@ class Explorer:
                         wait_until="domcontentloaded",
                         timeout=self._config.exploration.action_timeout_ms,
                     )
-                    await stabilize(page, self._config.browser.stabilize_quiet_ms)
                     forward = await observe_page(
                         page, self._config, auth_context=self._auth_context
                     )
@@ -1994,9 +2160,7 @@ class Explorer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _transition_kind(
-        source: StateMeta, destination: StateMeta, item: Interactable
-    ) -> str:
+    def _transition_kind(source: StateMeta, destination: StateMeta, item: Interactable) -> str:
         label = item.label.strip().lower()
         if item.kind == "tab" or item.role == "tab":
             return "tab"
@@ -2098,6 +2262,7 @@ class Explorer:
             return
         self._edge_records[edge_id] = record
 
+        phase_started = time.perf_counter()
         async with self._sessions() as session:
             row = await session.get(db.Edge, edge_id)
             if row is None:
@@ -2128,6 +2293,7 @@ class Explorer:
             row.provenance = provenance
             row.evidence = evidence_rows
             await session.commit()
+        self._record_timing("edge_db_seconds", phase_started)
 
         if created:
             self._stats["edges"] += 1
@@ -2139,9 +2305,7 @@ class Explorer:
                 self._stats["reversible_edges"] += 1
         else:
             if previous_via == "inferred" and strongest_via != "inferred":
-                self._stats["inferred_edges"] = max(
-                    0, self._stats["inferred_edges"] - 1
-                )
+                self._stats["inferred_edges"] = max(0, self._stats["inferred_edges"] - 1)
             if (
                 previous.get("scope") != "global_navigation"
                 and effective_scope == "global_navigation"
@@ -2248,6 +2412,16 @@ class Explorer:
         pending_actions = 0
         pending_states = 0
         async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(db.StateNode).where(db.StateNode.run_id == self._run_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            rows_by_id = {row.id: row for row in rows}
             for meta in self._states.values():
                 counts = {
                     "explored": 0,
@@ -2264,7 +2438,7 @@ class Explorer:
                     payload["status"] = status
                     items.append(payload)
 
-                row = await session.get(db.StateNode, meta.id)
+                row = rows_by_id.get(meta.id)
                 if row is not None:
                     family = None
                     if meta.route_family is not None:
@@ -2276,12 +2450,19 @@ class Explorer:
                         self._family_runtime_payload(item["pattern"])
                         for item in meta.surface_families
                         if item.get("pattern") in self._family_info
+                        and self._family_registry.candidates.get(item["pattern"])
+                        and self._family_registry.candidates[item["pattern"]].status != "rejected"
                     ]
                     existing_exploration = dict(row.exploration or {})
                     row.interactables = items
+                    row.detected_flags = {
+                        **dict(row.detected_flags or {}),
+                        "page_role": meta.page_role.value,
+                    }
                     row.exploration = {
                         **existing_exploration,
                         **counts,
+                        "page_role": meta.page_role.value,
                         "nav_capabilities": nav_capabilities,
                         "surface_families": surface_families,
                         **(
@@ -2290,9 +2471,7 @@ class Explorer:
                                 "family_sampled": len(
                                     self._family_sampled_urls.get(meta.route_family, [])
                                 ),
-                                "family_skipped": self._family_skipped.get(
-                                    meta.route_family, 0
-                                ),
+                                "family_skipped": self._family_skipped.get(meta.route_family, 0),
                                 "family": family,
                             }
                             if meta.route_family is not None
@@ -2312,8 +2491,11 @@ class Explorer:
         self._stats["surface_pending_items"] = pending_actions
 
     async def _finish_run(self, status: str, *, error: str | None = None) -> None:
+        self._sync_family_stats()
+        flush_started = time.perf_counter()
         with contextlib.suppress(Exception):
             await self._flush_state_details()
+        self._record_timing("finalize_seconds", flush_started)
         self._stats["actions_performed"] = self._budget.actions
         self._stats["duration_seconds"] = round(self._budget.elapsed_seconds, 2)
         self._stats["frontier_actions"] = len(self._frontier)
@@ -2327,6 +2509,9 @@ class Explorer:
         else:
             completion_status = "budget_limited"
         self._stats["completion_status"] = completion_status
+        self._stats["timings"] = {
+            key: round(value, 3) for key, value in sorted(self._timings.items())
+        }
         async with self._sessions() as session:
             run = await session.get(db.Run, self._run_id)
             run.status = status
@@ -2355,8 +2540,8 @@ class Explorer:
             ExplorerEvent(
                 EventType.RUN_COMPLETED,
                 f"{status}: {self._stats['states']} states, {self._stats['edges']} edges, "
-                    f"{self._stats['actions_performed']} actions "
-                    f"in {self._stats['duration_seconds']}s",
+                f"{self._stats['actions_performed']} actions "
+                f"in {self._stats['duration_seconds']}s",
                 {
                     "status": status,
                     "stop_reason": stop_reason,

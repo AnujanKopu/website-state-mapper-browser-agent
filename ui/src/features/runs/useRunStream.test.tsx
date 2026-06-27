@@ -74,31 +74,44 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("useRunStream foreground reconciliation", () => {
-  it("hydrates on foreground without opening a second live stream", async () => {
-    mocks.getGraph
-      .mockResolvedValueOnce(graph([state("a", 0)]))
-      .mockResolvedValueOnce(graph([state("a", 0), state("b", 1)]));
+  it("leaves a healthy live stream alone on foreground", async () => {
+    mocks.getGraph.mockResolvedValue(graph([state("a", 0)]));
 
     render(<Probe />);
     await waitFor(() => expect(screen.getByTestId("count")).toHaveTextContent("1"));
     expect(mocks.openRunStream).toHaveBeenCalledTimes(1);
 
     document.dispatchEvent(new Event("visibilitychange"));
-    await waitFor(() => expect(screen.getByTestId("count")).toHaveTextContent("2"));
-    expect(mocks.getGraph).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.getByTestId("count")).toHaveTextContent("1"));
+    expect(mocks.getGraph).toHaveBeenCalledTimes(1);
     expect(mocks.openRunStream).toHaveBeenCalledTimes(1);
   });
 
-  it("reattaches a hard-closed stream only after foreground reconciliation", async () => {
+  it("hydrates and immediately reattaches a hard-closed live stream", async () => {
     mocks.getGraph.mockResolvedValue(graph([state("a", 0)]));
     render(<Probe />);
     await waitFor(() => expect(mocks.openRunStream).toHaveBeenCalledTimes(1));
 
     mocks.handlers[0].onClosed?.();
     await waitFor(() => expect(mocks.getGraph).toHaveBeenCalledTimes(2));
-    expect(mocks.openRunStream).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(mocks.openRunStream).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not attach or rehydrate an authoritative persisted snapshot", async () => {
+    const persisted = graph([state("a", 0)], "running");
+    persisted.sync = {
+      schema_version: 2,
+      snapshot_sequence: null,
+      authoritative: true,
+      latest_state_id: "a",
+    };
+    mocks.getGraph.mockResolvedValue(persisted);
+
+    render(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("count")).toHaveTextContent("1"));
+    expect(mocks.openRunStream).not.toHaveBeenCalled();
 
     window.dispatchEvent(new Event("focus"));
-    await waitFor(() => expect(mocks.openRunStream).toHaveBeenCalledTimes(2));
+    expect(mocks.getGraph).toHaveBeenCalledTimes(1);
   });
 });

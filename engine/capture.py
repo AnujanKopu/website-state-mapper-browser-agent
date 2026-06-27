@@ -13,6 +13,7 @@ Split into two phases so the explorer can deduplicate cheaply:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 
@@ -42,10 +43,12 @@ async def observe_page(
 ) -> Observation:
     """Stabilize and observe the current page; compute all identity signals."""
     await stabilize(page, config.browser.stabilize_quiet_ms)
-    snapshot = await take_snapshot(page, config.capture)
     interactables = await discover_interactables(
         page, config.capture.max_interactables, config.capture.max_scroll_steps
     )
+    # Discovery restores the page to the top. Capturing afterwards keeps the
+    # DOM/screenshot aligned with any lazy content revealed by the scroll sweep.
+    snapshot = await take_snapshot(page, config.capture)
 
     url_normalized = identity.normalize_url(snapshot.url)
     skeleton_hash = identity.dom_skeleton_hash(snapshot.dom_skeleton)
@@ -126,12 +129,36 @@ def persist_state(
         action_sig=observation.action_sig,
         screenshot_dhash=observation.screenshot_dhash,
         signals=snapshot.signals,
+        evidence=snapshot.evidence,
         visible_text=snapshot.visible_text,
         interactables=observation.interactables,
         screenshot_path=screenshot_path,
         dom_snapshot_path=dom_snapshot_path,
         path=path,
         depth=depth,
+    )
+
+
+async def persist_state_async(
+    observation: Observation,
+    *,
+    run_id: str,
+    state_id: str,
+    depth: int,
+    path: list[ActionStep],
+    store: StorageBackend,
+    save_dom: bool = True,
+) -> CapturedState:
+    """Persist artifacts without blocking SSE/heartbeat delivery."""
+    return await asyncio.to_thread(
+        persist_state,
+        observation,
+        run_id=run_id,
+        state_id=state_id,
+        depth=depth,
+        path=path,
+        store=store,
+        save_dom=save_dom,
     )
 
 
@@ -153,6 +180,7 @@ def build_state_row(state: CapturedState) -> db.StateNode:
         screenshot_dhash=f"{state.screenshot_dhash:016x}",
         interactables=[i.model_dump() for i in state.interactables],
         detected_flags=state.detected_flags,
+        exploration={"evidence": state.evidence},
         path=[step.model_dump() for step in state.path],
         depth=state.depth,
     )
@@ -189,7 +217,7 @@ async def run_single_capture(
         await engine.dispose()
         raise
 
-    state = persist_state(
+    state = await persist_state_async(
         observation,
         run_id=run_id,
         state_id=new_id(),

@@ -179,6 +179,7 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
       ...(p.surface_families ? { surface_families: p.surface_families } : {}),
     },
     flags: { ...base.flags, ...((p.flags ?? {}) as StateFlags) },
+    evidence: p.evidence ?? base.evidence,
   };
 }
 
@@ -384,34 +385,69 @@ export function runReducer(state: RunState, action: RunAction): RunState {
       return freshRunState(action.runId);
     case "hydrate": {
       const { graph } = action;
-      const nodes = { ...state.nodes };
-      const order = [...state.order];
+      if (state.runId && graph.run.id !== state.runId) return state;
+      const snapshotSequence = graph.sync?.snapshot_sequence;
+      const snapshotIsCurrent =
+        graph.sync === undefined
+        || graph.sync.authoritative
+        || snapshotSequence === undefined
+        || snapshotSequence === null
+        || snapshotSequence >= state.lastEventSequence;
+      let nodes = snapshotIsCurrent ? { ...state.nodes } : state.nodes;
+      let order = snapshotIsCurrent ? [...state.order] : state.order;
       for (const s of graph.states) {
-        if (!nodes[s.id]) order.push(s.id);
-        nodes[s.id] = { ...nodes[s.id], ...s };
+        if (!nodes[s.id]) {
+          if (nodes === state.nodes) nodes = { ...state.nodes };
+          if (order === state.order) order = [...state.order];
+          order.push(s.id);
+        }
+        if (!nodes[s.id] || snapshotIsCurrent) {
+          nodes[s.id] = { ...nodes[s.id], ...s };
+        }
       }
-      const edges = { ...state.edges };
-      for (const e of graph.edges) edges[e.id] = { ...edges[e.id], ...e };
+      let edges = snapshotIsCurrent ? { ...state.edges } : state.edges;
+      for (const e of graph.edges) {
+        if (!edges[e.id]) {
+          if (edges === state.edges) edges = { ...state.edges };
+          edges[e.id] = e;
+        } else if (snapshotIsCurrent) {
+          edges[e.id] = { ...edges[e.id], ...e };
+        }
+      }
+      if (order !== state.order) {
+        const originalPosition = new Map(order.map((id, index) => [id, index]));
+        order.sort((a, b) => {
+          const aIndex = nodes[a]?.index;
+          const bIndex = nodes[b]?.index;
+          if (typeof aIndex === "number" && typeof bIndex === "number") return aIndex - bIndex;
+          if (typeof aIndex === "number") return -1;
+          if (typeof bIndex === "number") return 1;
+          return (originalPosition.get(a) ?? 0) - (originalPosition.get(b) ?? 0);
+        });
+      }
       const counters = graph.run.stats
-        ? countersFromStats(graph.run.stats, graph.states.length, graph.edges.length)
+        && snapshotIsCurrent
+        ? countersFromStats(graph.run.stats, Object.keys(nodes).length, Object.keys(edges).length)
         : state.counters;
       return {
         ...state,
         url: graph.run.url || state.url,
-        runStatus: graph.run.status || state.runStatus,
+        runStatus: snapshotIsCurrent ? (graph.run.status || state.runStatus) : state.runStatus,
         completionStatus:
-          typeof graph.run.stats?.completion_status === "string"
+          snapshotIsCurrent && typeof graph.run.stats?.completion_status === "string"
             ? (graph.run.stats.completion_status as string)
             : state.completionStatus,
         nodes,
         edges,
         order,
         counters,
-        viewportStateId:
-          state.viewportStateId ?? (order.length ? order[order.length - 1] : null),
+        viewportStateId: snapshotIsCurrent && graph.sync?.latest_state_id
+          ? graph.sync.latest_state_id
+          : state.viewportStateId ?? (order.length ? order[order.length - 1] : null),
       };
     }
     case "sse":
+      if (state.runId && action.envelope.run_id !== state.runId) return state;
       if (action.envelope.sequence <= state.lastEventSequence) return state;
       return applyEvent(state, action.envelope);
     case "streamOpen":

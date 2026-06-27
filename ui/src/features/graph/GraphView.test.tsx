@@ -7,6 +7,8 @@ import { resetResizeObservers, triggerResizeObservers } from "../../test/setup";
 const flowMock = vi.hoisted(() => ({
   fitBounds: vi.fn(),
   fitView: vi.fn(),
+  getZoom: vi.fn(() => 0.75),
+  setCenter: vi.fn(),
   latestProps: null as Record<string, unknown> | null,
   nodesInitialized: true,
 }));
@@ -24,7 +26,12 @@ vi.mock("@xyflow/react", () => ({
     return <div data-testid="react-flow">{props.children}</div>;
   },
   useNodesInitialized: () => flowMock.nodesInitialized,
-  useReactFlow: () => ({ fitBounds: flowMock.fitBounds, fitView: flowMock.fitView }),
+  useReactFlow: () => ({
+    fitBounds: flowMock.fitBounds,
+    fitView: flowMock.fitView,
+    getZoom: flowMock.getZoom,
+    setCenter: flowMock.setCenter,
+  }),
 }));
 
 import { GraphView } from "./GraphView";
@@ -92,6 +99,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   flowMock.fitBounds.mockReset();
   flowMock.fitView.mockReset();
+  flowMock.getZoom.mockClear();
+  flowMock.setCenter.mockReset();
   flowMock.latestProps = null;
   flowMock.nodesInitialized = true;
   resetResizeObservers();
@@ -119,18 +128,83 @@ describe("GraphView viewport lifecycle", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Waiting for the first state");
 
     view.rerender(<GraphView {...graphProps({ a: state("a", 0) })} />);
-    act(() => vi.advanceTimersByTime(299));
     expect(renderedNodes()).toHaveLength(0);
 
-    act(() => vi.advanceTimersByTime(1));
+    act(() => vi.runAllTimers());
     expect(renderedNodes()).toHaveLength(1);
-    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBe(true);
+    expect(renderedNodes()[0]).toMatchObject({
+      width: 210,
+      height: 78,
+      measured: { width: 210, height: 78 },
+    });
+    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBeUndefined();
+    expect(flowMock.latestProps?.nodesDraggable).toBe(false);
+    expect(flowMock.latestProps?.panOnDrag).toBe(true);
     act(() => vi.runAllTimers());
     expect(flowMock.fitBounds).toHaveBeenCalledTimes(1);
     expect(flowMock.fitBounds).toHaveBeenLastCalledWith(
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),
       { duration: 0, padding: 0.18 },
     );
+  });
+
+  it("queues live topology changes until mouse panning ends", () => {
+    const view = render(<GraphView {...graphProps({ a: state("a", 0) })} />);
+    act(() => vi.runAllTimers());
+    expect(renderedNodes()).toHaveLength(1);
+
+    act(() => {
+      (flowMock.latestProps?.onMoveStart as (event: object) => void)({ type: "pointer" });
+    });
+    view.rerender(
+      <GraphView {...graphProps({ a: state("a", 0), b: state("b", 1) })} />,
+    );
+    act(() => vi.runAllTimers());
+    expect(renderedNodes()).toHaveLength(1);
+
+    act(() => {
+      (flowMock.latestProps?.onMoveEnd as () => void)();
+    });
+    act(() => {
+      vi.runAllTimers();
+    });
+    expect(renderedNodes()).toHaveLength(2);
+  });
+
+  it("does not freeze topology for programmatic viewport movement", () => {
+    const view = render(<GraphView {...graphProps({ a: state("a", 0) })} />);
+    act(() => vi.runAllTimers());
+
+    act(() => {
+      (flowMock.latestProps?.onMoveStart as (event: null) => void)(null);
+    });
+    view.rerender(
+      <GraphView {...graphProps({ a: state("a", 0), b: state("b", 1) })} />,
+    );
+    act(() => vi.runAllTimers());
+
+    expect(renderedNodes()).toHaveLength(2);
+  });
+
+  it("flushes topology when a manual interaction loses window focus", () => {
+    const view = render(<GraphView {...graphProps({ a: state("a", 0) })} />);
+    act(() => vi.runAllTimers());
+    act(() => {
+      (flowMock.latestProps?.onMoveStart as (event: object) => void)({ type: "pointer" });
+    });
+    view.rerender(
+      <GraphView {...graphProps({ a: state("a", 0), b: state("b", 1) })} />,
+    );
+    act(() => vi.runAllTimers());
+    expect(renderedNodes()).toHaveLength(1);
+
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    act(() => {
+      vi.runAllTimers();
+    });
+    expect(renderedNodes()).toHaveLength(2);
   });
 
   it("follows the current node while live", () => {
@@ -156,10 +230,11 @@ describe("GraphView viewport lifecycle", () => {
       />,
     );
     act(() => vi.runAllTimers());
-    expect(flowMock.fitBounds).toHaveBeenCalled();
-    expect(flowMock.fitBounds).toHaveBeenLastCalledWith(
-      expect.objectContaining({ width: 210, height: 78 }),
-      expect.objectContaining({ duration: 0, padding: 0.35 }),
+    expect(flowMock.setCenter).toHaveBeenCalled();
+    expect(flowMock.setCenter).toHaveBeenLastCalledWith(
+      expect.any(Number),
+      expect.any(Number),
+      { duration: 0, zoom: 0.75 },
     );
   });
 
@@ -170,6 +245,7 @@ describe("GraphView viewport lifecycle", () => {
 
     act(() => {
       (flowMock.latestProps?.onMoveStart as (event: object) => void)({ type: "wheel" });
+      (flowMock.latestProps?.onMoveEnd as () => void)();
     });
     view.rerender(
       <GraphView

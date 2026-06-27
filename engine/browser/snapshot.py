@@ -10,16 +10,14 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from engine.schemas import CaptureConfig, PageSignals, PageSnapshot
 
-_NETWORK_IDLE_TIMEOUT_MS = 5_000
-
-# innerText (unlike textContent) reflects rendering: it skips hidden
-# elements and collapses layout whitespace, which is what state identity
-# should be based on.
-_VISIBLE_TEXT_JS = "() => document.body ? document.body.innerText : ''"
+# Long polling and analytics frequently prevent network-idle forever. Two
+# seconds still covers ordinary late fetches without charging every state the
+# old five-second timeout; the configured DOM quiet period follows it.
+_NETWORK_IDLE_TIMEOUT_MS = 2_000
 
 # Builds a text-free skeleton of the *visible* DOM (tag + role tree, runs of
-# more than 3 same-tag siblings truncated) and extracts classification
-# signals. One evaluate() round-trip.
+# more than 3 same-tag siblings truncated), extracts classification signals,
+# and returns the other cheap DOM fields in one evaluate() round-trip.
 _OBSERVE_JS = """
 () => {
   const SKIP_TAGS = new Set(['script', 'style', 'link', 'meta', 'noscript', 'template', 'svg']);
@@ -77,8 +75,79 @@ _OBSERVE_JS = """
     )
   ).length;
 
+  const labelOf = (el) => {
+    const labelledBy = (el.getAttribute('aria-labelledby') || '')
+      .split(/\\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.innerText || '')
+      .join(' ')
+      .trim();
+    if (labelledBy) return labelledBy.slice(0, 160);
+    if (el.id) {
+      const explicit = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (explicit?.innerText) return explicit.innerText.trim().slice(0, 160);
+    }
+    return (el.getAttribute('aria-label') || el.getAttribute('alt')
+      || el.getAttribute('title') || '').trim().slice(0, 160) || null;
+  };
+  const rectOf = (el) => {
+    const rect = el.getBoundingClientRect();
+    return { width: Math.round(rect.width), height: Math.round(rect.height) };
+  };
+  const forms = visibleAll('form').slice(0, 20).map((form) => ({
+    label: labelOf(form),
+    method: (form.getAttribute('method') || 'get').toLowerCase(),
+    action: form.action || null,
+    fields: Array.from(form.querySelectorAll('input, select, textarea'))
+      .slice(0, 60)
+      .map((field) => ({
+      label: labelOf(field),
+      tag: field.tagName.toLowerCase(),
+      type: (field.getAttribute('type') || '').toLowerCase() || null,
+      name: field.getAttribute('name'),
+      required: field.required || field.getAttribute('aria-required') === 'true',
+      autocomplete: field.getAttribute('autocomplete'),
+      })),
+  }));
+  const visuals = visibleAll('table, svg, canvas, img, video, [role="img"]')
+    .slice(0, 60)
+    .map((el) => ({
+      kind: el.getAttribute('role') === 'img' ? 'graphic' : el.tagName.toLowerCase(),
+      label: labelOf(el)
+        || el.querySelector?.('caption, title, desc')?.textContent?.trim().slice(0, 160)
+        || null,
+      ...rectOf(el),
+    }));
+  const headings = visibleAll('h1, h2, h3, h4, h5, h6, [role="heading"]')
+    .slice(0, 80)
+    .map((el) => ({
+      level: Number(el.getAttribute('aria-level')) || Number(el.tagName.slice(1)) || null,
+      text: (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
+    }))
+    .filter((item) => item.text);
+
   return {
+    title: document.title || '',
+    visible_text: document.body ? document.body.innerText : '',
     skeleton: document.body ? skeletonOf(document.body, 0) : '',
+    evidence: {
+      page: {
+        language: document.documentElement.lang || null,
+        canonical_url: document.querySelector('link[rel="canonical"]')?.href || null,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          dpr: window.devicePixelRatio,
+        },
+        document: {
+          width: document.documentElement.scrollWidth,
+          height: document.documentElement.scrollHeight,
+        },
+      },
+      forms,
+      visuals,
+    },
+    text_evidence: { headings },
     signals: {
       modal_open: visibleAll('[role="dialog"], dialog[open], [aria-modal="true"]').length > 0,
       password_fields: visibleAll('input[type="password"]').length,
@@ -110,18 +179,22 @@ async def stabilize(page: Page, quiet_ms: int) -> None:
 
 async def take_snapshot(page: Page, config: CaptureConfig) -> PageSnapshot:
     """Capture the observable surface of the current page."""
-    visible_text: str = await page.evaluate(_VISIBLE_TEXT_JS)
+    observed: dict = await page.evaluate(_OBSERVE_JS)
+    visible_text: str = observed["visible_text"]
     if len(visible_text) > config.max_visible_text_chars:
         visible_text = visible_text[: config.max_visible_text_chars]
 
-    observed: dict = await page.evaluate(_OBSERVE_JS)
-
     return PageSnapshot(
         url=page.url,
-        title=await page.title(),
+        title=observed["title"],
         visible_text=visible_text,
-        html=await page.content(),
-        screenshot_png=await page.screenshot(full_page=config.full_page_screenshot),
+        html=await page.content() if config.save_dom_snapshots else "",
+        screenshot_png=await page.screenshot(
+            full_page=config.full_page_screenshot,
+            caret="hide",
+        ),
         dom_skeleton=observed["skeleton"],
         signals=PageSignals(**observed["signals"]),
+        evidence=observed["evidence"],
+        text_evidence=observed["text_evidence"],
     )

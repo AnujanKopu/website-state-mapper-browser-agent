@@ -144,33 +144,34 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert len(home_docs) == 1
     assert "performed" in set(home_docs[0]["provenance"])
     nav_capabilities = root["exploration"].get("nav_capabilities", [])
-    assert any(item["label"] == "Docs" and item["target_state_id"] == docs["id"]
-               for item in nav_capabilities)
+    assert any(
+        item["label"] == "Docs" and item["target_state_id"] == docs["id"]
+        for item in nav_capabilities
+    )
 
     # Browser back edges exist only as validated restoration evidence.
     history_edges = [e for e in edges if e["transition_kind"] == "back"]
     assert history_edges
     assert all(e["reversible"] for e in history_edges)
     assert all(
-        any(ev.get("mechanism") != "browser_history" or ev.get("validated") is True
-            for ev in e["evidence"])
+        any(
+            ev.get("mechanism") != "browser_history" or ev.get("validated") is True
+            for ev in e["evidence"]
+        )
         for e in history_edges
     )
 
     # Tabs expose both directions because both controls are visible in each
     # captured state; neither direction creates another canonical page.
     tab_state = next(
-        s for s in states
-        if s["type"] == "tab" and "Integrations" in (s["label"] or s["title"])
+        s for s in states if s["type"] == "tab" and "Integrations" in (s["label"] or s["title"])
     )
     assert any(
-        e["from"] == home["id"] and e["to"] == tab_state["id"]
-        and e["transition_kind"] == "tab"
+        e["from"] == home["id"] and e["to"] == tab_state["id"] and e["transition_kind"] == "tab"
         for e in edges
     )
     assert any(
-        e["from"] == tab_state["id"] and e["to"] == home["id"]
-        and e["transition_kind"] == "tab"
+        e["from"] == tab_state["id"] and e["to"] == home["id"] and e["transition_kind"] == "tab"
         for e in edges
     )
 
@@ -275,8 +276,10 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
     ]
     assert len(family_items) == 4
     assert len({item["group_id"] for item in family_items}) == 1
-    assert any(item["href"].endswith("carol.html") and item["status"] == "skipped_duplicate"
-               for item in family_items)
+    assert any(
+        item["href"].endswith("carol.html") and item["status"] == "skipped_duplicate"
+        for item in family_items
+    )
 
     stats = graph["run"]["stats"]
     assert stats["family_dedup_hits"] == 1
@@ -288,6 +291,75 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
     assert all(meta["family_sampled"] == 3 for meta in family_meta)
     assert all(meta["family_skipped"] == 1 for meta in family_meta)
     assert any(edge["collapsed_count"] == 4 for edge in graph["edges"])
+
+
+def test_rejected_family_releases_deferred_actions():
+    """A false family must return every held action to the normal frontier."""
+    from engine.explorer import Frontier, PendingAction, StateMeta
+    from engine.families import FamilyRegistry
+    from engine.ranking import ActionCandidate
+    from engine.schemas import BoundingBox, Interactable, StateType
+
+    box = BoundingBox(x=0, y=0, width=10, height=10)
+    registry = FamilyRegistry()
+    items = [
+        Interactable(
+            selector=f"#mixed > a:nth-of-type({index})",
+            tag="a",
+            text=value,
+            href=f"https://app.test/mixed/{value}",
+            bounding_box=box,
+            item_id=value,
+            region="main",
+            container_key="mixed",
+        )
+        for index, value in enumerate(("one", "two", "three", "four"), 1)
+    ]
+    family = registry.observe_surface(
+        source_key="root",
+        source_structure="root-structure",
+        base_url="https://app.test/",
+        items=items,
+    )[0]
+    family.status = "rejected"
+
+    explorer = Explorer(Settings(), RunConfig())
+    explorer._family_registry = registry
+    explorer._family_deferred = {family.pattern: []}
+    explorer._frontier = Frontier()
+    explorer._family_sampled_urls = {}
+    explorer._family_skipped = {}
+    explorer._family_info = {}
+    explorer._family_variants = {}
+    explorer._edges_done = set()
+    explorer._item_outcome = {}
+    explorer._stats = {}
+    source = StateMeta(
+        id="root",
+        index=0,
+        url="https://app.test/",
+        url_normalized="https://app.test/",
+        depth=0,
+        path=[],
+        state_type=StateType.PAGE,
+    )
+    for item in items:
+        candidate = ActionCandidate(
+            interactable=item,
+            family_pattern=family.pattern,
+            family_id=family.family_id,
+            family_status="provisional",
+        )
+        explorer._family_deferred[family.pattern].append(
+            PendingAction(from_state=source, candidate=candidate)
+        )
+
+    released = explorer._release_family_deferred(family, rejected=True)
+
+    assert released == len(items)
+    assert len(explorer._frontier) == len(items)
+    assert all(explorer._frontier.pop().candidate.family_pattern is None for _ in range(len(items)))
+    assert not explorer._item_outcome
 
 
 def test_enqueue_actions_prefers_highest_scored():
@@ -314,9 +386,7 @@ def test_enqueue_actions_prefers_highest_scored():
 
     def cand(label: str, score: float) -> ActionCandidate:
         return ActionCandidate(
-            interactable=Interactable(
-                selector=f"#{label}", tag="a", text=label, bounding_box=box
-            ),
+            interactable=Interactable(selector=f"#{label}", tag="a", text=label, bounding_box=box),
             score=score,
         )
 

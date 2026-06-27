@@ -24,11 +24,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from engine.capture import new_id
 from engine.config import Settings
 from engine.events import TERMINAL_EVENTS, EventType
 from engine.explorer import Explorer, ExplorerEvent
 from engine.schemas import Credentials, RunConfig, RunStatus
+from engine.storage import StorageBackend
 
 # Pushed onto subscriber queues to signal end-of-stream.
 _SENTINEL = object()
@@ -101,6 +104,11 @@ class RunHandle:
         self.history.append(event)
         return event
 
+    @property
+    def last_sequence(self) -> int:
+        """Highest sequence already published, or -1 before the first event."""
+        return self._seq - 1
+
     def _fan_out(self, event: StreamedEvent) -> None:
         for queue in self.subscribers:
             queue.put_nowait(event)
@@ -113,6 +121,8 @@ class RunHandle:
         event_type = str(event.kind)
         if event_type in TERMINAL_EVENTS:
             self.terminal_emitted = True
+            if self.heartbeat_task is not None:
+                self.heartbeat_task.cancel()
         if event_type == EventType.AUTH_GATE and event.data.get("decision") is None:
             # Explorer is pausing at an auth wall; reflect this in the handle status.
             self.status = RunStatus.PAUSED
@@ -169,6 +179,8 @@ class RunHandle:
         return True
 
     def publish_heartbeat(self) -> None:
+        if self.terminal_emitted or self.done:
+            return
         envelope = self._envelope(
             EventType.HEARTBEAT.value,
             {
@@ -192,9 +204,18 @@ class RunHandle:
 class RunManager:
     """Owns running explorations and their event streams."""
 
-    def __init__(self, settings: Settings, run_config: RunConfig) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        run_config: RunConfig,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        store: StorageBackend | None = None,
+    ) -> None:
         self._settings = settings
         self._run_config = run_config
+        self._session_factory = session_factory
+        self._store = store
         self._handles: dict[str, RunHandle] = {}
 
     # ------------------------------------------------------------------
@@ -226,6 +247,8 @@ class RunManager:
             on_event=handle.publish,
             auth_gate_hook=auth_gate_hook,
             credentials=credentials,
+            session_factory=self._session_factory,
+            store=self._store,
         )
         handle.task = asyncio.create_task(
             self._drive(explorer, handle), name=f"explore:{run_id}"
@@ -254,9 +277,11 @@ class RunManager:
     # Subscription
     # ------------------------------------------------------------------
 
-    async def subscribe(self, handle: RunHandle):
+    async def subscribe(self, handle: RunHandle, *, after_sequence: int = -1):
         """Yield every event for a run: buffered history first, then live."""
-        queue, history, already_done = self._attach(handle)
+        queue, history, already_done = self._attach(
+            handle, after_sequence=after_sequence
+        )
         try:
             for event in history:
                 yield event
@@ -270,7 +295,9 @@ class RunManager:
         finally:
             handle.subscribers.discard(queue)
 
-    def _attach(self, handle: RunHandle) -> tuple[asyncio.Queue, list[StreamedEvent], bool]:
+    def _attach(
+        self, handle: RunHandle, *, after_sequence: int = -1
+    ) -> tuple[asyncio.Queue, list[StreamedEvent], bool]:
         """Atomically snapshot history and register a subscriber.
 
         Contains no `await`, so `publish` cannot interleave: events already in
@@ -278,7 +305,7 @@ class RunManager:
         the queue -- guaranteeing exactly-once delivery across the handoff.
         """
         queue: asyncio.Queue = asyncio.Queue()
-        history = list(handle.history)
+        history = [event for event in handle.history if event.sequence > after_sequence]
         if not handle.done:
             handle.subscribers.add(queue)
         return queue, history, handle.done

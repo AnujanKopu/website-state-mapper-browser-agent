@@ -3,8 +3,6 @@
 from engine.ranking import (
     ActionCandidate,
     collapse_siblings,
-    detect_surface_families,
-    infer_url_family,
     is_auth_entry,
     score_action,
 )
@@ -55,12 +53,14 @@ class TestCollapseSiblings:
     def test_nav_links_with_distinct_targets_stay_separate(self):
         nav = [
             _item("body > nav > a:nth-of-type(1)", text="Home", href="https://demo.test/"),
-            _item("body > nav > a:nth-of-type(2)", text="Pricing", href="https://demo.test/pricing"),
+            _item(
+                "body > nav > a:nth-of-type(2)", text="Pricing", href="https://demo.test/pricing"
+            ),
             _item("body > nav > a:nth-of-type(3)", text="Docs", href="https://demo.test/docs"),
         ]
         assert len(collapse_siblings(nav)) == 3
 
-    def test_slug_family_is_inferred_but_kept_for_bounded_sampling(self):
+    def test_registry_preserved_items_stay_separate_for_sampling(self):
         profiles = [
             _item(
                 f"#profiles > li:nth-of-type({n}) > a",
@@ -70,15 +70,14 @@ class TestCollapseSiblings:
             for n, name in enumerate(("Alice", "Bob", "Carol"), start=1)
         ]
 
-        candidates = collapse_siblings(profiles)
+        candidates = collapse_siblings(
+            profiles,
+            preserve_item_ids={item.item_id or item.selector for item in profiles},
+        )
 
         assert len(candidates) == 3
-        assert {candidate.family_pattern for candidate in candidates} == {
-            "https://demo.test/users/:id"
-        }
-        assert len({item.group_id for item in profiles}) == 1
-        assert candidates[0].collapsed_count == 3
-        assert all(candidate.collapsed_count == 1 for candidate in candidates[1:])
+        assert all(candidate.family_pattern is None for candidate in candidates)
+        assert all(candidate.collapsed_count == 1 for candidate in candidates)
 
     def test_hrefless_buttons_group_by_text(self):
         tabs = [
@@ -105,56 +104,6 @@ class TestCollapseSiblings:
 
         assert len(candidates) == 2
         assert all(candidate.family_pattern is None for candidate in candidates)
-
-
-class TestSurfaceFamilies:
-    def test_repeated_content_routes_are_detected_across_selector_shapes(self):
-        links = [
-            _item("#hero-game", text="Blade Ball", href="https://demo.test/games/blade-ball"),
-            _item("#table-row-1 a", text="Grow a Garden", href="https://demo.test/games/grow-a-garden"),
-            _item("#card-news", text="Patch notes", href="https://demo.test/news/patch-notes"),
-            _item("#docs", text="Docs", href="https://demo.test/docs"),
-        ]
-
-        families = detect_surface_families(links)
-
-        assert {family.kind for family in families} == {"game"}
-        assert families[0].discovered_count == 2
-        assert families[0].pattern == "https://demo.test/games/:id/:param"
-
-
-class TestUrlFamilies:
-    def test_game_detail_urls_infer_same_family_without_english_labels(self):
-        urls = [
-            "https://rotrends.com/game/10104979519/SUPERMOTO-2",
-            "https://rotrends.com/game/987654321/UNDERWATER-BARRYS-PRISON",
-            "https://rotrends.com/game/123456789/%D8%B4%D8%A7%D8%A7%D8%A7%D9%84%D9%8A%D8%A9",
-            "https://rotrends.com/game/10260434203/",
-        ]
-
-        families = [infer_url_family(url) for url in urls]
-
-        assert {family.pattern for family in families if family} == {
-            "https://rotrends.com/game/:id/:param"
-        }
-        assert all(family and family.label == "Games" for family in families)
-
-    def test_youtube_watch_and_shorts_infer_video_families(self):
-        watch = infer_url_family("https://www.youtube.com/watch?v=abc123&t=42")
-        short = infer_url_family("https://www.youtube.com/shorts/xyz987")
-
-        assert watch is not None
-        assert watch.pattern == "https://www.youtube.com/watch?v=:id"
-        assert watch.label == "Videos"
-        assert short is not None
-        assert short.pattern == "https://www.youtube.com/shorts/:id"
-        assert short.label == "Shorts"
-        assert short.kind == "video"
-
-    def test_collection_and_checkout_urls_do_not_infer_families(self):
-        assert infer_url_family("https://rotrends.com/games/all?sort=-playing") is None
-        assert infer_url_family("https://demo.test/checkout") is None
-        assert infer_url_family("https://demo.test/docs") is None
 
 
 class TestScoreAction:

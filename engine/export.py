@@ -72,6 +72,15 @@ def _surface_items(interactables: list[dict]) -> list[dict]:
             "in_modal": item.get("in_modal", False),
             "aria_selected": item.get("aria_selected"),
             "aria_expanded": item.get("aria_expanded"),
+            "aria_controls": item.get("aria_controls"),
+            "aria_haspopup": item.get("aria_haspopup"),
+            "aria_pressed": item.get("aria_pressed"),
+            "checked": item.get("checked"),
+            "input_type": item.get("input_type"),
+            "required": item.get("required", False),
+            "autocomplete": item.get("autocomplete"),
+            "form_action": item.get("form_action"),
+            "form_method": item.get("form_method"),
             "control_key": item.get("control_key", ""),
             "container_key": item.get("container_key"),
             "page_box": item.get("page_box"),
@@ -93,7 +102,7 @@ async def export_graph(
                 await session.execute(
                     select(db.StateNode)
                     .where(db.StateNode.run_id == run_id)
-                    .order_by(db.StateNode.created_at)
+                    .order_by(db.StateNode.created_at, db.StateNode.id)
                 )
             )
             .scalars()
@@ -123,6 +132,7 @@ async def export_graph(
         "states": [
             {
                 "id": node.id,
+                "index": index,
                 "type": node.state_type,
                 "url": node.url,
                 "url_normalized": node.url_normalized,
@@ -136,11 +146,16 @@ async def export_graph(
                 "dom_snapshot": node.dom_snapshot_path,
                 "visible_ctas": _visible_ctas(node.interactables),
                 "surface_items": _surface_items(node.interactables),
-                "exploration": node.exploration or {},
+                "exploration": {
+                    key: value
+                    for key, value in (node.exploration or {}).items()
+                    if key != "evidence"
+                },
+                "evidence": (node.exploration or {}).get("evidence", {}),
                 "flags": node.detected_flags,
                 "path": node.path,
             }
-            for node in states
+            for index, node in enumerate(states)
         ],
         "edges": [
             {
@@ -204,6 +219,26 @@ def _surface_groups(state: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def _compact_evidence(evidence: dict) -> dict:
+    """Bound rich graph evidence for the agent-oriented context pack."""
+    forms = evidence.get("forms") or []
+    visuals = evidence.get("visuals") or []
+    hints = evidence.get("substate_hints") or []
+    return {
+        "page": evidence.get("page") or {},
+        "forms": [
+            {**form, "fields": (form.get("fields") or [])[:20]} for form in forms[:10]
+        ],
+        "visuals": visuals[:15],
+        "substate_hints": hints[:20],
+        "counts": {
+            "forms": len(forms),
+            "visuals": len(visuals),
+            "substate_hints": len(hints),
+        },
+    }
+
+
 def build_context_pack(graph: dict) -> dict:
     """Turn an exported graph document into the structured context pack."""
     states = graph["states"]
@@ -232,7 +267,11 @@ def build_context_pack(graph: dict) -> dict:
     unexplored = []
     action_paths = []
     for i, state in enumerate(states):
-        exploration = state.get("exploration") or {}
+        exploration = {
+            key: value
+            for key, value in (state.get("exploration") or {}).items()
+            if key != "evidence"
+        }
         pack_states.append(
             {
                 "index": i,
@@ -248,6 +287,7 @@ def build_context_pack(graph: dict) -> dict:
                 "in_transitions": [transition(e, "from") for e in in_edges[state["id"]]],
                 "out_transitions": [transition(e, "to") for e in out_edges[state["id"]]],
                 "exploration": exploration,
+                "evidence": _compact_evidence(state.get("evidence") or {}),
             }
         )
         if state.get("path"):
@@ -381,6 +421,39 @@ def render_context_markdown(pack: dict) -> str:
         active_flags = [k for k, v in s["flags"].items() if v is True]
         if active_flags:
             lines.append(f"- Flags: {', '.join(active_flags)}")
+        evidence = s.get("evidence") or {}
+        forms = evidence.get("forms") or []
+        if forms:
+            rendered_forms = []
+            for form in forms:
+                fields = ", ".join(
+                    field.get("label") or field.get("name") or field.get("type") or field["tag"]
+                    for field in form.get("fields", [])
+                )
+                rendered_forms.append(
+                    f"{form.get('label') or form.get('method', 'get').upper() + ' form'}"
+                    + (f" ({fields})" if fields else "")
+                )
+            lines.append(f"- Forms: {'; '.join(rendered_forms)}")
+        visuals = evidence.get("visuals") or []
+        if visuals:
+            lines.append(
+                "- Visual content: "
+                + ", ".join(
+                    f"{item.get('kind')}"
+                    + (f" ({item.get('label')})" if item.get("label") else "")
+                    for item in visuals
+                )
+            )
+        hints = evidence.get("substate_hints") or []
+        if hints:
+            lines.append(
+                "- Possible substates: "
+                + ", ".join(
+                    f"{item.get('label')} [{item.get('kind') or item.get('popup') or 'control'}]"
+                    for item in hints
+                )
+            )
         for region in _REGION_ORDER:
             rows = s["surface_groups"].get(region)
             if not rows:

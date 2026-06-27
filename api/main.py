@@ -7,16 +7,20 @@ Run with:
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import update
 
 from api.manager import RunManager
 from api.routes import router
 from engine.config import Settings, load_run_config
+from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.schemas import RunConfig
+from engine.storage import LocalStorage
 
 
 def create_app(
@@ -33,7 +37,24 @@ def create_app(
         await init_db(engine)
         app.state.settings = settings
         app.state.session_factory = create_session_factory(engine)
-        app.state.manager = RunManager(settings, run_config)
+        # Explorations are in-memory tasks and cannot survive an API restart.
+        # Reconcile persisted transient statuses before serving them to the UI.
+        async with app.state.session_factory.begin() as session:
+            await session.execute(
+                update(db.Run)
+                .where(db.Run.status.in_(["queued", "running", "paused"]))
+                .values(
+                    status="cancelled",
+                    finished_at=datetime.now(UTC),
+                    error="Exploration was interrupted by an API restart.",
+                )
+            )
+        app.state.manager = RunManager(
+            settings,
+            run_config,
+            session_factory=app.state.session_factory,
+            store=LocalStorage(settings.data_dir),
+        )
         try:
             yield
         finally:

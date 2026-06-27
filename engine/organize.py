@@ -10,9 +10,6 @@ from engine.classify import StateAnalysis
 from engine.schemas import Observation, PageRole, StateType
 
 _RESULTS = re.compile(r"\b(search|results?|matches)\b", re.I)
-_DETAIL_SEGMENTS = re.compile(
-    r"\b(game|video|product|post|profile|user|item|listing|article)\b", re.I
-)
 _BOUNDARIES = {
     StateType.AUTH_WALL,
     StateType.PAYWALL,
@@ -50,9 +47,9 @@ def infer_page_role(
     title_and_url = f"{observation.snapshot.title} {observation.url_normalized}"
     if _RESULTS.search(title_and_url) or "?q=" in observation.url_normalized:
         return PageRole.RESULTS
-    if route_family or _DETAIL_SEGMENTS.search(urlsplit(observation.url_normalized).path):
+    if route_family:
         return PageRole.DETAIL
-    if any(candidate.family_pattern for candidate in analysis.candidates):
+    if any(candidate.family_status == "confirmed" for candidate in analysis.candidates):
         return PageRole.HUB
     return PageRole.FLOW_STEP
 
@@ -65,13 +62,18 @@ def heuristic_name(
     parent_label: str | None,
 ) -> dict:
     base = clean_title(observation.snapshot.title, observation.snapshot.url)
-    if trigger_label and parent_label and state_type in {
-        StateType.TAB,
-        StateType.DROPDOWN,
-        StateType.MODAL,
-        StateType.FORM,
-        StateType.WIZARD_STEP,
-    }:
+    if (
+        trigger_label
+        and parent_label
+        and state_type
+        in {
+            StateType.TAB,
+            StateType.DROPDOWN,
+            StateType.MODAL,
+            StateType.FORM,
+            StateType.WIZARD_STEP,
+        }
+    ):
         text = f"{parent_label} — {trigger_label}"
     elif state_type == StateType.AUTH_WALL:
         text = base if re.search(r"log|sign|auth", base, re.I) else "Authentication"

@@ -113,12 +113,27 @@ async def get_run(
 
 
 @router.get("/runs/{run_id}/graph")
-async def get_graph(run_id: str, sessions: SessionsDep) -> dict:
+async def get_graph(run_id: str, manager: ManagerDep, sessions: SessionsDep) -> dict:
     """Full state graph (states + edges) for a run, as it stands now."""
+    handle = manager.get(run_id)
+    # This is a lower-bound watermark: explorer mutations are committed before
+    # their events are published, so every event at or below it is represented
+    # by the ensuing database snapshot.
+    snapshot_sequence = handle.last_sequence if handle is not None else None
     try:
-        return await export_graph(sessions, run_id)
+        graph = await export_graph(sessions, run_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if handle is not None and handle.status == RunStatus.PAUSED:
+        graph["run"]["status"] = RunStatus.PAUSED.value
+    terminal = graph["run"]["status"] in {"done", "failed", "cancelled"}
+    graph["sync"] = {
+        "schema_version": 2,
+        "snapshot_sequence": snapshot_sequence,
+        "authoritative": handle is None or handle.done or terminal,
+        "latest_state_id": graph["states"][-1]["id"] if graph["states"] else None,
+    }
+    return graph
 
 
 @router.get("/runs/{run_id}/export")
@@ -170,7 +185,10 @@ async def get_context_pack(
 
 @router.get("/runs/{run_id}/events")
 async def stream_events(
-    run_id: str, request: Request, manager: ManagerDep
+    run_id: str,
+    request: Request,
+    manager: ManagerDep,
+    after_sequence: Annotated[int | None, Query(ge=-1)] = None,
 ) -> EventSourceResponse:
     """Server-Sent Events stream of the run's progress.
 
@@ -183,13 +201,22 @@ async def stream_events(
             status_code=404,
             detail=f"No live event stream for run {run_id}; use /graph for results",
         )
-    return EventSourceResponse(_event_source(manager, handle, request))
+    last_event_id = request.headers.get("last-event-id")
+    header_sequence = int(last_event_id) if last_event_id and last_event_id.isdigit() else -1
+    cursor = max(after_sequence if after_sequence is not None else -1, header_sequence)
+    return EventSourceResponse(
+        _event_source(manager, handle, request, after_sequence=cursor)
+    )
 
 
 async def _event_source(
-    manager: RunManager, handle: RunHandle, request: Request
+    manager: RunManager,
+    handle: RunHandle,
+    request: Request,
+    *,
+    after_sequence: int = -1,
 ) -> AsyncIterator[dict]:
-    async for event in manager.subscribe(handle):
+    async for event in manager.subscribe(handle, after_sequence=after_sequence):
         if await request.is_disconnected():
             break
         yield {

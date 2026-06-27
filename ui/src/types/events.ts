@@ -60,6 +60,15 @@ export interface SurfaceItemLite {
   status: string;
   aria_selected?: boolean | null;
   aria_expanded?: boolean | null;
+  aria_controls?: string | null;
+  aria_haspopup?: string | null;
+  aria_pressed?: boolean | null;
+  checked?: boolean | null;
+  input_type?: string | null;
+  required?: boolean;
+  autocomplete?: string | null;
+  form_action?: string | null;
+  form_method?: string | null;
   control_key?: string;
   container_key?: string | null;
 }
@@ -104,6 +113,7 @@ export interface StateDiscoveredPayload extends BasePayload {
   family?: FamilyMetadata | null;
   nav_capabilities?: NavCapability[];
   surface_families?: FamilyMetadata[];
+  evidence?: import("./graph").StateEvidence;
 }
 
 export interface EdgeDiscoveredPayload extends BasePayload {

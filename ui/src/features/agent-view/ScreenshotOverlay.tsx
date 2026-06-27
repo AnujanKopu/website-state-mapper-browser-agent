@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 export interface ExpandedScreenshot {
   imageUrl: string;
@@ -12,8 +12,11 @@ interface ScreenshotOverlayProps {
 }
 
 export function ScreenshotOverlay({ screenshot, onClose }: ScreenshotOverlayProps) {
+  const [actualSize, setActualSize] = useState(false);
+
   useEffect(() => {
     if (!screenshot) return;
+    setActualSize(false);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -32,12 +35,23 @@ export function ScreenshotOverlay({ screenshot, onClose }: ScreenshotOverlayProp
             <strong>{screenshot.title}</strong>
             <span>{screenshot.pageUrl}</span>
           </span>
+          <button
+            className="button button--ghost"
+            type="button"
+            onClick={() => setActualSize((value) => !value)}
+          >
+            {actualSize ? "Fit image" : "Actual size"}
+          </button>
           <button className="icon-button" onClick={onClose} aria-label="Close">
             {"\u00d7"}
           </button>
         </div>
         <div className="overlay__body">
-          <img src={screenshot.imageUrl} alt={`Expanded screenshot of ${screenshot.title}`} />
+          <img
+            className={actualSize ? "overlay__image--actual" : undefined}
+            src={screenshot.imageUrl}
+            alt={`Expanded screenshot of ${screenshot.title}`}
+          />
         </div>
       </div>
     </div>
