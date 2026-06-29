@@ -125,6 +125,25 @@ _OBSERVE_JS = """
       text: (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
     }))
     .filter((item) => item.text);
+  const controlGroups = visibleAll(
+    'form, table, [role="toolbar"], [role="tablist"], [role="search"], section, article'
+  ).slice(0, 80).map((owner) => ({
+    kind: owner.getAttribute('role') || owner.tagName.toLowerCase(),
+    label: labelOf(owner)
+      || owner.querySelector('legend, caption, h1, h2, h3, [role="heading"]')
+        ?.textContent?.replace(/\\s+/g, ' ').trim().slice(0, 160)
+      || null,
+    controls: Array.from(owner.querySelectorAll(
+      'input:not([type="hidden"]), textarea, select, button, [role="tab"], [role="combobox"]'
+    )).slice(0, 40).map((control) => ({
+      tag: control.tagName.toLowerCase(),
+      role: control.getAttribute('role'),
+      type: control.getAttribute('type'),
+      label: labelOf(control),
+      placeholder: control.getAttribute('placeholder'),
+      name: control.getAttribute('name'),
+    })),
+  }));
 
   return {
     title: document.title || '',
@@ -147,7 +166,7 @@ _OBSERVE_JS = """
       forms,
       visuals,
     },
-    text_evidence: { headings },
+    text_evidence: { headings, control_groups: controlGroups },
     signals: {
       modal_open: visibleAll('[role="dialog"], dialog[open], [aria-modal="true"]').length > 0,
       password_fields: visibleAll('input[type="password"]').length,
@@ -175,6 +194,80 @@ async def stabilize(page: Page, quiet_ms: int) -> None:
     with contextlib.suppress(PlaywrightTimeoutError):
         await page.wait_for_load_state("networkidle", timeout=_NETWORK_IDLE_TIMEOUT_MS)
     await asyncio.sleep(quiet_ms / 1000)
+
+
+async def local_probe_marker(page: Page) -> str:
+    """Cheap rendered-state marker used to reject true local no-ops.
+
+    This deliberately excludes screenshots, raw HTML, and page scrolling. A
+    changed marker still receives the full observation path before it can
+    become a state.
+    """
+    return await page.evaluate(
+        """
+        () => {
+          const visible = (el) => {
+            const style = getComputedStyle(el);
+            const box = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && Number(style.opacity || 1) > 0 && box.width > 0 && box.height > 0;
+          };
+          const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+          let hash = 2166136261;
+          for (let index = 0; index < text.length; index += 1) {
+            hash ^= text.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+          }
+          const controls = Array.from(document.querySelectorAll(
+            '[aria-expanded], [aria-pressed], [aria-selected], input:checked, option:checked, dialog[open]'
+          )).filter(visible).slice(0, 250).map((el) => [
+            el.tagName,
+            el.getAttribute('role'),
+            el.getAttribute('aria-expanded'),
+            el.getAttribute('aria-pressed'),
+            el.getAttribute('aria-selected'),
+            el.id || null,
+          ]);
+          const overlays = Array.from(document.querySelectorAll(
+            '[role="dialog"], [role="menu"], [role="listbox"], [aria-modal="true"]'
+          )).filter(visible).length;
+          return JSON.stringify([location.href, document.title, hash >>> 0, text.length, controls, overlays]);
+        }
+        """
+    )
+
+
+async def wait_for_local_mutation_quiet(
+    page: Page, *, quiet_ms: int = 750, cap_ms: int = 2_000
+) -> None:
+    """Wait for a bounded DOM-mutation quiet window after a local action."""
+    await page.evaluate(
+        """
+        ({ quietMs, capMs }) => new Promise((resolve) => {
+          let quietTimer;
+          const done = () => {
+            observer.disconnect();
+            clearTimeout(quietTimer);
+            clearTimeout(capTimer);
+            resolve();
+          };
+          const arm = () => {
+            clearTimeout(quietTimer);
+            quietTimer = setTimeout(done, quietMs);
+          };
+          const observer = new MutationObserver(arm);
+          observer.observe(document.documentElement, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            characterData: true,
+          });
+          const capTimer = setTimeout(done, capMs);
+          arm();
+        })
+        """,
+        {"quietMs": quiet_ms, "capMs": cap_ms},
+    )
 
 
 async def take_snapshot(page: Page, config: CaptureConfig) -> PageSnapshot:

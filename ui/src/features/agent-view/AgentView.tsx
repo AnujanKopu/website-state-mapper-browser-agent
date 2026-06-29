@@ -19,6 +19,11 @@ const RUNNING = new Set(["running", "queued", "paused"]);
 
 const FILTER_LABELS: Record<CounterFilterKey, string> = {
   states: "state",
+  page_states: "page",
+  substates: "substate",
+  interaction_nodes: "interaction",
+  surface_items_observed: "surface observation",
+  interaction_capabilities: "interaction",
   edges: "edge",
   inferred_edges: "inferred",
   frontier: "pending",
@@ -26,6 +31,11 @@ const FILTER_LABELS: Record<CounterFilterKey, string> = {
   deduped: "deduped",
   denied: "denied",
   failed: "failed",
+  stale_actions: "stale",
+  replay_failed_actions: "replay failed",
+  known_state_actions: "known state",
+  unresolved_discovery_obligations: "obligation",
+  pending_representative_actions: "representative",
   noop: "noop",
   frontier_size: "pending",
   surface_pending: "surface",

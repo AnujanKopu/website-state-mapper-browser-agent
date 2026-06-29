@@ -131,7 +131,7 @@ async def test_full_lifecycle_graph_and_export(client: httpx.AsyncClient):
     assert status["finished_at"]
 
     graph = (await client.get(f"/api/runs/{run_id}/graph")).json()
-    assert graph["sync"]["schema_version"] == 2
+    assert graph["sync"]["schema_version"] == 4
     assert graph["sync"]["authoritative"] is True
     assert [state["index"] for state in graph["states"]] == list(range(len(graph["states"])))
     assert all("evidence" in state for state in graph["states"])
@@ -160,6 +160,7 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
     assert "action_started" in kinds
     assert "action_finished" in kinds
     assert "frontier_updated" in kinds
+    assert "surface_items_discovered" in kinds
     assert kinds[-1] == "run_completed"  # terminal event closes the stream
 
     # Every envelope carries the contract v1 fields.
@@ -193,6 +194,30 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
 
     # The stream agrees with the persisted graph.
     graph = (await client.get(f"/api/runs/{run_id}/graph")).json()
+    persisted_states = {state["id"]: state for state in graph["states"]}
+    live_inventory = next(
+        item
+        for payload in node_events
+        for item in payload.get("surface_items", [])
+        if item["status"] == "inventory_only"
+    )
+    live_state = next(
+        payload for payload in node_events if live_inventory in payload.get("surface_items", [])
+    )
+    persisted_inventory = next(
+        item
+        for item in persisted_states[live_state["state_id"]]["surface_items"]
+        if item["item_id"] == live_inventory["item_id"]
+    )
+    for field in (
+        "kind",
+        "tag",
+        "role",
+        "interaction_scope",
+        "execution_policy",
+        "controlled_surface",
+    ):
+        assert live_inventory[field] == persisted_inventory[field]
     edge_events = [e["payload"] for e in events if e["type"] == "edge_discovered"]
     # Stable edge ids allow later observations to upgrade an inferred edge
     # without creating another graph row.  The final event snapshot for every
@@ -206,6 +231,30 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
         assert live["to"] == persisted["to"]
         assert live["via"] == persisted["via"]
         assert live["provenance"] == persisted["provenance"]
+
+    # Authoritative post-probe item updates converge with terminal hydration.
+    latest_surfaces = {
+        event["payload"]["state_id"]: event["payload"]
+        for event in events
+        if event["type"] == "surface_items_discovered"
+    }
+    for state_id, payload in latest_surfaces.items():
+        live_items = {item["item_id"]: item for item in payload["surface_items"]}
+        terminal_items = {
+            item["item_id"]: item for item in persisted_states[state_id]["surface_items"]
+        }
+        assert set(live_items) == set(terminal_items)
+        for item_id, live in live_items.items():
+            terminal_item = terminal_items[item_id]
+            for field in (
+                "status",
+                "execution_policy",
+                "component_key",
+                "component_label",
+                "icon_label",
+                "probe_reason",
+            ):
+                assert live[field] == terminal_item[field]
 
 
 async def test_context_pack_endpoint(client: httpx.AsyncClient):

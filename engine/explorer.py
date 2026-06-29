@@ -31,12 +31,18 @@ from engine import identity
 from engine.browser.actions import (
     click_interactable,
     click_selector,
-    dismiss_cookie_banner,
+    is_navigation_interactable,
+    probe_reason,
+    rebind_interactable,
     validate_interactable,
 )
 from engine.browser.autofill import autofill_auth_form
 from engine.browser.session import BrowserSession
-from engine.browser.snapshot import stabilize
+from engine.browser.snapshot import (
+    local_probe_marker,
+    stabilize,
+    wait_for_local_mutation_quiet,
+)
 from engine.capture import (
     build_state_row,
     new_id,
@@ -49,7 +55,13 @@ from engine.config import Settings
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.events import ActionOutcome, EventType
-from engine.families import FamilyCandidate, FamilyRegistry
+from engine.families import (
+    FamilyCandidate,
+    FamilyRegistry,
+    matches_template,
+    structure_signature,
+    tokenize_url,
+)
 from engine.identity import normalize_url
 from engine.organize import heuristic_name, infer_page_role
 from engine.ranking import (
@@ -130,6 +142,9 @@ class StateMeta:
     nav_capabilities: list[dict] = field(default_factory=list)
     surface_families: list[dict] = field(default_factory=list)
     family_template_key: tuple | None = None
+    # Bounded nearby text/structure for a future per-state LLM pass. This is
+    # deliberately in-memory only and never enters persistence or SSE.
+    llm_context: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -149,8 +164,14 @@ class PendingAction:
     from_state: StateMeta
     candidate: ActionCandidate
     journey_key: str = "root"
-    phase: int = 1
+    # 0 auth discovery, 1 global/family navigation, 2 ordinary navigation,
+    # 3 local structural probes.
+    phase: int = 2
+    lane: str = "navigation"
     sequence: int = 0
+    required: bool = False
+    obligation_kind: str | None = None
+    action_key: str = ""
 
 
 class Budget:
@@ -158,6 +179,8 @@ class Budget:
         self._config = config
         self.actions = 0
         self._started = time.monotonic()
+        self._paused_total = 0.0
+        self._pause_started: float | None = None
 
     def note_action(self) -> None:
         self.actions += 1
@@ -166,15 +189,35 @@ class Budget:
     def elapsed_seconds(self) -> float:
         return time.monotonic() - self._started
 
+    @property
+    def auth_paused_seconds(self) -> float:
+        current = (
+            time.monotonic() - self._pause_started
+            if self._pause_started is not None
+            else 0.0
+        )
+        return self._paused_total + current
+
+    @property
+    def active_elapsed_seconds(self) -> float:
+        return max(0.0, self.elapsed_seconds - self.auth_paused_seconds)
+
+    def pause_for_auth(self) -> None:
+        if self._pause_started is None:
+            self._pause_started = time.monotonic()
+
+    def resume_from_auth(self) -> None:
+        if self._pause_started is not None:
+            self._paused_total += time.monotonic() - self._pause_started
+            self._pause_started = None
+
     def stop_reason(self, state_count: int, actions_since_new: int) -> str | None:
         if self.actions >= self._config.max_actions:
             return "max_actions"
         if state_count >= self._config.max_states:
             return "max_states"
-        if self.elapsed_seconds >= self._config.max_wall_seconds:
+        if self.active_elapsed_seconds >= self._config.max_wall_seconds:
             return "max_wall_seconds"
-        if actions_since_new >= NOVELTY_PATIENCE:
-            return "novelty_exhausted"
         return None
 
 
@@ -208,17 +251,27 @@ class Frontier:
                 item.sequence,
             )
 
-        index = min(range(len(self._items)), key=lambda i: priority(self._items[i]))
+        candidates = [
+            i for i, item in enumerate(self._items)
+            if item.phase == min(candidate.phase for candidate in self._items)
+        ]
+        index = min(candidates, key=lambda i: priority(self._items[i]))
         item = self._items.pop(index)
         self._journey_pops[item.journey_key] = self._journey_pops.get(item.journey_key, 0) + 1
         return item
+
+    def drain(self) -> list[PendingAction]:
+        items, self._items = self._items, []
+        return items
 
     def __len__(self) -> int:
         return len(self._items)
 
 
 _AUTH_SUCCESS = re.compile(r"\b(log\s*out|sign\s*out|my\s+account|profile|dashboard)\b", re.I)
-_AUTH_PATH = re.compile(r"/(log-?in|sign-?in|sign-?up|register|auth)(/|$)", re.I)
+_AUTH_PATH = re.compile(
+    r"/(log-?in|sign-?in|sign-?up|register|auth)(?:/|\.html?$|$)", re.I
+)
 _AUTH_RETURN_PARAMS = {
     "after",
     "continue",
@@ -306,6 +359,12 @@ class Explorer:
         self._provided_sessions = session_factory
         self._provided_store = store
         self._text_evidence_sink = text_evidence_sink
+        # Helper methods are unit-testable before a run initializes its full
+        # runtime maps; the run resets this store when exploration starts.
+        self._item_outcome: dict[tuple[str, str], str] = {}
+        self._action_ledger: dict[str, str] = {}
+        self._required_action_keys: set[str] = set()
+        self._required_action_kinds: dict[str, str] = {}
         self._family_registry = FamilyRegistry(
             min_support=config.exploration.url_family_min_support,
             strong_support=config.exploration.url_family_strong_support,
@@ -345,6 +404,9 @@ class Explorer:
         self._family_skipped: dict[str, int] = {}
         self._family_info: dict[str, dict] = {}
         self._family_deferred: dict[str, list[PendingAction]] = defaultdict(list)
+        self._auth_deferred_family_action: PendingAction | None = None
+        self._auth_deferred_family_actions: dict[str, PendingAction] = {}
+        self._global_probe_outcomes: dict[tuple[AuthContext, str], str] = {}
         self._edges_done: set[tuple[str, str]] = set()
         self._capabilities: dict[tuple[str, str], TransitionCapability] = {}
         self._capability_by_item: dict[tuple[str, str], str] = {}
@@ -360,10 +422,18 @@ class Explorer:
         self._validated_history: set[tuple[str, str]] = set()
         # (state_id, item_id) -> terminal surface status for items we acted on.
         self._item_outcome: dict[tuple[str, str], str] = {}
+        self._action_ledger: dict[str, str] = {}
+        self._required_action_keys: set[str] = set()
+        self._required_action_kinds: dict[str, str] = {}
+        self._stale_rebind_attempted: set[str] = set()
+        self._interaction_capabilities_seen: set[tuple[str, str, str]] = set()
         self._current_state_id: str | None = None
         self._actions_since_new = 0
         self._stats: dict = {
             "states": 0,
+            "page_states": 0,
+            "substates": 0,
+            "interaction_nodes": 0,
             "edges": 0,
             "inferred_edges": 0,
             "dedup_hits": 0,
@@ -382,6 +452,23 @@ class Explorer:
             "reversible_edges": 0,
             "surface_pending_items": 0,
             "frontier_actions": 0,
+            "local_probes": 0,
+            "mutating_requests_blocked": 0,
+            "globally_deduplicated_probes": 0,
+            "auth_deferred_family_samples": 0,
+            "surface_items_observed": 0,
+            "interaction_capabilities": 0,
+            "useful_actions": 0,
+            "known_state_actions": 0,
+            "stale_actions": 0,
+            "replay_failed_actions": 0,
+            "observed_edges": 0,
+            "repeated_probes_suppressed": 0,
+            "selector_collisions_resolved": 0,
+            "responsive_owners_collapsed": 0,
+            "navigation_links_revealed": 0,
+            "pending_representative_actions": 0,
+            "unresolved_discovery_obligations": 0,
         }
         self._timings: dict[str, float] = defaultdict(float)
 
@@ -402,6 +489,7 @@ class Explorer:
 
         try:
             async with BrowserSession(self._config.browser) as browser:
+                self._browser_session = browser
                 page = await browser.new_page()
                 await self._explore(page, url)
         except Exception as exc:
@@ -438,7 +526,6 @@ class Explorer:
             )
         )
         await page.goto(url)
-        await dismiss_cookie_banner(page)
         self._root_url = _effective_scope_url(url, page.url)
 
         observe_started = time.perf_counter()
@@ -472,13 +559,22 @@ class Explorer:
             if reason:
                 self._stats["stop_reason"] = reason
                 break
-            await self._execute(page, self._frontier.pop())
+            pending = self._frontier.pop()
+            await self._execute(page, pending)
+            await self._sync_surface_state(pending.from_state)
             self._emit_frontier()
 
     def _counters(self) -> dict:
         """UI-friendly snapshot of live progress counters."""
         return {
             "states": self._stats["states"],
+            "page_states": self._stats.get("page_states", 0),
+            "substates": self._stats.get("substates", 0),
+            "interaction_nodes": self._stats.get("interaction_nodes", 0),
+            "surface_items_observed": self._stats.get("surface_items_observed", 0),
+            "interaction_capabilities": self._stats.get(
+                "interaction_capabilities", 0
+            ),
             "edges": self._stats["edges"],
             "inferred_edges": self._stats["inferred_edges"],
             "denied": self._stats["actions_denied"],
@@ -494,6 +590,20 @@ class Explorer:
             "family_sampled": self._stats.get("family_urls_sampled", 0),
             "family_deferred": self._stats.get("family_urls_deferred", 0),
             "family_skipped": self._stats.get("family_urls_skipped", 0),
+            "useful_actions": self._stats.get("useful_actions", 0),
+            "known_state_actions": self._stats.get("known_state_actions", 0),
+            "stale_actions": self._stats.get("stale_actions", 0),
+            "replay_failed_actions": self._stats.get("replay_failed_actions", 0),
+            "observed_edges": self._stats.get("observed_edges", 0),
+            "repeated_probes_suppressed": self._stats.get(
+                "repeated_probes_suppressed", 0
+            ),
+            "pending_representative_actions": self._stats.get(
+                "pending_representative_actions", 0
+            ),
+            "unresolved_discovery_obligations": self._stats.get(
+                "unresolved_discovery_obligations", 0
+            ),
         }
 
     def _emit_frontier(self) -> None:
@@ -521,6 +631,58 @@ class Explorer:
     @staticmethod
     def _is_global_chrome_item(item: Interactable) -> bool:
         return bool(item.in_nav or item.region in {"nav", "header", "aside"})
+
+    @classmethod
+    def _is_persistent_local_control(cls, item: Interactable) -> bool:
+        if cls._is_global_chrome_item(item):
+            return True
+        return bool(
+            item.region is None
+            and re.search(
+                r"\b(search|voice|account|profile|avatar)\b", item.label, re.I
+            )
+        )
+
+    def _annotate_interaction_policy(self, item: Interactable) -> None:
+        """Classify discovery separately from execution.
+
+        Only real links are eligible for traversal; every other visible
+        control remains useful inventory without dispatching a DOM event.
+        """
+        decision = evaluate_action(item, base_url=self._root_url)
+        if not decision.allowed:
+            item.execution_policy = "blocked"
+            item.safety_category = decision.category.value if decision.category else None
+            item.interaction_scope = (
+                "external" if item.safety_category == "external" else "local_ui"
+            )
+            return
+        if is_navigation_interactable(item):
+            item.execution_policy = "navigate"
+            item.interaction_scope = "page_navigation"
+            item.safety_category = None
+            return
+        reason = probe_reason(item)
+        if reason is not None:
+            if reason == "navigation_disclosure" and (
+                item.aria_expanded is True or item.aria_pressed is True
+                or re.search(r"\b(show|see|view)\s+less\b|\bcollapse\b", item.label, re.I)
+            ):
+                # The shell is already open. Toggling it would hide routes and
+                # manufacture work rather than reveal new capabilities.
+                item.execution_policy = "inventory_only"
+                item.interaction_scope = "local_ui"
+                item.probe_reason = reason
+                item.safety_category = None
+                return
+            item.execution_policy = "probe_local"
+            item.interaction_scope = "local_ui"
+            item.probe_reason = reason
+            item.safety_category = None
+            return
+        item.execution_policy = "inventory_only"
+        item.interaction_scope = "local_ui"
+        item.safety_category = None
 
     @staticmethod
     def _is_peripheral_action(item: Interactable) -> bool:
@@ -576,6 +738,60 @@ class Explorer:
     def _stable_hash(*parts: str | None, length: int = 20) -> str:
         basis = "|".join((part or "").strip().lower() for part in parts)
         return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:length]
+
+    def _action_key_for(self, pending: PendingAction) -> str:
+        item = pending.candidate.interactable
+        return self._stable_hash(
+            pending.from_state.id,
+            pending.from_state.auth_context.value,
+            self._control_key(item),
+            item.component_key,
+            item.href,
+            str(item.aria_selected),
+            str(item.aria_expanded),
+            str(item.aria_pressed),
+            str(pending.phase),
+            length=32,
+        )
+
+    def _prepare_pending(self, pending: PendingAction) -> PendingAction:
+        if not pending.action_key:
+            pending.action_key = self._action_key_for(pending)
+        if pending.required:
+            self._required_action_keys.add(pending.action_key)
+            self._required_action_kinds[pending.action_key] = (
+                pending.obligation_kind or "required_action"
+            )
+        return pending
+
+    def _record_action_outcome(self, pending: PendingAction, outcome: str) -> None:
+        pending = self._prepare_pending(pending)
+        previous = self._action_ledger.get(pending.action_key)
+        self._action_ledger[pending.action_key] = outcome
+        if previous is not None:
+            return
+        if outcome in {"new_state", "known_state", "explored"}:
+            self._stats["useful_actions"] += 1
+        if outcome == "known_state":
+            self._stats["known_state_actions"] += 1
+        elif outcome == "stale":
+            self._stats["stale_actions"] += 1
+        elif outcome == "replay_failed":
+            self._stats["replay_failed_actions"] += 1
+
+    def _required_obligation_summary(self) -> tuple[int, int]:
+        unresolved = sum(
+            key not in self._action_ledger for key in self._required_action_keys
+        )
+        failed = sum(
+            self._action_ledger.get(key)
+            in {"stale", "failed", "replay_failed", "blocked"}
+            for key in self._required_action_keys
+        )
+        return unresolved, failed
+
+    def _queue_action(self, pending: PendingAction) -> None:
+        self._frontier.push(self._prepare_pending(pending))
 
     def _control_key(self, item: Interactable) -> str:
         if item.control_key:
@@ -709,6 +925,9 @@ class Explorer:
         info["checked_count"] = len(self._family_sampled_urls.get(pattern, []))
         info["represented_count"] = len(self._family_variants.get(pattern, {}))
         info["variant_count"] = info["represented_count"]
+        info["variant_state_ids"] = list(
+            dict.fromkeys(self._family_variants.get(pattern, {}).values())
+        )[:8]
         info["skipped_count"] = self._family_skipped.get(pattern, 0)
         info["sample_urls"] = list(
             dict.fromkeys(
@@ -737,6 +956,7 @@ class Explorer:
         families = self._family_registry.observe_surface(
             source_key=f"{observation.url_normalized}|{observation.fingerprint}",
             source_structure=observation.skeleton_hash,
+            source_signature=structure_signature(observation),
             base_url=observation.snapshot.url,
             items=observation.interactables,
         )
@@ -753,8 +973,12 @@ class Explorer:
             ] += 1
         preserve: set[str] = set()
         for item in observation.interactables:
+            if not item.href or self._is_global_chrome_item(item) or is_auth_entry(
+                ActionCandidate(interactable=item)
+            ):
+                continue
             family = self._family_registry.family_for_url(
-                item.href or "", base_url=observation.snapshot.url
+                item.href, base_url=observation.snapshot.url
             )
             if family is None:
                 continue
@@ -783,8 +1007,14 @@ class Explorer:
 
         first_for_pattern: set[str] = set()
         for candidate in analysis.candidates:
+            if (
+                not candidate.interactable.href
+                or self._is_global_chrome_item(candidate.interactable)
+                or is_auth_entry(candidate)
+            ):
+                continue
             family = self._family_registry.family_for_url(
-                candidate.interactable.href or "", base_url=observation.snapshot.url
+                candidate.interactable.href, base_url=observation.snapshot.url
             )
             if family is None:
                 continue
@@ -802,10 +1032,17 @@ class Explorer:
 
         return [family.payload() for family in families if family.status != "rejected"]
 
-    def _adopt_confirmed_family(self, candidate: FamilyCandidate) -> None:
-        payload = candidate.payload()
+    async def _adopt_confirmed_family(self, candidate: FamilyCandidate) -> None:
+        payload = self._family_runtime_payload(candidate.pattern)
         self._family_info[candidate.pattern] = payload
         variants = self._family_variants.setdefault(candidate.pattern, {})
+        anchor: StateMeta | None = None
+        if candidate.family_kind == "collection_variant_family":
+            for meta in self._states.values():
+                exact = tokenize_url(meta.url)
+                if exact is not None and exact.url in candidate.collection_anchor_urls:
+                    anchor = meta
+                    break
         for meta in self._states.values():
             if meta.parent_state_id is not None:
                 continue
@@ -814,22 +1051,127 @@ class Explorer:
                 continue
             meta.route_family = candidate.pattern
             meta.family = dict(payload)
-            meta.page_role = PageRole.DETAIL
+            meta.page_role = (
+                PageRole.RESULTS
+                if candidate.family_kind == "collection_variant_family"
+                else PageRole.DETAIL
+            )
+            self._family_registry.record_sample_state(candidate, meta.url, meta.id)
             if meta.family_template_key is not None:
                 variants.setdefault(meta.family_template_key, meta.id)
+            if anchor is not None and anchor.id != meta.id and meta.parent_state_id is None:
+                meta.parent_state_id = anchor.id
+                meta.return_state_id = anchor.id
+                meta.state_type = StateType.PAGE_VARIANT
+                meta.page_depth = anchor.page_depth
+                meta.substate_depth = max(1, anchor.substate_depth + 1)
+                if hasattr(self, "_stats"):
+                    self._stats["page_states"] = max(0, self._stats["page_states"] - 1)
+                    self._stats["substates"] += 1
+        payload = self._family_runtime_payload(candidate.pattern)
+        self._family_info[candidate.pattern] = payload
+        for meta in self._states.values():
+            if meta.route_family == candidate.pattern:
+                meta.family = dict(payload)
         for meta in self._states.values():
             supports_family = False
             for item in meta.interactables:
-                member = self._family_registry.family_for_url(item.href or "", base_url=meta.url)
+                if not item.href or self._is_global_chrome_item(item) or is_auth_entry(
+                    ActionCandidate(interactable=item)
+                ):
+                    continue
+                member = self._family_registry.family_for_url(item.href, base_url=meta.url)
                 if member is not None and member.pattern == candidate.pattern:
                     item.group_id = candidate.family_id
                     supports_family = True
-            if supports_family and not any(
-                item.get("pattern") == candidate.pattern for item in meta.surface_families
-            ):
-                meta.surface_families.append(dict(payload))
             if supports_family:
+                meta.surface_families = [
+                    item
+                    for item in meta.surface_families
+                    if item.get("pattern") != candidate.pattern
+                ] + [dict(payload)]
                 meta.page_role = PageRole.HUB
+
+        affected = [
+            meta
+            for meta in self._states.values()
+            if meta.route_family == candidate.pattern
+            or any(item.get("pattern") == candidate.pattern for item in meta.surface_families)
+        ]
+        async with self._sessions() as session:
+            for meta in affected:
+                row = await session.get(db.StateNode, meta.id)
+                if row is None:
+                    continue
+                row.parent_state_id = meta.parent_state_id
+                row.state_type = meta.state_type.value
+                row.exploration = {
+                    **dict(row.exploration or {}),
+                    "page_role": meta.page_role.value,
+                    "page_anchor_id": meta.parent_state_id or meta.id,
+                    "variant_kind": (
+                        "page_variant" if meta.state_type == StateType.PAGE_VARIANT else "page"
+                    ),
+                    **(
+                        {
+                            "route_family": candidate.pattern,
+                            "family": dict(meta.family or payload),
+                            "family_variant_key": self._stable_hash(
+                                *(str(part) for part in (meta.family_template_key or ())),
+                                length=20,
+                            ),
+                            "family_representative_state_id": (
+                                variants.get(meta.family_template_key)
+                                if meta.family_template_key is not None
+                                else meta.id
+                            ),
+                        }
+                        if meta.route_family == candidate.pattern
+                        else {}
+                    ),
+                    "surface_families": [
+                        self._family_runtime_payload(item["pattern"])
+                        for item in meta.surface_families
+                        if item.get("pattern") in self._family_registry.candidates
+                    ],
+                }
+            await session.commit()
+        for meta in affected:
+            self._emit(
+                ExplorerEvent(
+                    EventType.STATE_UPDATED,
+                    f"Updated family metadata for s{meta.index}",
+                    {
+                        "state_id": meta.id,
+                        "type": meta.state_type.value,
+                        "parent_state_id": meta.parent_state_id,
+                        "page_role": meta.page_role.value,
+                        "page_anchor_id": meta.parent_state_id or meta.id,
+                        "variant_kind": (
+                            "page_variant"
+                            if meta.state_type == StateType.PAGE_VARIANT
+                            else "page"
+                        ),
+                        "route_family": meta.route_family,
+                        "family_variant_key": (
+                            self._stable_hash(
+                                *(str(part) for part in (meta.family_template_key or ())),
+                                length=20,
+                            )
+                            if meta.route_family
+                            else None
+                        ),
+                        "family_representative_state_id": (
+                            variants.get(meta.family_template_key)
+                            if meta.route_family and meta.family_template_key is not None
+                            else meta.id if meta.route_family else None
+                        ),
+                        "family": dict(meta.family or payload) if meta.route_family else None,
+                        "surface_families": meta.surface_families,
+                        "counters": self._counters(),
+                    },
+                )
+            )
 
     def _release_family_deferred(
         self, candidate: FamilyCandidate, *, rejected: bool = False
@@ -845,16 +1187,18 @@ class Explorer:
                 action.candidate.family_label = None
                 action.candidate.family_kind = None
                 action.candidate.family_status = None
-                self._frontier.push(action)
+                self._queue_action(action)
                 released += 1
             elif self._family_registry.should_sample(candidate, item.href or ""):
-                self._frontier.push(action)
+                self._queue_action(action)
                 released += 1
             elif candidate.status == "provisional":
                 still_deferred.append(action)
             else:
                 self._family_registry.mark_skipped(candidate, item.href or "")
-                self._edges_done.add((action.from_state.id, item.selector))
+                action = self._prepare_pending(action)
+                self._edges_done.add((action.from_state.id, action.action_key))
+                self._record_action_outcome(action, "known_state")
                 self._item_outcome[(action.from_state.id, item.item_id)] = "skipped_duplicate"
         if still_deferred:
             self._family_deferred[candidate.pattern] = still_deferred
@@ -893,10 +1237,6 @@ class Explorer:
         target_id: str | None = None
         if capability.target_hint is not None:
             target_id = self._known_target_id(source.auth_context, capability.target_hint)
-        if target_id is None and capability.item.kind == "tab":
-            page_id = self._page_ancestor(source)
-            target_id = self._tab_targets.get((page_id, capability.control_key))
-
         if target_id == source.id:
             return
         if target_id is None or target_id not in self._states:
@@ -929,7 +1269,6 @@ class Explorer:
                 items = modal_items
 
         touched_globals: set[str] = set()
-        touched_tabs: set[tuple[str, str]] = set()
         for item in items:
             if not evaluate_action(item, base_url=self._root_url).allowed:
                 continue
@@ -954,21 +1293,10 @@ class Explorer:
                 self._global_capabilities[global_key].add(ref)
                 touched_globals.add(global_key)
 
-            if item.kind == "tab":
-                tab_key = (self._page_ancestor(meta), control_key)
-                self._tab_capabilities[tab_key].add(ref)
-                touched_tabs.add(tab_key)
-                if item.aria_selected is True:
-                    self._tab_targets.setdefault(tab_key, meta.id)
-
             await self._resolve_capability(ref)
 
         # A newly observed selected tab or newly repeated navbar signature can
         # resolve controls captured in earlier states.
-        for tab_key in touched_tabs:
-            if tab_key in self._tab_targets:
-                for ref in tuple(self._tab_capabilities[tab_key]):
-                    await self._resolve_capability(ref)
         for global_key in touched_globals:
             refs = tuple(self._global_capabilities[global_key])
             if len({source_id for source_id, _ in refs}) >= 2:
@@ -987,12 +1315,6 @@ class Explorer:
         if capability is None:
             return
 
-        if capability.item.kind == "tab":
-            tab_key = (self._page_ancestor(source), capability.control_key)
-            self._tab_targets.setdefault(tab_key, destination.id)
-            for ref in tuple(self._tab_capabilities[tab_key]):
-                await self._resolve_capability(ref)
-
         global_key = capability.global_key
         if global_key is None or not self._is_global_capability(capability):
             return
@@ -1005,18 +1327,117 @@ class Explorer:
             return
         self._global_targets[global_key] = destination.id
 
+    async def _apply_navigation_disclosure(
+        self,
+        source: StateMeta,
+        pending: PendingAction,
+        observation: Observation,
+    ) -> int:
+        """Merge newly revealed shell routes into their owning page state."""
+        item = pending.candidate.interactable
+        before = {
+            (self._control_key(existing), existing.href, existing.label.strip().lower())
+            for existing in source.interactables
+        }
+        for discovered in observation.interactables:
+            self._annotate_interaction_policy(discovered)
+        revealed = [
+            discovered
+            for discovered in observation.interactables
+            if (
+                self._control_key(discovered),
+                discovered.href,
+                discovered.label.strip().lower(),
+            )
+            not in before
+        ]
+        if not revealed:
+            return 0
+
+        dependency = {
+            "selector": item.selector,
+            "label": item.label,
+            "role": item.role or ("link" if item.tag == "a" else "button"),
+            "href": item.href,
+            "control_key": self._control_key(item),
+            "locator": dict(item.locator),
+        }
+        for discovered in revealed:
+            if not discovered.href:
+                discovered.dependencies = [dependency]
+        source.interactables.extend(revealed)
+        detected_families, preserve_ids = self._observe_surface_families(observation)
+        analysis = analyze_state(
+            observation,
+            base_url=self._root_url,
+            preserve_item_ids=preserve_ids,
+        )
+        self._apply_surface_families(observation, analysis, detected_families)
+        self._enqueue_actions(
+            source,
+            analysis,
+            only_item_ids={discovered.item_id for discovered in revealed},
+        )
+        await self._register_transition_capabilities(source)
+        revealed_navigation = sum(
+            discovered.execution_policy == "navigate" for discovered in revealed
+        )
+        self._stats["navigation_links_revealed"] += revealed_navigation
+        return revealed_navigation
+
     async def _execute(self, page: Page, pending: PendingAction) -> None:
+        pending = self._prepare_pending(pending)
         source = pending.from_state
         item = pending.candidate.interactable
-        edge_key = (source.id, item.selector)
+        edge_key = (source.id, pending.action_key)
         if edge_key in self._edges_done:
+            self._record_action_outcome(pending, "known_state")
+            return
+        navigation_action = (
+            item.execution_policy == "navigate" and is_navigation_interactable(item)
+        )
+        local_probe = item.execution_policy == "probe_local" and probe_reason(item) is not None
+        global_probe_key: tuple[AuthContext, str] | None = None
+        if local_probe and self._is_persistent_local_control(item):
+            probe_key = self._global_key(source, item, None) or self._stable_hash(
+                source.auth_context.value,
+                item.kind,
+                item.label,
+                identity.strip_positional_selector(item.selector),
+                item.container_key,
+                length=24,
+            )
+            if probe_key is not None:
+                global_probe_key = (source.auth_context, probe_key)
+                if global_probe_key in self._global_probe_outcomes:
+                    self._stats["globally_deduplicated_probes"] += 1
+                    self._stats["repeated_probes_suppressed"] += 1
+                    self._item_outcome[(source.id, item.item_id)] = "skipped_duplicate"
+                    self._edges_done.add(edge_key)
+                    self._record_action_outcome(pending, "known_state")
+                    self._emit_action_finished(
+                        ActionOutcome.DEDUPED,
+                        f"Reused the persistent '{item.label}' probe outcome",
+                        from_state_id=source.id,
+                    )
+                    return
+        # Defense in depth: frontier construction should already enforce this.
+        if not navigation_action and not local_probe:
+            self._item_outcome[(source.id, item.item_id)] = "inventory_only"
+            self._edges_done.add(edge_key)
+            self._record_action_outcome(pending, "noop")
             return
 
         # Family evidence may have accumulated after this action was queued.
         # Resolve it again at pop time so ordering is deterministic and stale
         # candidate metadata never causes an eager skip.
-        family_candidate = self._family_registry.family_for_url(
-            item.href or "", base_url=source.url
+        family_candidate = (
+            self._family_registry.family_for_url(item.href, base_url=source.url)
+            if navigation_action
+            and item.href
+            and not self._is_global_chrome_item(item)
+            and not is_auth_entry(pending.candidate)
+            else None
         )
         family_pattern: str | None = None
         if family_candidate is not None:
@@ -1035,6 +1456,7 @@ class Explorer:
                 self._family_registry.mark_skipped(family_candidate, item.href or "")
                 self._edges_done.add(edge_key)
                 self._item_outcome[(source.id, item.item_id)] = "skipped_duplicate"
+                self._record_action_outcome(pending, "known_state")
                 self._sync_family_stats()
                 self._emit_action_finished(
                     ActionOutcome.DEDUPED,
@@ -1063,7 +1485,12 @@ class Explorer:
                 page_id = source.id
             destination = self._states[page_id]
             self._edges_done.add(edge_key)
-            self._item_outcome[(source.id, item.item_id)] = "explored"
+            self._item_outcome[(source.id, item.item_id)] = (
+                "noop" if destination.id == source.id else "known_state"
+            )
+            self._record_action_outcome(
+                pending, "noop" if destination.id == source.id else "known_state"
+            )
             if destination.id == source.id:
                 self._stats["noop_actions"] += 1
                 self._emit_action_finished(
@@ -1088,7 +1515,8 @@ class Explorer:
                 source, self._states[inferred_id], pending.candidate, via="inferred"
             )
             self._edges_done.add(edge_key)
-            self._item_outcome[(source.id, item.item_id)] = "explored"
+            self._item_outcome[(source.id, item.item_id)] = "known_state"
+            self._record_action_outcome(pending, "known_state")
             self._emit_action_finished(
                 ActionOutcome.DEDUPED,
                 f"Inferred '{item.label}' -> known s{self._states[inferred_id].index}",
@@ -1098,6 +1526,8 @@ class Explorer:
             return
 
         self._budget.note_action()
+        if local_probe:
+            self._stats["local_probes"] += 1
         self._actions_since_new += 1
         self._emit(
             ExplorerEvent(
@@ -1114,28 +1544,93 @@ class Explorer:
         )
 
         phase_started = time.perf_counter()
-        ensured = await self._ensure_at(page, source)
+        direct_get = bool(
+            navigation_action
+            and item.href
+            and is_same_origin(item.href, self._root_url)
+        )
+        ensured = True if direct_get else await self._ensure_at(page, source)
         self._record_timing("restore_seconds", phase_started)
         if not ensured:
-            self._stats["failed_actions"] += 1
+            self._item_outcome[(source.id, item.item_id)] = "replay_failed"
+            self._record_action_outcome(pending, "replay_failed")
             self._emit_action_finished(
-                ActionOutcome.FAILED,
+                ActionOutcome.REPLAY_FAILED,
                 f"Could not replay path to s{source.index}",
                 from_state_id=source.id,
             )
             return
 
-        if not await validate_interactable(page, item):
-            self._stats["failed_actions"] += 1
-            self._item_outcome[(source.id, item.item_id)] = "noop"
-            self._edges_done.add(edge_key)
-            self._emit_action_finished(
-                ActionOutcome.FAILED,
-                f"Dropped stale action {item.label!r}",
-                from_state_id=source.id,
-            )
-            return
+        if item.dependencies:
+            try:
+                for dependency in item.dependencies:
+                    await click_selector(
+                        page,
+                        dependency.get("selector"),
+                        timeout_ms=self._config.exploration.action_timeout_ms,
+                        label=dependency.get("label"),
+                        role=dependency.get("role"),
+                        href=dependency.get("href"),
+                        locator=dependency.get("locator"),
+                    )
+                    await stabilize(page, min(self._config.browser.stabilize_quiet_ms, 250))
+            except PlaywrightError:
+                self._item_outcome[(source.id, item.item_id)] = "replay_failed"
+                self._record_action_outcome(pending, "replay_failed")
+                self._emit_action_finished(
+                    ActionOutcome.REPLAY_FAILED,
+                    f"Could not restore prerequisites for {item.label!r}",
+                    from_state_id=source.id,
+                )
+                return
 
+        # Href navigation is performed directly and does not depend on a
+        # selector surviving an authenticated-shell or hydration change.
+        if not item.href and not await validate_interactable(page, item):
+            if pending.action_key not in self._stale_rebind_attempted:
+                self._stale_rebind_attempted.add(pending.action_key)
+                rebound = await rebind_interactable(
+                    page,
+                    item,
+                    max_elements=self._config.capture.max_interactables,
+                    max_inventory_elements=self._config.capture.max_inventory_controls,
+                )
+                if rebound is not None:
+                    self._annotate_interaction_policy(rebound)
+                    pending.candidate.interactable = rebound
+                    item = rebound
+                    navigation_action = (
+                        item.execution_policy == "navigate"
+                        and is_navigation_interactable(item)
+                    )
+                    local_probe = (
+                        item.execution_policy == "probe_local"
+                        and probe_reason(item) is not None
+                    )
+            if not item.href and not await validate_interactable(page, item):
+                self._item_outcome[(source.id, pending.candidate.interactable.item_id)] = "stale"
+                self._edges_done.add(edge_key)
+                self._record_action_outcome(pending, "stale")
+                self._emit_action_finished(
+                    ActionOutcome.STALE,
+                    f"Dropped stale action {item.label!r} after semantic rebind",
+                    from_state_id=source.id,
+                )
+                return
+
+        blocked_before = len(self._browser_session.blocked_mutations)
+        external_blocked_before = len(self._browser_session.blocked_probe_navigations)
+        guarded_click = local_probe or (navigation_action and not item.href)
+        if guarded_click:
+            self._browser_session.set_probe_guard(True, source_url=source.url)
+        local_marker_before: str | None = None
+        if local_probe and item.probe_reason != "navigation_disclosure":
+            with contextlib.suppress(PlaywrightError):
+                local_marker_before = await local_probe_marker(page)
+        if global_probe_key is not None:
+            # Claim the persistent control before executing it; the frontier is
+            # serial, so later copies can safely inherit this terminal outcome.
+            self._global_probe_outcomes[global_probe_key] = "performed"
         try:
             phase_started = time.perf_counter()
             await click_interactable(
@@ -1146,11 +1641,14 @@ class Explorer:
             )
             self._record_timing("action_seconds", phase_started)
         except PlaywrightError:
+            if guarded_click:
+                self._browser_session.set_probe_guard(False)
             self._record_timing("action_seconds", phase_started)
             self._current_state_id = None  # page state is now unknown
             self._stats["failed_actions"] += 1
-            self._item_outcome[(source.id, item.item_id)] = "explored"
+            self._item_outcome[(source.id, item.item_id)] = "failed"
             self._edges_done.add(edge_key)  # don't burn budget retrying a dead selector
+            self._record_action_outcome(pending, "failed")
             self._emit_action_finished(
                 ActionOutcome.FAILED,
                 f"Click failed on {item.label!r}",
@@ -1158,10 +1656,141 @@ class Explorer:
             )
             return
 
-        await self._absorb_popups(page)
         phase_started = time.perf_counter()
-        observation = await observe_page(page, self._config, auth_context=self._auth_context)
+        blocked_after = blocked_before
+        await self._absorb_popups(page)
+        if local_marker_before is not None:
+            local_marker_after: str | None = None
+            with contextlib.suppress(PlaywrightError):
+                await wait_for_local_mutation_quiet(page)
+                local_marker_after = await local_probe_marker(page)
+            blocked_after = len(self._browser_session.blocked_mutations)
+            blocked_mutation_count = blocked_after - blocked_before
+            external_blocked_count = (
+                len(self._browser_session.blocked_probe_navigations)
+                - external_blocked_before
+            )
+            if local_marker_after is not None and local_marker_after == local_marker_before:
+                if guarded_click:
+                    self._browser_session.set_probe_guard(False)
+                self._record_timing("observe_seconds", phase_started)
+                self._current_state_id = source.id
+                self._edges_done.add(edge_key)
+                if blocked_mutation_count > 0:
+                    self._stats["mutating_requests_blocked"] += blocked_mutation_count
+                    item.safety_category = "mutation_blocked"
+                    self._item_outcome[(source.id, item.item_id)] = "blocked"
+                    self._record_action_outcome(pending, "blocked")
+                    self._emit_action_finished(
+                        ActionOutcome.BLOCKED,
+                        f"Blocked a mutating request from '{item.label}'",
+                        from_state_id=source.id,
+                    )
+                elif external_blocked_count > 0:
+                    item.safety_category = "external"
+                    self._item_outcome[(source.id, item.item_id)] = "blocked"
+                    self._record_action_outcome(pending, "blocked")
+                    self._emit_action_finished(
+                        ActionOutcome.BLOCKED,
+                        f"Blocked external navigation from '{item.label}'",
+                        from_state_id=source.id,
+                    )
+                else:
+                    self._stats["noop_actions"] += 1
+                    self._item_outcome[(source.id, item.item_id)] = "noop"
+                    self._record_action_outcome(pending, "noop")
+                    self._emit_action_finished(
+                        ActionOutcome.NOOP,
+                        f"'{item.label}' changed nothing",
+                        from_state_id=source.id,
+                    )
+                return
+        try:
+            observation = await observe_page(
+                page, self._config, auth_context=self._auth_context
+            )
+        finally:
+            if guarded_click:
+                self._browser_session.set_probe_guard(False)
+                blocked_after = len(self._browser_session.blocked_mutations)
         self._record_timing("observe_seconds", phase_started)
+        blocked_mutation_count = blocked_after - blocked_before
+        if guarded_click and blocked_mutation_count > 0:
+            self._stats["mutating_requests_blocked"] += blocked_mutation_count
+        if item.probe_reason == "navigation_disclosure":
+            revealed = await self._apply_navigation_disclosure(
+                source, pending, observation
+            )
+            self._current_state_id = source.id
+            self._item_outcome[(source.id, item.item_id)] = (
+                "explored" if revealed else "noop"
+            )
+            self._edges_done.add(edge_key)
+            if revealed:
+                self._record_action_outcome(pending, "explored")
+                self._emit_action_finished(
+                    ActionOutcome.EXPLORED,
+                    f"'{item.label}' revealed {revealed} navigation link(s)",
+                    from_state_id=source.id,
+                    revealed_navigation_links=revealed,
+                )
+            else:
+                self._stats["noop_actions"] += 1
+                self._record_action_outcome(pending, "noop")
+                self._emit_action_finished(
+                    ActionOutcome.NOOP,
+                    f"'{item.label}' revealed no new navigation links",
+                    from_state_id=source.id,
+                )
+            return
+        if (
+            guarded_click
+            and blocked_mutation_count > 0
+            and not (
+                navigation_action
+                and observation.url_normalized != source.url_normalized
+                and is_same_origin(observation.snapshot.url, self._root_url)
+            )
+        ):
+            item.safety_category = "mutation_blocked"
+            self._item_outcome[(source.id, item.item_id)] = "blocked"
+            self._edges_done.add(edge_key)
+            await self._restore_probe_source(page, source)
+            self._record_action_outcome(pending, "blocked")
+            self._emit_action_finished(
+                ActionOutcome.BLOCKED,
+                f"Blocked a mutating request from '{item.label}'",
+                from_state_id=source.id,
+            )
+            return
+        if guarded_click and len(
+            self._browser_session.blocked_probe_navigations
+        ) > external_blocked_before:
+            item.safety_category = "external"
+            self._item_outcome[(source.id, item.item_id)] = "blocked"
+            self._edges_done.add(edge_key)
+            await self._restore_probe_source(page, source)
+            self._record_action_outcome(pending, "blocked")
+            self._emit_action_finished(
+                ActionOutcome.BLOCKED,
+                f"Blocked external navigation from '{item.label}'",
+                from_state_id=source.id,
+            )
+            return
+        if guarded_click and not is_same_origin(
+            observation.snapshot.url, self._root_url
+        ):
+            item.safety_category = "external"
+            self._item_outcome[(source.id, item.item_id)] = "blocked"
+            self._edges_done.add(edge_key)
+            await self._restore_probe_source(page, source)
+            self._record_action_outcome(pending, "blocked")
+            self._emit_action_finished(
+                ActionOutcome.BLOCKED,
+                f"Blocked external navigation from '{item.label}'",
+                from_state_id=source.id,
+            )
+            return
         if (
             observation.url_normalized == source.url_normalized
             and self._is_generic_expansion(item)
@@ -1171,19 +1800,37 @@ class Explorer:
             self._current_state_id = source.id
             self._item_outcome[(source.id, item.item_id)] = "noop"
             self._edges_done.add(edge_key)
+            if local_probe:
+                await self._restore_probe_source(page, source)
+            self._record_action_outcome(pending, "noop")
             self._emit_action_finished(
                 ActionOutcome.NOOP,
                 f"'{item.label}' is a generic expansion, not a durable state",
                 from_state_id=source.id,
             )
             return
-        if family_candidate is not None and family_pattern is not None:
+        observed_analysis = analyze_state(observation, base_url=self._root_url)
+        auth_redirect = (
+            self._auth_mode == AuthMode.LOGIN
+            and observed_analysis.state_type == StateType.AUTH_WALL
+        )
+        if family_candidate is not None and family_pattern is not None and auth_redirect:
+            # Login is a deferred checkpoint for this representative, not
+            # structural evidence against the route family.
+            deferred_key = f"{family_candidate.pattern}|{item.href or observation.snapshot.url}"
+            self._auth_deferred_family_actions[deferred_key] = pending
+            self._auth_deferred_family_action = next(
+                iter(self._auth_deferred_family_actions.values()), None
+            )
+            self._stats["auth_deferred_family_samples"] += 1
+            family_pattern = None
+        elif family_candidate is not None and family_pattern is not None:
             _old_status, new_status = self._family_registry.record_sample(
                 family_candidate, item.href or observation.snapshot.url, observation
             )
             self._sync_family_stats()
             if new_status == "confirmed":
-                self._adopt_confirmed_family(family_candidate)
+                await self._adopt_confirmed_family(family_candidate)
                 self._release_family_deferred(family_candidate)
             elif new_status == "rejected":
                 self._release_family_deferred(family_candidate, rejected=True)
@@ -1193,8 +1840,20 @@ class Explorer:
                 self._release_family_deferred(family_candidate)
             family_pattern = family_candidate.pattern if new_status == "confirmed" else None
         key = identity.key_for(observation)
-        existing_id = self._resolve_existing_state(observation, source, key)
-        if existing_id is None and family_pattern is not None:
+        existing_id = self._resolve_existing_state(
+            observation, source, key, local_probe=local_probe
+        )
+        parsed_item_url = tokenize_url(item.href or observation.snapshot.url)
+        exact_family_sample = bool(
+            family_candidate is not None
+            and parsed_item_url is not None
+            and parsed_item_url.url in family_candidate.samples
+        )
+        if (
+            existing_id is None
+            and family_pattern is not None
+            and not exact_family_sample
+        ):
             existing_id = self._family_template_target(observation, family_pattern)
 
         if existing_id == source.id:
@@ -1202,6 +1861,10 @@ class Explorer:
             self._stats["noop_actions"] += 1
             self._current_state_id = source.id
             self._item_outcome[(source.id, item.item_id)] = "noop"
+            self._edges_done.add(edge_key)
+            if local_probe:
+                await self._restore_probe_source(page, source)
+            self._record_action_outcome(pending, "noop")
             self._emit_action_finished(
                 ActionOutcome.NOOP,
                 f"'{item.label}' changed nothing",
@@ -1210,11 +1873,13 @@ class Explorer:
             return
 
         via = "performed"
-        if existing_id is not None:
+        destination_was_known = existing_id is not None
+        if destination_was_known:
             destination = self._states[existing_id]
             self._stats["dedup_hits"] += 1
             if family_pattern is not None and destination.route_family == family_pattern:
                 self._stats["family_dedup_hits"] += 1
+            self._record_action_outcome(pending, "known_state")
             self._emit_action_finished(
                 ActionOutcome.DEDUPED,
                 f"'{item.label}' led to known state s{destination.index}",
@@ -1235,6 +1900,7 @@ class Explorer:
                 enqueue_actions=pending.phase != 0,
             )
             self._actions_since_new = 0
+            self._record_action_outcome(pending, "new_state")
             self._emit_action_finished(
                 ActionOutcome.NEW_STATE,
                 f"'{item.label}' reached new state s{destination.index}",
@@ -1242,17 +1908,37 @@ class Explorer:
                 to_state_id=destination.id,
             )
 
+        if family_candidate is not None and exact_family_sample:
+            self._family_registry.record_sample_state(
+                family_candidate,
+                item.href or observation.snapshot.url,
+                destination.id,
+            )
+            if family_candidate.status == "confirmed":
+                await self._adopt_confirmed_family(family_candidate)
+            self._sync_family_stats()
+
         await self._add_edge(source, destination, pending.candidate, via=via)
         await self._learn_performed_capability(source, item, destination)
         self._edges_done.add(edge_key)
-        self._item_outcome[(source.id, item.item_id)] = "explored"
-        # A family merge leaves the browser on an alternate instance URL.
-        # Force replay before expanding the representative's actions.
+        self._item_outcome[(source.id, item.item_id)] = (
+            "known_state" if destination_was_known else "explored"
+        )
         self._current_state_id = (
             destination.id if observation.url_normalized == destination.url_normalized else None
         )
-        if self._current_state_id == destination.id:
+        if self._current_state_id == destination.id and not item.href:
             await self._validate_browser_back(page, source, destination)
+
+        if local_probe:
+            if pending.phase == 0:
+                self._enqueue_auth_discovery(destination, observed_analysis)
+            restored = await self._restore_probe_source(page, source)
+            if not restored:
+                self._stats["replay_failed_actions"] += 1
+                self._item_outcome[(source.id, item.item_id)] = "replay_failed"
+                self._action_ledger[pending.action_key] = "replay_failed"
+            return
 
         # Auth-wall gate: pause exploration if the destination is a login page.
         # This runs after recording the edge so the gate node is always visible.
@@ -1268,7 +1954,12 @@ class Explorer:
             )
 
     def _resolve_existing_state(
-        self, observation: Observation, source: StateMeta, key: identity.StateKey
+        self,
+        observation: Observation,
+        source: StateMeta,
+        key: identity.StateKey,
+        *,
+        local_probe: bool = False,
     ) -> str | None:
         """Layered match: identity index, then known top-level URL page.
 
@@ -1290,6 +1981,8 @@ class Explorer:
                 if known_auth is not None:
                     return known_auth
         if observation.url_normalized == source.url_normalized:
+            return None
+        if local_probe and self._same_route(observation.snapshot.url, source.url):
             return None
         if observation.snapshot.signals.modal_open:
             return None
@@ -1348,20 +2041,65 @@ class Explorer:
         return current.id
 
     @staticmethod
+    def _same_route(left: str, right: str) -> bool:
+        """Whether two URLs represent variants of one page route.
+
+        Query-only changes produced by filters/sorts belong to the page's
+        interaction layer, while a path change remains page navigation.
+        """
+        a, b = urlsplit(left), urlsplit(right)
+        return (
+            a.scheme.lower(),
+            a.netloc.lower(),
+            a.path.rstrip("/") or "/",
+        ) == (
+            b.scheme.lower(),
+            b.netloc.lower(),
+            b.path.rstrip("/") or "/",
+        )
+
+    @staticmethod
     def _substate_type(trigger: Interactable | None) -> StateType:
         """Subtype for a same-URL state change that isn't a modal."""
         if trigger is not None:
             if trigger.role == "tab" or trigger.kind == "tab":
-                return StateType.TAB
+                return StateType.PAGE_VARIANT
             label = trigger.label.lower()
             if (
                 trigger.tag == "summary"
                 or trigger.kind in ("disclosure", "menuitem")
                 or trigger.aria_expanded is not None
-                or re.search(r"\b(menu|settings?|account|profile|filter|sort)\b", label)
+                or re.search(r"\b(menu|settings?|account|profile)\b", label)
             ):
                 return StateType.DROPDOWN
+            if (
+                trigger.kind in {"select", "toggle", "search"}
+                or trigger.probe_reason in {
+                    "focus_search",
+                    "labelled_structural_button",
+                    "table_control",
+                }
+                or re.search(
+                    r"\b(filter|sort|search|chart|metrics?|table|categor(?:y|ies)|layout|view)\b",
+                    label,
+                )
+            ):
+                return StateType.PAGE_VARIANT
         return StateType.DROPDOWN
+
+    @staticmethod
+    def _has_page_variant_intent(trigger: Interactable | None) -> bool:
+        if trigger is None:
+            return False
+        if trigger.kind in {"tab", "select", "toggle", "search"}:
+            return True
+        return bool(
+            re.search(
+                r"\b(filter|sort|search|chart|metrics?|table|categor(?:y|ies)|layout|view)\b",
+                trigger.label,
+                re.I,
+            )
+        )
 
     async def _register_state(
         self,
@@ -1378,6 +2116,8 @@ class Explorer:
         family: dict | None = None,
         page_depth_override: int | None = None,
     ) -> StateMeta:
+        for item in observation.interactables:
+            self._annotate_interaction_policy(item)
         detected_families, preserve_item_ids = self._observe_surface_families(observation)
         analysis = analyze_state(
             observation,
@@ -1406,7 +2146,22 @@ class Explorer:
             return_state_id = source.id
             page_depth = source.page_depth
             substate_depth = source.substate_depth + 1
-        elif source is not None and observation.url_normalized == source.url_normalized:
+        elif source is not None and (
+            observation.url_normalized == source.url_normalized
+            or (
+                trigger is not None
+                and trigger.execution_policy == "probe_local"
+                and self._same_route(observation.snapshot.url, source.url)
+            )
+            or (
+                self._has_page_variant_intent(trigger)
+                and (
+                    self._same_route(observation.snapshot.url, source.url)
+                    or self._family_template_key(observation)
+                    == source.family_template_key
+                )
+            )
+        ):
             parent_state_id = self._page_ancestor(source)
             return_state_id = source.id
             page_depth = source.page_depth
@@ -1468,6 +2223,24 @@ class Explorer:
             row.label = naming["text"]
             row.exploration = {
                 "auth_context": observation.auth_context.value,
+                "route_surface_key": self._stable_hash(
+                    observation.auth_context.value,
+                    observation.url_normalized,
+                    length=24,
+                ),
+                "page_anchor_id": parent_state_id or state.state_id,
+                "variant_kind": (
+                    "page"
+                    if parent_state_id is None
+                    else "page_variant"
+                    if state_type in {StateType.PAGE_VARIANT, StateType.TAB}
+                    else "overlay"
+                ),
+                **(
+                    {"inherited_surface_state_id": parent_state_id}
+                    if parent_state_id is not None
+                    else {}
+                ),
                 "page_role": page_role.value,
                 "page_depth": page_depth,
                 "substate_depth": substate_depth,
@@ -1509,6 +2282,24 @@ class Explorer:
             nav_capabilities=nav_capabilities,
             surface_families=surface_families,
             family_template_key=self._family_template_key(observation),
+            llm_context={
+                "url": observation.snapshot.url,
+                "title": observation.snapshot.title,
+                **observation.snapshot.text_evidence,
+                "controls": [
+                    {
+                        "item_id": item.item_id,
+                        "label": item.label,
+                        "component": item.component_label,
+                        "context": item.context_label,
+                        "icon": item.icon_label,
+                        "role": item.role,
+                        "kind": item.kind,
+                        "controls": item.aria_controls,
+                    }
+                    for item in observation.interactables[:100]
+                ],
+            },
         )
         self._states[meta.id] = meta
         self._identity.add(key or identity.key_for(observation), meta.id)
@@ -1527,7 +2318,32 @@ class Explorer:
                 self._family_template_key(observation), meta.id
             )
         self._stats["states"] += 1
+        if parent_state_id is None:
+            self._stats["page_states"] += 1
+        else:
+            self._stats["substates"] += 1
+        self._stats["surface_items_observed"] += len(meta.interactables)
+        for item in meta.interactables:
+            if item.interaction_scope == "page_navigation":
+                continue
+            self._interaction_capabilities_seen.add(
+                (
+                    observation.auth_context.value,
+                    observation.url_normalized,
+                    item.control_key or item.item_id,
+                )
+            )
+            if item.locator.get("duplicate_id_ancestor"):
+                self._stats["selector_collisions_resolved"] += 1
+            self._stats["responsive_owners_collapsed"] += int(
+                item.locator.get("responsive_alias_count", 0)
+            )
+        self._stats["interaction_capabilities"] = len(
+            self._interaction_capabilities_seen
+        )
+        self._stats["interaction_nodes"] = self._stats["interaction_capabilities"]
         self._stats["actions_denied"] += len(analysis.denied)
+        self._stats["denied_actions"] = self._stats["actions_denied"]
 
         if self._text_evidence_sink is not None:
             result = self._text_evidence_sink(
@@ -1565,6 +2381,12 @@ class Explorer:
                     "page_role": page_role.value,
                     "name": naming,
                     "route_family": route_family,
+                    "route_surface_key": row.exploration.get("route_surface_key"),
+                    "page_anchor_id": row.exploration.get("page_anchor_id"),
+                    "variant_kind": row.exploration.get("variant_kind"),
+                    "inherited_surface_state_id": row.exploration.get(
+                        "inherited_surface_state_id"
+                    ),
                     "auth_context": observation.auth_context.value,
                     "page_depth": page_depth,
                     "substate_depth": substate_depth,
@@ -1585,8 +2407,7 @@ class Explorer:
             self._enqueue_actions(meta, analysis)
         return meta
 
-    @staticmethod
-    def _surface_summary(meta: StateMeta) -> list[dict]:
+    def _surface_summary(self, meta: StateMeta) -> list[dict]:
         """Compact surface-item list for the live state_discovered payload."""
         return [
             {
@@ -1602,6 +2423,12 @@ class Explorer:
                 "aria_haspopup": item.aria_haspopup,
                 "aria_pressed": item.aria_pressed,
                 "checked": item.checked,
+                "tag": item.tag,
+                "role": item.role,
+                "href": item.href,
+                "placeholder": item.placeholder,
+                "name": item.name,
+                "associated_label": item.associated_label,
                 "input_type": item.input_type,
                 "required": item.required,
                 "autocomplete": item.autocomplete,
@@ -1609,7 +2436,16 @@ class Explorer:
                 "form_method": item.form_method,
                 "control_key": item.control_key,
                 "container_key": item.container_key,
-                "status": ("blocked" if item.item_id in meta.blocked_ids else "pending"),
+                "container_type": item.container_type,
+                "controlled_surface": item.controlled_surface,
+                "component_key": item.component_key,
+                "component_label": item.component_label,
+                "icon_label": item.icon_label,
+                "probe_reason": item.probe_reason,
+                "interaction_scope": item.interaction_scope,
+                "execution_policy": item.execution_policy,
+                "safety_category": item.safety_category,
+                "status": self._final_status(meta, item),
             }
             for item in meta.interactables
         ]
@@ -1625,6 +2461,10 @@ class Explorer:
         if (
             observation.url_normalized != source.url_normalized
             and not observation.snapshot.signals.modal_open
+            and not (
+                item.execution_policy == "probe_local"
+                and self._same_route(observation.snapshot.url, source.url)
+            )
         ):
             return [ActionStep(kind="goto", url=observation.snapshot.url)]
         return [
@@ -1636,34 +2476,78 @@ class Explorer:
                 role=item.role or ("link" if item.tag == "a" else "button"),
                 href=item.href,
                 control_key=item.control_key or None,
+                locator=dict(item.locator),
             ),
         ]
 
-    def _enqueue_actions(self, meta: StateMeta, analysis: StateAnalysis) -> None:
-        if meta.page_depth >= self._config.budgets.max_depth:
-            meta.representative_ids = set()
-            return
-        if meta.substate_depth >= self._config.exploration.max_substate_depth:
-            meta.representative_ids = set()
-            return
+    def _enqueue_actions(
+        self,
+        meta: StateMeta,
+        analysis: StateAnalysis,
+        *,
+        only_item_ids: set[str] | None = None,
+    ) -> None:
         if meta.state_type in _TERMINAL_TYPES:
             meta.representative_ids = set()
             return
         if meta.state_type in _GATE_TYPES:
             meta.representative_ids = set()
             return  # expanded only after auth_gate resolution via _handle_auth_wall
+        allow_navigation = meta.page_depth < self._config.budgets.max_depth
+        allow_local = meta.substate_depth < self._config.exploration.max_substate_depth
         eligible: list[ActionCandidate] = []
-        parent_selector_shapes: set[str] = set()
+        local_eligible: list[ActionCandidate] = []
+        parent_control_keys: set[str] = set()
         if meta.parent_state_id:
             parent = self._states.get(meta.parent_state_id)
             if parent is not None:
-                parent_selector_shapes = {
-                    identity.strip_positional_selector(item.selector)
+                parent_control_keys = {
+                    self._control_key(item)
                     for item in parent.interactables
                 }
         seen_semantic_actions: set[tuple[str, str | None]] = set()
-        for candidate in analysis.safe:
+        click_only_semantic_counts: dict[tuple[str, str | None], int] = defaultdict(int)
+        # Prefer a real href owner, then a custom semantic link, over an
+        # overlapping empty visual anchor with the same label.
+        discovery_order = sorted(
+            (
+                candidate
+                for candidate in analysis.safe
+                if only_item_ids is None
+                or candidate.interactable.item_id in only_item_ids
+            ),
+            key=lambda candidate: (
+                2
+                if candidate.interactable.href
+                else 1
+                if candidate.interactable.role == "link"
+                and candidate.interactable.tag != "a"
+                else 0
+            ),
+            reverse=True,
+        )
+        for candidate in discovery_order:
             item = candidate.interactable
+            if item.execution_policy == "probe_local":
+                if not allow_local:
+                    self._item_outcome[(meta.id, item.item_id)] = "inventory_only"
+                    continue
+                if (
+                    parent_control_keys
+                    and self._control_key(item) in parent_control_keys
+                    and not item.in_modal
+                    and item.region != "modal"
+                ):
+                    self._item_outcome[(meta.id, item.item_id)] = "skipped_duplicate"
+                    continue
+                candidate.score = score_action(candidate, visited_urls=self._visited_urls)
+                if item.aria_controls or item.aria_haspopup or item.aria_expanded is not None:
+                    candidate.score += 20
+                local_eligible.append(candidate)
+                continue
+            if item.execution_policy != "navigate" or not allow_navigation:
+                self._item_outcome[(meta.id, item.item_id)] = "inventory_only"
+                continue
             target_hint = self._target_hint(item)
             known_target = (
                 self._known_target_id(meta.auth_context, target_hint)
@@ -1678,7 +2562,7 @@ class Explorer:
                 continue
             if (
                 self._is_global_chrome_item(item)
-                and meta.depth > 0
+                and meta.page_depth > 0
                 and meta.page_role != PageRole.HOME
                 and not is_auth_entry(candidate)
             ):
@@ -1711,13 +2595,23 @@ class Explorer:
                 "modal",
             }:
                 continue
-            semantic_key = (item.label.strip().lower(), item.region)
-            if semantic_key in seen_semantic_actions and candidate.family_pattern is None:
+            semantic_key = (self._control_key(item), item.href)
+            if (
+                semantic_key in seen_semantic_actions
+                and candidate.family_pattern is None
+                and not (
+                    item.execution_policy == "navigate"
+                    and not item.href
+                    and click_only_semantic_counts[semantic_key] < 2
+                )
+            ):
                 continue
             seen_semantic_actions.add(semantic_key)
+            if item.execution_policy == "navigate" and not item.href:
+                click_only_semantic_counts[semantic_key] += 1
             if (
-                parent_selector_shapes
-                and identity.strip_positional_selector(item.selector) in parent_selector_shapes
+                parent_control_keys
+                and self._control_key(item) in parent_control_keys
                 and not (
                     (item.kind == "tab" and meta.state_type == StateType.TAB)
                     or item.in_modal
@@ -1729,13 +2623,16 @@ class Explorer:
             candidate.score = score_action(candidate, visited_urls=self._visited_urls)
             eligible.append(candidate)
         ranked = sorted(eligible, key=lambda c: c.score, reverse=True)
-        top = ranked[: self._config.exploration.max_actions_per_state]
+        local_ranked = sorted(local_eligible, key=lambda c: c.score, reverse=True)
+        local_top = local_ranked[: self._config.exploration.max_local_actions_per_state]
+        nav_cap = self._config.exploration.max_actions_per_state
+        top = list(ranked) if nav_cap is None else ranked[:nav_cap]
         # Always reserve a slot for a sign-in/sign-up affordance when one exists.
         auth_pick = next((c for c in ranked if is_auth_entry(c)), None)
         if auth_pick and auth_pick not in top:
-            top = [auth_pick, *[c for c in top if c is not auth_pick]][
-                : self._config.exploration.max_actions_per_state
-            ]
+            top = [auth_pick, *[c for c in top if c is not auth_pick]]
+            if nav_cap is not None:
+                top = top[:nav_cap]
         # A collection surface should sample one repeated entity family even
         # when filters and navigation links fill the top-K slots.
         family_pick = next((c for c in ranked if c.family_pattern), None)
@@ -1759,7 +2656,9 @@ class Explorer:
                 None,
             )
             if return_pick and return_pick not in top:
-                top = [return_pick, *top][: self._config.exploration.max_actions_per_state]
+                top = [return_pick, *top]
+                if nav_cap is not None:
+                    top = top[:nav_cap]
         else:
             return_pick = None
 
@@ -1767,14 +2666,28 @@ class Explorer:
         # even when ordinary ranking would place filters or chrome above them.
         sample_picks = []
         for candidate in ranked:
-            family = self._family_registry.family_for_url(
-                candidate.interactable.href or "", base_url=meta.url
+            item = candidate.interactable
+            family = (
+                self._family_registry.family_for_url(item.href, base_url=meta.url)
+                if item.href
+                and not self._is_global_chrome_item(item)
+                and not is_auth_entry(candidate)
+                else None
             )
             if family is not None and self._family_registry.should_sample(
-                family, candidate.interactable.href or ""
+                family, item.href or ""
             ):
                 sample_picks.append(candidate)
         required = [*sample_picks]
+        if meta.page_depth == 0:
+            global_picks = [
+                candidate for candidate in ranked
+                if self._is_global_chrome_item(candidate.interactable)
+            ]
+            global_cap = self._config.exploration.max_global_navigation_actions
+            if global_cap is not None:
+                global_picks = global_picks[:global_cap]
+            required = [*global_picks, *required]
         if auth_pick is not None:
             required.insert(0, auth_pick)
         if return_pick is not None:
@@ -1783,27 +2696,41 @@ class Explorer:
         for candidate in [*required, *top, *ranked]:
             if candidate not in ordered:
                 ordered.append(candidate)
-        top = ordered[: max(self._config.exploration.max_actions_per_state, len(required))]
+        top = (
+            ordered
+            if nav_cap is None
+            else ordered[: max(nav_cap, len(required))]
+        )
 
-        queued_ids = {c.interactable.item_id for c in top}
+        queued_ids = {c.interactable.item_id for c in [*top, *local_top]}
         deferred_ids: set[str] = set()
         for candidate in eligible:
             item_id = candidate.interactable.item_id
             if item_id not in queued_ids:
-                family = self._family_registry.family_for_url(
-                    candidate.interactable.href or "", base_url=meta.url
+                item = candidate.interactable
+                family = (
+                    self._family_registry.family_for_url(item.href, base_url=meta.url)
+                    if item.href
+                    and not self._is_global_chrome_item(item)
+                    and not is_auth_entry(candidate)
+                    else None
                 )
                 if family is not None and family.status == "provisional":
                     journey_key = (
                         _journey_slug(candidate.interactable.label)
-                        if meta.depth == 0
+                        if meta.page_depth == 0
                         else meta.journey_key
                     )
-                    action = PendingAction(
+                    action = self._prepare_pending(PendingAction(
                         from_state=meta,
                         candidate=candidate,
                         journey_key=journey_key,
-                    )
+                        phase=1,
+                        required=self._family_registry.should_sample(
+                            family, candidate.interactable.href or ""
+                        ),
+                        obligation_kind="family_representative",
+                    ))
                     self._family_deferred[family.pattern].append(action)
                     self._family_registry.mark_deferred(family, candidate.interactable.href or "")
                     deferred_ids.add(item_id)
@@ -1813,17 +2740,65 @@ class Explorer:
                             family, candidate.interactable.href or ""
                         )
                     self._item_outcome.setdefault((meta.id, item_id), "skipped_duplicate")
-        meta.representative_ids = queued_ids | deferred_ids
+        if only_item_ids is None:
+            meta.representative_ids = queued_ids | deferred_ids
+        else:
+            meta.representative_ids.update(queued_ids | deferred_ids)
         self._sync_family_stats()
         for candidate in top:
             journey_key = meta.journey_key
-            if meta.depth == 0:
+            if meta.page_depth == 0:
                 journey_key = _journey_slug(candidate.interactable.label)
-            self._frontier.push(
+            item = candidate.interactable
+            family = (
+                self._family_registry.family_for_url(item.href, base_url=meta.url)
+                if item.href and not self._is_global_chrome_item(item)
+                else None
+            )
+            family_sample = bool(
+                family is not None
+                and self._family_registry.should_sample(family, item.href or "")
+            )
+            global_required = self._is_global_chrome_item(item)
+            self._queue_action(
                 PendingAction(
                     from_state=meta,
                     candidate=candidate,
                     journey_key=journey_key,
+                    phase=(
+                        1
+                        if self._is_global_chrome_item(candidate.interactable)
+                        or (
+                            candidate.interactable.href
+                            and (
+                                family := self._family_registry.family_for_url(
+                                    candidate.interactable.href, base_url=meta.url
+                                )
+                            ) is not None
+                            and self._family_registry.should_sample(
+                                family, candidate.interactable.href
+                            )
+                        )
+                        else 2
+                    ),
+                    required=global_required or family_sample,
+                    obligation_kind=(
+                        "family_representative" if family_sample else "primary_navigation"
+                        if global_required else None
+                    ),
+                )
+            )
+        for candidate in local_top:
+            disclosure = candidate.interactable.probe_reason == "navigation_disclosure"
+            self._queue_action(
+                PendingAction(
+                    from_state=meta,
+                    candidate=candidate,
+                    journey_key=meta.journey_key,
+                    phase=1 if disclosure else 3,
+                    lane="disclosure" if disclosure else "local",
+                    required=disclosure,
+                    obligation_kind="navigation_disclosure" if disclosure else None,
                 )
             )
 
@@ -1832,31 +2807,77 @@ class Explorer:
         ranked: list[ActionCandidate] = []
         revealers: list[ActionCandidate] = []
         for candidate in analysis.safe:
+            item = candidate.interactable
             candidate.score = score_action(candidate, visited_urls=self._visited_urls)
-            if is_auth_entry(candidate):
+            if item.execution_policy == "navigate" and is_auth_entry(candidate):
                 ranked.append(candidate)
-            else:
-                item = candidate.interactable
+            elif item.execution_policy == "probe_local":
                 label = item.label.lower()
                 if (
                     item.region in {"nav", "header"}
                     and item.kind in {"button", "menuitem", "disclosure"}
-                    and any(word in label for word in ("menu", "account", "profile"))
+                    and any(
+                        word in label
+                        for word in ("menu", "account", "profile", "avatar", "user")
+                    )
                 ):
                     revealers.append(candidate)
-        picks = sorted(ranked, key=lambda c: c.score, reverse=True)
+            else:
+                self._item_outcome.setdefault(
+                    (meta.id, item.item_id), "inventory_only"
+                )
+        def auth_priority(candidate: ActionCandidate) -> tuple[int, float]:
+            path = urlsplit(candidate.interactable.href or "").path.lower()
+            # Map registration/recovery boundaries before entering the login
+            # gate, otherwise authentication replaces the guest header.
+            registration = bool(
+                re.search(
+                    r"/(sign-?up|register|create-account)(?:/|\.html?$|$)", path
+                )
+            )
+            recovery = bool(
+                re.search(r"/(forgot|recover|reset-password)(?:/|\.html?$|$)", path)
+            )
+            return (0 if registration or recovery else 1, -candidate.score)
+
+        picks = sorted(ranked, key=auth_priority)
         if not picks:
             picks = sorted(revealers, key=lambda c: c.score, reverse=True)[
                 : self._config.exploration.auth_discovery_action_cap
             ]
+        # Frontier score is otherwise allowed to reorder one auth boundary
+        # ahead of another. Preserve registration/recovery-before-login order.
+        for index, candidate in enumerate(picks):
+            candidate.score = 10_000.0 - index
         meta.representative_ids = {c.interactable.item_id for c in picks}
         for candidate in picks:
-            self._frontier.push(
+            item = candidate.interactable
+            path = urlsplit(item.href or "").path.lower()
+            maps_guest_auth_boundary = bool(
+                re.search(
+                    r"/(sign-?up|register|create-account|forgot|recover|reset-password)"
+                    r"(?:/|\.html?$|$)",
+                    path,
+                )
+            )
+            self._queue_action(
                 PendingAction(
                     from_state=meta,
                     candidate=candidate,
                     journey_key="authentication",
-                    phase=0,
+                    phase=(
+                        0
+                        if maps_guest_auth_boundary
+                        or item.execution_policy == "probe_local"
+                        else 1
+                    ),
+                    lane=(
+                        "local"
+                        if item.execution_policy == "probe_local"
+                        else "navigation"
+                    ),
+                    required=True,
+                    obligation_kind="auth_discovery",
                 )
             )
 
@@ -1872,18 +2893,24 @@ class Explorer:
     async def _handle_auth_wall(self, page: Page, meta: StateMeta) -> StateMeta | None:
         """Authenticate, retrying the checkpoint until success or explicit skip."""
         autofill_attempted = False
+        resume_authorized = False
         while True:
             observation: Observation | None = None
             autofill_submitted = False
-            if self._credentials is not None:
+            if self._credentials is not None and resume_authorized:
                 autofill_attempted = True
+                resume_authorized = False
                 try:
                     auth_page_url = page.url
-                    submitted = await autofill_auth_form(
-                        page,
-                        self._credentials,
-                        timeout_ms=self._config.exploration.action_timeout_ms,
-                    )
+                    self._browser_session.set_auth_submission_allowed(True)
+                    try:
+                        submitted = await autofill_auth_form(
+                            page,
+                            self._credentials,
+                            timeout_ms=self._config.exploration.action_timeout_ms,
+                        )
+                    finally:
+                        self._browser_session.set_auth_submission_allowed(False)
                     autofill_submitted = submitted
                     if submitted:
                         with contextlib.suppress(PlaywrightError):
@@ -1913,7 +2940,7 @@ class Explorer:
                     observation = None
 
             if observation is not None and self._auth_succeeded(observation, meta):
-                return await self._register_authenticated_state(observation, meta)
+                return await self._register_authenticated_state(page, observation, meta)
 
             self._emit(
                 ExplorerEvent(
@@ -1937,7 +2964,14 @@ class Explorer:
             if self._auth_gate_hook is None:
                 return None
 
-            decision, new_credentials = await self._auth_gate_hook(meta.id, meta.url)
+            budget = getattr(self, "_budget", None)
+            if budget is not None:
+                budget.pause_for_auth()
+            try:
+                decision, new_credentials = await self._auth_gate_hook(meta.id, meta.url)
+            finally:
+                if budget is not None:
+                    budget.resume_from_auth()
             if new_credentials is not None:
                 self._credentials = new_credentials
             if decision == "skip":
@@ -1952,7 +2986,8 @@ class Explorer:
             except Exception:  # noqa: BLE001
                 observation = None
             if observation is not None and self._auth_succeeded(observation, meta):
-                return await self._register_authenticated_state(observation, meta)
+                return await self._register_authenticated_state(page, observation, meta)
+            resume_authorized = True
             autofill_attempted = False
 
     @staticmethod
@@ -1966,22 +3001,151 @@ class Explorer:
         return bool(_AUTH_SUCCESS.search(observation.snapshot.visible_text)) or changed_page
 
     async def _register_authenticated_state(
-        self, observation: Observation, source: StateMeta
+        self, page: Page, observation: Observation, source: StateMeta
     ) -> StateMeta:
         self._auth_context = AuthContext.AUTHENTICATED
         observation = with_auth_context(observation, AuthContext.AUTHENTICATED)
-        # All guest candidates are stale once the site's header/session changes.
+        # Hold the guest frontier while the authenticated shell is rebuilt.
+        # Its direct route targets are rebased afterwards instead of discarded.
+        guest_pending = self._frontier.drain()
         self._frontier = Frontier()
+
+        deferred_actions = list(self._auth_deferred_family_actions.values())
+        if not deferred_actions and self._auth_deferred_family_action is not None:
+            deferred_actions = [self._auth_deferred_family_action]
+        self._auth_deferred_family_actions.clear()
+        self._auth_deferred_family_action = None
+        route_family: str | None = None
+        matched_deferred: tuple[PendingAction, FamilyCandidate] | None = None
+        for deferred in deferred_actions:
+            item = deferred.candidate.interactable
+            candidate = (
+                self._family_registry.family_for_url(item.href, base_url=deferred.from_state.url)
+                if item.href
+                else None
+            )
+            if (
+                candidate is not None
+                and item.href
+                and matches_template(item.href, candidate.pattern)
+                and matches_template(observation.snapshot.url, candidate.pattern)
+            ):
+                _old_status, new_status = self._family_registry.record_sample(
+                    candidate, item.href, observation
+                )
+                self._sync_family_stats()
+                if new_status == "confirmed":
+                    await self._adopt_confirmed_family(candidate)
+                    self._release_family_deferred(candidate)
+                    route_family = candidate.pattern
+                elif new_status == "rejected":
+                    self._release_family_deferred(candidate, rejected=True)
+                else:
+                    self._release_family_deferred(candidate)
+                matched_deferred = (deferred, candidate)
+            else:
+                # The provider ignored its return target. Retry this safe GET
+                # route after reseeding instead of treating it as divergence.
+                guest_pending.append(deferred)
+
+        # Family validation may have released more guest actions.
+        guest_pending.extend(self._frontier.drain())
+        self._frontier = Frontier()
+        returned_to_root = self._same_route(observation.snapshot.url, self._root_url)
         post_auth = await self._register_state(
             observation,
             depth=source.depth + 1,
             path=[ActionStep(kind="goto", url=observation.snapshot.url)],
             key=identity.key_for(observation),
             source=source,
+            route_family=route_family,
             journey_key="authentication",
-            page_depth_override=0,
+            page_depth_override=0 if returned_to_root else None,
         )
+        if matched_deferred is not None:
+            deferred_action, candidate = matched_deferred
+            self._family_registry.record_sample_state(
+                candidate,
+                deferred_action.candidate.interactable.href or observation.snapshot.url,
+                post_auth.id,
+            )
+            if candidate.status == "confirmed":
+                await self._adopt_confirmed_family(candidate)
+            self._record_action_outcome(deferred_action, "new_state")
+
+        auth_root = post_auth
+        if not returned_to_root:
+            await page.goto(self._root_url)
+            root_observation = await observe_page(
+                page, self._config, auth_context=AuthContext.AUTHENTICATED
+            )
+            root_key = identity.key_for(root_observation)
+            existing_root_id = self._identity.find(root_key)
+            if existing_root_id is None:
+                auth_root = await self._register_state(
+                    root_observation,
+                    depth=post_auth.depth + 1,
+                    path=[ActionStep(kind="goto", url=root_observation.snapshot.url)],
+                    key=root_key,
+                    source=post_auth,
+                    journey_key="root",
+                    page_depth_override=0,
+                )
+            else:
+                auth_root = self._states[existing_root_id]
+            if auth_root.id != post_auth.id:
+                await self._add_auth_reseed_edge(post_auth, auth_root)
+
+        auth_root_hrefs = {
+            normalize_url(item.href)
+            for item in auth_root.interactables
+            if item.href and is_same_origin(item.href, self._root_url)
+        }
+        rebased_urls: set[str] = set()
+        for pending in guest_pending:
+            item = pending.candidate.interactable
+            self._item_outcome.setdefault(
+                (pending.from_state.id, item.item_id), "skipped_duplicate"
+            )
+            if (
+                item.execution_policy != "navigate"
+                or not item.href
+                or not is_same_origin(item.href, self._root_url)
+                or is_auth_entry(pending.candidate)
+                or self._is_peripheral_action(item)
+            ):
+                continue
+            target = normalize_url(item.href)
+            if target in auth_root_hrefs or target in rebased_urls:
+                continue
+            rebased_urls.add(target)
+            self._queue_action(
+                PendingAction(
+                    from_state=auth_root,
+                    candidate=pending.candidate,
+                    journey_key=pending.journey_key,
+                    phase=1 if self._is_global_chrome_item(item) else pending.phase,
+                    required=pending.required,
+                    obligation_kind=pending.obligation_kind,
+                )
+            )
+
+        # Rebase still-provisional family representatives as well; they are
+        # not currently in the frontier but must keep their sampling schedule.
+        for pattern, actions in list(self._family_deferred.items()):
+            self._family_deferred[pattern] = [
+                PendingAction(
+                    from_state=auth_root,
+                    candidate=action.candidate,
+                    journey_key=action.journey_key,
+                    phase=1,
+                    required=action.required,
+                    obligation_kind=action.obligation_kind,
+                )
+                for action in actions
+            ]
         self._actions_since_new = 0
+        self._current_state_id = auth_root.id
         self._emit(
             ExplorerEvent(
                 EventType.AUTH_GATE,
@@ -2029,6 +3193,28 @@ class Explorer:
             evidence={"mode": "user_auth", "validated": True},
         )
 
+    async def _add_auth_reseed_edge(
+        self, source: StateMeta, destination: StateMeta
+    ) -> None:
+        """Record the deliberate authenticated-root revisit."""
+        await self._upsert_transition(
+            source,
+            destination,
+            capability_id="auth-reseed",
+            action_type="auth_reseed",
+            label="Revisit authenticated root",
+            selector="auth:reseed",
+            element_text=None,
+            confidence=1.0,
+            collapsed_count=1,
+            via="auth_reseed",
+            surface_item_id=None,
+            transition_kind="auth_reseed",
+            scope="global",
+            reversible=False,
+            evidence={"mode": "auth_reseed", "validated": True},
+        )
+
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -2049,6 +3235,7 @@ class Explorer:
                         label=step.label,
                         role=step.role,
                         href=step.href,
+                        locator=step.locator,
                     )
                 await stabilize(page, self._config.browser.stabilize_quiet_ms)
         except PlaywrightError:
@@ -2056,6 +3243,11 @@ class Explorer:
             return False
         self._current_state_id = target.id
         return True
+
+    async def _restore_probe_source(self, page: Page, source: StateMeta) -> bool:
+        """Replay the exact source after a bounded local-control probe."""
+        self._current_state_id = None
+        return await self._ensure_at(page, source)
 
     async def _validate_browser_back(
         self, page: Page, source: StateMeta, destination: StateMeta
@@ -2244,7 +3436,7 @@ class Explorer:
             "to": destination.id,
             "action": action_type,
             "label": effective_label,
-            "selector": selector,
+            "selector": previous.get("selector", selector) if previous else selector,
             "element_text": element_text,
             "confidence": max(confidence, float(previous.get("confidence", 0)) if previous else 0),
             "collapsed_count": max(
@@ -2260,12 +3452,33 @@ class Explorer:
         }
         if previous == record:
             return
-        self._edge_records[edge_id] = record
 
         phase_started = time.perf_counter()
         async with self._sessions() as session:
             row = await session.get(db.Edge, edge_id)
             if row is None:
+                # Graph-v4 uses ``transition_key`` as the semantic identity,
+                # but existing databases retain the original selector-based
+                # uniqueness constraint. Two distinct controls can legitimately
+                # reuse one generated CSS selector after hydration. Preserve
+                # both semantic edges with a deterministic, CSS-valid comment
+                # discriminator instead of letting that compatibility index
+                # abort the entire run.
+                storage_selector = selector
+                legacy_collision = (
+                    await session.execute(
+                        select(db.Edge).where(
+                            db.Edge.run_id == self._run_id,
+                            db.Edge.from_state_id == source.id,
+                            db.Edge.selector == selector,
+                            db.Edge.action_type == action_type,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if legacy_collision is not None:
+                    storage_selector = (
+                        f"{selector}/*flowstate-edge:{transition_key[:12]}*/"
+                    )
                 row = db.Edge(
                     id=edge_id,
                     run_id=self._run_id,
@@ -2273,10 +3486,11 @@ class Explorer:
                     to_state_id=destination.id,
                     action_type=action_type,
                     label=effective_label,
-                    selector=selector,
+                    selector=storage_selector,
                     selector_strategy="css",
                 )
                 session.add(row)
+                record["selector"] = storage_selector
             row.label = effective_label
             row.from_state_id = source.id
             row.to_state_id = destination.id
@@ -2293,12 +3507,15 @@ class Explorer:
             row.provenance = provenance
             row.evidence = evidence_rows
             await session.commit()
+        self._edge_records[edge_id] = record
         self._record_timing("edge_db_seconds", phase_started)
 
         if created:
             self._stats["edges"] += 1
             if strongest_via == "inferred":
                 self._stats["inferred_edges"] += 1
+            else:
+                self._stats["observed_edges"] += 1
             if effective_scope == "global_navigation":
                 self._stats["global_navigation_edges"] += 1
             if effective_reversible:
@@ -2306,6 +3523,7 @@ class Explorer:
         else:
             if previous_via == "inferred" and strongest_via != "inferred":
                 self._stats["inferred_edges"] = max(0, self._stats["inferred_edges"] - 1)
+                self._stats["observed_edges"] += 1
             if (
                 previous.get("scope") != "global_navigation"
                 and effective_scope == "global_navigation"
@@ -2396,11 +3614,71 @@ class Explorer:
         outcome = self._item_outcome.get((meta.id, item.item_id))
         if outcome is not None:
             return outcome
-        if item.item_id in meta.blocked_ids:
+        if item.execution_policy == "blocked" or item.item_id in meta.blocked_ids:
             return "blocked"
+        if item.execution_policy == "inventory_only":
+            return "inventory_only"
         if item.item_id not in meta.representative_ids:
             return "skipped_duplicate"  # folded into a sibling representative
         return "pending"  # ranked but never reached (budget/depth/frontier)
+
+    def _surface_details(self, meta: StateMeta) -> tuple[list[dict], dict[str, int]]:
+        counts = {
+            "explored": 0,
+            "pending": 0,
+            "blocked": 0,
+            "noop": 0,
+            "skipped_duplicate": 0,
+            "inventory_only": 0,
+            "known_state": 0,
+            "stale": 0,
+            "failed": 0,
+            "replay_failed": 0,
+        }
+        items: list[dict] = []
+        for item in meta.interactables:
+            status = self._final_status(meta, item)
+            counts[status] = counts.get(status, 0) + 1
+            payload = item.model_dump()
+            payload["status"] = status
+            items.append(payload)
+        return items, counts
+
+    async def _sync_surface_state(self, meta: StateMeta) -> None:
+        """Persist and stream authoritative item outcomes after an action."""
+        items, counts = self._surface_details(meta)
+        async with self._sessions() as session:
+            row = await session.get(db.StateNode, meta.id)
+            if row is None:
+                return
+            row.interactables = items
+            row.exploration = {
+                **dict(row.exploration or {}),
+                **counts,
+                "visit_status": (
+                    "fully_explored" if counts["pending"] == 0 else "partially_explored"
+                ),
+            }
+            await session.commit()
+        self._stats["surface_pending_items"] = sum(
+            sum(
+                self._final_status(state, item) == "pending"
+                for item in state.interactables
+            )
+            for state in self._states.values()
+        )
+        self._emit(
+            ExplorerEvent(
+                EventType.SURFACE_ITEMS_DISCOVERED,
+                f"Updated interactions for s{meta.index}",
+                {
+                    "state_id": meta.id,
+                    "surface_items": self._surface_summary(meta),
+                    "exploration": counts,
+                    "counters": self._counters(),
+                },
+            )
+        )
 
     async def _flush_state_details(self) -> None:
         """Write final surface-item statuses + per-state coverage at run end.
@@ -2423,20 +3701,7 @@ class Explorer:
             )
             rows_by_id = {row.id: row for row in rows}
             for meta in self._states.values():
-                counts = {
-                    "explored": 0,
-                    "pending": 0,
-                    "blocked": 0,
-                    "noop": 0,
-                    "skipped_duplicate": 0,
-                }
-                items: list[dict] = []
-                for item in meta.interactables:
-                    status = self._final_status(meta, item)
-                    counts[status] = counts.get(status, 0) + 1
-                    payload = item.model_dump()
-                    payload["status"] = status
-                    items.append(payload)
+                items, counts = self._surface_details(meta)
 
                 row = rows_by_id.get(meta.id)
                 if row is not None:
@@ -2454,6 +3719,8 @@ class Explorer:
                         and self._family_registry.candidates[item["pattern"]].status != "rejected"
                     ]
                     existing_exploration = dict(row.exploration or {})
+                    row.parent_state_id = meta.parent_state_id
+                    row.state_type = meta.state_type.value
                     row.interactables = items
                     row.detected_flags = {
                         **dict(row.detected_flags or {}),
@@ -2463,11 +3730,38 @@ class Explorer:
                         **existing_exploration,
                         **counts,
                         "page_role": meta.page_role.value,
+                        "page_anchor_id": meta.parent_state_id or meta.id,
+                        "variant_kind": (
+                            "page"
+                            if meta.parent_state_id is None
+                            else "page_variant"
+                            if meta.state_type in {StateType.PAGE_VARIANT, StateType.TAB}
+                            else "overlay"
+                        ),
+                        **(
+                            {"inherited_surface_state_id": meta.parent_state_id}
+                            if meta.parent_state_id is not None
+                            else {}
+                        ),
                         "nav_capabilities": nav_capabilities,
                         "surface_families": surface_families,
                         **(
                             {
                                 "route_family": meta.route_family,
+                                "family_variant_key": self._stable_hash(
+                                    *(
+                                        str(part)
+                                        for part in (meta.family_template_key or ())
+                                    ),
+                                    length=20,
+                                ),
+                                "family_representative_state_id": (
+                                    self._family_variants.get(meta.route_family, {}).get(
+                                        meta.family_template_key
+                                    )
+                                    if meta.family_template_key is not None
+                                    else meta.id
+                                ),
                                 "family_sampled": len(
                                     self._family_sampled_urls.get(meta.route_family, [])
                                 ),
@@ -2498,14 +3792,36 @@ class Explorer:
         self._record_timing("finalize_seconds", flush_started)
         self._stats["actions_performed"] = self._budget.actions
         self._stats["duration_seconds"] = round(self._budget.elapsed_seconds, 2)
+        self._stats["active_duration_seconds"] = round(
+            self._budget.active_elapsed_seconds, 2
+        )
+        self._stats["auth_paused_duration_seconds"] = round(
+            self._budget.auth_paused_seconds, 2
+        )
         self._stats["frontier_actions"] = len(self._frontier)
+        unresolved_required, failed_required = self._required_obligation_summary()
+        pending_representatives = sum(
+            candidate.status == "provisional"
+            and len(set(candidate.sample_targets) - set(candidate.samples))
+            for candidate in self._family_registry.candidates.values()
+        ) + len(self._auth_deferred_family_actions)
+        self._stats["pending_representative_actions"] = pending_representatives
+        self._stats["unresolved_discovery_obligations"] = (
+            unresolved_required + pending_representatives
+        )
+        self._stats["required_action_failures"] = failed_required
         stop_reason = self._stats.get("stop_reason")
         if status == "failed":
             completion_status = "failed"
-        elif stop_reason == "frontier_exhausted":
+        elif (
+            stop_reason == "frontier_exhausted"
+            and not self._stats.get("pending_actions")
+            and not self._stats["unresolved_discovery_obligations"]
+            and not failed_required
+        ):
             completion_status = "complete"
-        elif stop_reason == "novelty_exhausted":
-            completion_status = "novelty_exhausted"
+        elif stop_reason == "frontier_exhausted":
+            completion_status = "partial"
         else:
             completion_status = "budget_limited"
         self._stats["completion_status"] = completion_status

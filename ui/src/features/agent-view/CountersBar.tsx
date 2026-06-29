@@ -15,11 +15,11 @@ interface Tile {
 }
 
 const TILES: Tile[] = [
-  { key: "states", label: "States" },
+  { key: "page_states", label: "Pages" },
   { key: "edges", label: "Edges" },
   { key: "inferred_edges", label: "Inferred" },
   { key: "frontier", label: "Pending" },
-  { key: "surface_pending", label: "Surface" },
+  { key: "interaction_nodes", label: "Interactions" },
   { key: "actions_performed", label: "Actions" },
   { key: "deduped", label: "Deduped" },
   { key: "denied", label: "Denied", tone: "warn" },

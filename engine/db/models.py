@@ -87,6 +87,8 @@ class StateNode(Base):
 
 class Edge(Base):
     __tablename__ = "edges"
+    # Legacy compatibility key. Runtime upserts disambiguate selector reuse;
+    # semantic graph identity lives in ``transition_key``.
     __table_args__ = (
         UniqueConstraint(
             "run_id", "from_state_id", "selector", "action_type", name="uq_edge_action"

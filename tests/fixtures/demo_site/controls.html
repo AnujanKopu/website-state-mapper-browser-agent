@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Control Surface Fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    header, main { padding: 16px; }
+    aside { float: left; width: 160px; padding: 16px; }
+    .toolbar { display: flex; gap: 8px; align-items: center; }
+    .select-owner { cursor: pointer; border: 1px solid #888; padding: 8px; }
+    button, input { min-width: 32px; min-height: 32px; }
+    table { margin-top: 20px; border-collapse: collapse; width: 700px; }
+    th { padding: 12px; text-align: left; }
+    [role="button"] { cursor: pointer; display: inline-block; width: 20px; height: 20px; }
+    .popup { border: 1px solid #888; padding: 8px; margin: 4px; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="login.html">Log in</a>
+    <a href="signup.html">Sign up</a>
+  </header>
+  <aside>
+    <a href="pricing.html">Analyze</a>
+    <a href="docs.html">Collections</a>
+    <a href="post1.html">Genres</a>
+    <a role="link" tabindex="0" onclick="location.href='spa.html'">Shorts</a>
+  </aside>
+  <main>
+    <div class="toolbar" role="toolbar" aria-label="Game controls">
+      <input type="search" placeholder="Search" aria-controls="search-dialog"
+             onfocus="document.getElementById('search-dialog').hidden=false">
+      <button type="button"><svg data-icon="search"></svg></button>
+      <div class="select-owner" tabindex="0" role="button" aria-haspopup="listbox"
+           aria-controls="category-menu" aria-expanded="false"
+           onclick="openMenu('category-menu', this)">All Categories<input role="combobox" aria-haspopup="listbox"></div>
+      <button type="button" aria-haspopup="menu" aria-controls="chart-menu" aria-expanded="false"
+              onclick="openMenu('chart-menu', this)">Chart</button>
+      <button type="button" aria-haspopup="menu" aria-controls="metrics-menu" aria-expanded="false"
+              onclick="openMenu('metrics-menu', this)">Metrics (7/34)</button>
+      <button type="button" aria-pressed="false"
+              onclick="this.setAttribute('aria-pressed', this.getAttribute('aria-pressed') !== 'true')"><svg data-icon="table"></svg></button>
+      <button type="button" onclick="downloadFixture()"><svg data-icon="download"></svg></button>
+    </div>
+    <div id="category-menu" class="popup" role="listbox" hidden><button role="option">Adventure</button></div>
+    <div id="chart-menu" class="popup" role="menu" hidden><button role="menuitem">Line chart</button></div>
+    <div id="metrics-menu" class="popup" role="menu" hidden><button role="menuitem">Visits</button></div>
+    <div id="search-dialog" role="dialog" aria-modal="true" aria-label="Search games" hidden>
+      <h2>Search games</h2><button type="button" onclick="this.parentElement.hidden=true">Close</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Visits <span role="button" aria-haspopup="menu" aria-controls="visits-filter"
+                         aria-expanded="false" onclick="openFilter('visits-filter', this, 'visits')"><svg data-icon="filter"></svg></span></th>
+        <th>Players <span role="button" aria-haspopup="menu" aria-controls="players-filter"
+                          aria-expanded="false" onclick="openFilter('players-filter', this, 'players')"><svg data-icon="filter"></svg></span></th>
+      </tr></thead>
+      <tbody><tr><td>10</td><td>20</td></tr></tbody>
+    </table>
+    <div id="visits-filter" class="popup" role="menu" hidden><button role="menuitem">Top visits</button></div>
+    <div id="players-filter" class="popup" role="menu" hidden><button role="menuitem">Top players</button></div>
+  </main>
+  <script>
+    function openMenu(id, control) {
+      document.querySelectorAll('.popup').forEach((menu) => menu.hidden = true);
+      document.getElementById(id).hidden = false;
+      control.setAttribute('aria-expanded', 'true');
+    }
+    function openFilter(id, control, name) {
+      openMenu(id, control);
+      history.replaceState({}, '', `?filter=${name}`);
+    }
+    function downloadFixture() {
+      const link = document.createElement('a');
+      link.href = 'data:text/csv,game,visits';
+      link.download = 'games.csv';
+      link.click();
+    }
+  </script>
+</body>
+</html>

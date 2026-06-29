@@ -107,8 +107,23 @@ export function createGraphTopology(
   nodes: Record<string, GraphState>,
   edges: Record<string, GraphEdge>,
 ): GraphTopology {
-  const nodeIds = Object.values(nodes).sort(stateOrder).map((state) => state.id);
-  const nodeSet = new Set(nodeIds);
+  const allNodeIds = Object.values(nodes).sort(stateOrder).map((state) => state.id);
+  const nodeSet = new Set(allNodeIds);
+  const hiddenEquivalentSamples = new Set(
+    Object.values(nodes)
+      .filter((state) => {
+        const representative = state.exploration?.family_representative_state_id;
+        return Boolean(
+          !state.parent_state_id
+          && state.exploration?.route_family
+          && representative
+          && representative !== state.id
+          && nodes[representative],
+        );
+      })
+      .map((state) => state.id),
+  );
+  const nodeIds = allNodeIds.filter((id) => !hiddenEquivalentSamples.has(id));
   const familyMembers = new Map<
     string,
     {
@@ -176,7 +191,7 @@ export function createGraphTopology(
     const pattern = state.parent_state_id ? null : state.exploration?.route_family;
     if (!pattern) continue;
     const entry = registerFamily(pattern, state.exploration?.family);
-    entry.members.push(state);
+    if (!hiddenEquivalentSamples.has(state.id)) entry.members.push(state);
   }
   const families: FamilyGroup[] = [...familyMembers.entries()]
     .filter(([, entry]) => {
@@ -205,10 +220,16 @@ export function createGraphTopology(
     .sort((a, b) => a.id.localeCompare(b.id));
 
   const ownerByNode: Record<string, string> = Object.fromEntries(
-    nodeIds.map((id) => [id, id]),
+    allNodeIds.map((id) => [id, id]),
   );
   for (const family of families) {
     for (const memberId of family.memberIds) ownerByNode[memberId] = family.id;
+  }
+  // Exact sample states stay in persisted evidence, but structurally equivalent
+  // samples route through the same visual family owner as their representative.
+  for (const stateId of hiddenEquivalentSamples) {
+    const representative = nodes[stateId].exploration?.family_representative_state_id;
+    if (representative) ownerByNode[stateId] = ownerByNode[representative] ?? representative;
   }
 
   const validEdges = Object.values(edges)

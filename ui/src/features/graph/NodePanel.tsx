@@ -28,7 +28,12 @@ const STATUS_CLASS: Record<SurfaceStatus, string> = {
   pending: "chip--pending",
   blocked: "chip--blocked",
   noop: "chip--muted",
+  known_state: "chip--ok",
+  stale: "chip--blocked",
+  failed: "chip--blocked",
+  replay_failed: "chip--blocked",
   skipped_duplicate: "chip--skip",
+  inventory_only: "chip--muted",
 };
 
 const STATUS_LABEL: Record<SurfaceStatus, string> = {
@@ -36,7 +41,12 @@ const STATUS_LABEL: Record<SurfaceStatus, string> = {
   pending: "pending",
   blocked: "blocked",
   noop: "no-op",
+  known_state: "known state",
+  stale: "stale",
+  failed: "failed",
+  replay_failed: "replay failed",
   skipped_duplicate: "duplicate",
+  inventory_only: "inventory only",
 };
 
 interface SurfaceRow {
@@ -49,13 +59,18 @@ function groupSurface(items: SurfaceItem[]): [string, SurfaceRow[]][] {
   const byRegion = new Map<string, SurfaceRow[]>();
   const seenGroup = new Map<string, SurfaceRow>();
   for (const item of items) {
-    if (item.group_id && seenGroup.has(item.group_id)) {
-      seenGroup.get(item.group_id)!.count += 1;
+    const groupKey = item.component_key ?? item.group_id;
+    if (groupKey && seenGroup.has(groupKey)) {
+      seenGroup.get(groupKey)!.count += 1;
       continue;
     }
     const region = item.region ?? "other";
-    const row: SurfaceRow = { label: item.label, status: item.status, count: 1 };
-    if (item.group_id) seenGroup.set(item.group_id, row);
+    const row: SurfaceRow = {
+      label: item.component_label || item.label,
+      status: item.status,
+      count: 1,
+    };
+    if (groupKey) seenGroup.set(groupKey, row);
     if (!byRegion.has(region)) byRegion.set(region, []);
     byRegion.get(region)!.push(row);
   }

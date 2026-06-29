@@ -1,0 +1,24 @@
+services:
+  crawl-supervisor:
+    build:
+      context: .
+      dockerfile: Dockerfile.supervisor
+    user: "${FLOWSTATE_ROOTLESS_UID:-1000}:${FLOWSTATE_ROOTLESS_GID:-1000}"
+    environment:
+      FLOWSTATE_WORKER_JOB_ROOT: /jobs
+      FLOWSTATE_WORKER_JOB_HOST_ROOT: ${FLOWSTATE_WORKER_JOB_ROOT:?set worker job root}
+      FLOWSTATE_PROJECT_DIR: /project
+      FLOWSTATE_SUPERVISOR_TOKEN: ${FLOWSTATE_SUPERVISOR_TOKEN:?set supervisor token}
+      DOCKER_HOST: ${FLOWSTATE_ROOTLESS_DOCKER_HOST:-unix:///run/user/1000/docker.sock}
+    volumes:
+      - .:/project:ro
+      - ${FLOWSTATE_WORKER_JOB_ROOT:?set worker job root}:/jobs:rw
+      - ${FLOWSTATE_ROOTLESS_DOCKER_SOCKET:?set rootless runtime socket}:/run/user/1000/docker.sock
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "127.0.0.1:8091:8091"

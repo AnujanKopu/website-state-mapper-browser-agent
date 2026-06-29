@@ -11,10 +11,15 @@ browser:
   navigation_timeout_ms: 20000
   # How long the page must stay quiet (after load) before we snapshot it.
   stabilize_quiet_ms: 500
+  # Hosted workers force this off; local fixture development may opt in.
+  allow_private_networks: true
 
 capture:
   full_page_screenshot: true
   max_interactables: 100
+  # Non-navigating controls are inventoried separately so they cannot crowd
+  # page links out of the traversal frontier.
+  max_inventory_controls: 200
   # Visible text beyond this length is truncated before hashing/storage.
   max_visible_text_chars: 20000
   # Persist raw DOM HTML snapshots. Disable for UI-driven runs that only
@@ -26,14 +31,18 @@ capture:
 
 # Exploration budgets; whichever exhausts first stops the run.
 budgets:
-  max_states: 60
-  max_actions: 150
-  max_depth: 4
-  max_wall_seconds: 300
+  max_states: 250
+  max_actions: 1000
+  max_depth: 8
+  max_wall_seconds: 1800
 
 exploration:
-  # Out-edges enqueued per state (top-K after ranking); keeps the graph clean.
-  max_actions_per_state: 12
+  # null means ranking controls traversal order, never route eligibility.
+  max_actions_per_state: null
+  # Same-page controls have an independent budget and cannot crowd out links.
+  max_local_actions_per_state: 24
+  # Distinct persistent navigation destinations sampled from the root shell.
+  max_global_navigation_actions: null
   action_timeout_ms: 5000
   # Distinct states kept per loose URL family (e.g. /post/#); further siblings
   # fold into the family representative as skipped items + inferred edges.

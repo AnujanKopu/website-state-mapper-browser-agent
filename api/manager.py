@@ -20,16 +20,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from api.supervisor_client import SupervisorClient
 from engine.capture import new_id
 from engine.config import Settings
+from engine.db import models as db
+from engine.db.session import create_db_engine, create_session_factory
 from engine.events import TERMINAL_EVENTS, EventType
 from engine.explorer import Explorer, ExplorerEvent
+from engine.network_policy import validate_public_http_url
 from engine.schemas import Credentials, RunConfig, RunStatus
 from engine.storage import StorageBackend
 
@@ -90,6 +99,9 @@ class RunHandle:
     _auth_gate_event: asyncio.Event | None = field(default=None, repr=False)
     _auth_gate_decision: str = field(default="skip", repr=False)
     _auth_gate_creds: Credentials | None = field(default=None, repr=False)
+    _control_sink: Callable[[str, Credentials | None], None] | None = field(
+        default=None, repr=False
+    )
 
     def _envelope(self, event_type: str, payload: dict) -> StreamedEvent:
         event = StreamedEvent(
@@ -126,6 +138,14 @@ class RunHandle:
         if event_type == EventType.AUTH_GATE and event.data.get("decision") is None:
             # Explorer is pausing at an auth wall; reflect this in the handle status.
             self.status = RunStatus.PAUSED
+            if (
+                self._control_sink is not None
+                and self.auth_gate is None
+                and event.data.get("state_id")
+            ):
+                self.set_auth_gate(
+                    str(event.data["state_id"]), str(event.data.get("url") or self.url)
+                )
         self._fan_out(self._envelope(event_type, payload))
 
     # ------------------------------------------------------------------
@@ -175,7 +195,10 @@ class RunHandle:
             )
         )
         assert self._auth_gate_event is not None
-        self._auth_gate_event.set()
+        if self._control_sink is not None:
+            self._control_sink(decision, credentials)
+        else:
+            self._auth_gate_event.set()
         return True
 
     def publish_heartbeat(self) -> None:
@@ -217,6 +240,11 @@ class RunManager:
         self._session_factory = session_factory
         self._store = store
         self._handles: dict[str, RunHandle] = {}
+        self._supervisor = (
+            SupervisorClient(settings.supervisor_url, settings.supervisor_token)
+            if settings.hosted_mode and settings.supervisor_url
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -230,6 +258,10 @@ class RunManager:
         credentials: Credentials | None = None,
     ) -> RunHandle:
         """Register a run and launch it as a background task; returns at once."""
+        if self._settings.hosted_mode:
+            validate_public_http_url(url)
+            if self._supervisor is None:
+                raise ValueError("hosted mode requires FLOWSTATE_SUPERVISOR_URL")
         run_id = new_id()
         handle = RunHandle(run_id=run_id, url=url, status=RunStatus.RUNNING)
         handle.credentials = credentials
@@ -237,22 +269,34 @@ class RunManager:
 
         config = self._config_with_overrides(overrides or {})
 
-        def auth_gate_hook(state_id: str, url_: str):
-            handle.set_auth_gate(state_id, url_)
-            return handle.wait_auth_decision()
+        if self._settings.hosted_mode:
+            assert self._supervisor is not None
 
-        explorer = Explorer(
-            self._settings,
-            config,
-            on_event=handle.publish,
-            auth_gate_hook=auth_gate_hook,
-            credentials=credentials,
-            session_factory=self._session_factory,
-            store=self._store,
-        )
-        handle.task = asyncio.create_task(
-            self._drive(explorer, handle), name=f"explore:{run_id}"
-        )
+            def send_control(decision: str, creds: Credentials | None) -> None:
+                command = "auth_resume" if decision == "resume" else "auth_skip"
+                asyncio.create_task(self._supervisor.command(run_id, command, creds))
+
+            handle._control_sink = send_control
+            handle.task = asyncio.create_task(
+                self._drive_worker(handle, config), name=f"worker:{run_id}"
+            )
+        else:
+            def auth_gate_hook(state_id: str, url_: str):
+                handle.set_auth_gate(state_id, url_)
+                return handle.wait_auth_decision()
+
+            explorer = Explorer(
+                self._settings,
+                config,
+                on_event=handle.publish,
+                auth_gate_hook=auth_gate_hook,
+                credentials=credentials,
+                session_factory=self._session_factory,
+                store=self._store,
+            )
+            handle.task = asyncio.create_task(
+                self._drive(explorer, handle), name=f"explore:{run_id}"
+            )
         handle.heartbeat_task = asyncio.create_task(
             self._heartbeat(handle), name=f"heartbeat:{run_id}"
         )
@@ -265,6 +309,13 @@ class RunManager:
         """Cancel any in-flight runs and heartbeats (called on app shutdown)."""
         tasks: list[asyncio.Task] = []
         for handle in self._handles.values():
+            if (
+                self._supervisor is not None
+                and handle.task is not None
+                and not handle.task.done()
+            ):
+                with contextlib.suppress(Exception):
+                    await self._supervisor.command(handle.run_id, "cancel")
             for task in (handle.task, handle.heartbeat_task):
                 if task is not None and not task.done():
                     task.cancel()
@@ -338,6 +389,112 @@ class RunManager:
             if not handle.terminal_emitted:
                 handle.publish(ExplorerEvent(EventType.RUN_FAILED, str(exc), {"error": str(exc)}))
             handle.complete(RunStatus.FAILED, error=str(exc))
+
+    async def _drive_worker(self, handle: RunHandle, config: RunConfig) -> None:
+        """Stream one disposable worker, hydrating committed state before SSE."""
+        assert self._supervisor is not None
+        try:
+            async for message in self._supervisor.stream_run(
+                run_id=handle.run_id,
+                url=handle.url,
+                config=config,
+                credentials=handle.credentials,
+            ):
+                message_type = message.get("type")
+                if message_type == "artifact_manifest":
+                    continue
+                if message_type == "worker_error":
+                    raise RuntimeError(str(message.get("error") or "worker failed"))
+                # The worker commits before writing each envelope. Mirror that
+                # snapshot into API storage before publishing the event.
+                await self._import_worker_snapshot(handle.run_id)
+                payload = dict(message.get("payload") or {})
+                event_message = str(payload.pop("message", ""))
+                handle.publish(
+                    ExplorerEvent(
+                        EventType(str(message_type)), event_message, payload
+                    )
+                )
+            await self._import_worker_snapshot(handle.run_id)
+            handle.complete(RunStatus.DONE)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self._supervisor.command(handle.run_id, "cancel")
+            handle.complete(RunStatus.CANCELLED, error="run cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 - worker boundary
+            if not handle.terminal_emitted:
+                handle.publish(
+                    ExplorerEvent(EventType.RUN_FAILED, str(exc), {"error": str(exc)})
+                )
+            handle.complete(RunStatus.FAILED, error=str(exc))
+        finally:
+            with contextlib.suppress(Exception):
+                await self._supervisor.cleanup(handle.run_id)
+
+    async def _import_worker_snapshot(self, run_id: str) -> None:
+        """Merge one worker's per-run SQLite graph into the API database."""
+        if self._session_factory is None:
+            raise RuntimeError("hosted worker import requires an API session factory")
+        job_dir = (self._settings.worker_job_root / run_id).resolve()
+        root = self._settings.worker_job_root.resolve()
+        if root not in job_dir.parents:
+            raise RuntimeError("worker job escaped configured root")
+        database = job_dir / "flowstate.db"
+        if not database.exists():
+            return
+
+        source_engine = create_db_engine(
+            f"sqlite+aiosqlite:///{database.as_posix()}"
+        )
+        source_sessions = create_session_factory(source_engine)
+        records: list[tuple[type, dict]] = []
+        try:
+            async with source_sessions() as source:
+                run = await source.get(db.Run, run_id)
+                if run is None:
+                    return
+                records.append((db.Run, self._row_data(run)))
+                for model in (db.StateNode, db.Edge):
+                    rows = (
+                        await source.execute(
+                            select(model).where(model.run_id == run_id)
+                        )
+                    ).scalars()
+                    records.extend((model, self._row_data(row)) for row in rows)
+        finally:
+            await source_engine.dispose()
+
+        async with self._session_factory() as destination:
+            for model, values in records:
+                await destination.merge(model(**values))
+            await destination.commit()
+        self._copy_worker_screenshots(job_dir, run_id)
+
+    @staticmethod
+    def _row_data(row: object) -> dict:
+        return {
+            column.name: getattr(row, column.name)
+            for column in row.__table__.columns  # type: ignore[attr-defined]
+        }
+
+    def _copy_worker_screenshots(self, job_dir: Path, run_id: str) -> None:
+        source = job_dir / "artifacts" / "runs" / run_id / "screenshots"
+        if not source.exists():
+            return
+        target = self._settings.data_dir / "runs" / run_id / "screenshots"
+        target.mkdir(parents=True, exist_ok=True)
+        for image in source.glob("*.png"):
+            if source.resolve() not in image.resolve().parents:
+                continue
+            try:
+                with Image.open(image) as candidate:
+                    if candidate.format != "PNG":
+                        continue
+                    candidate.verify()
+            except (OSError, UnidentifiedImageError):
+                continue
+            shutil.copy2(image, target / image.name)
 
     def _config_with_overrides(self, overrides: dict) -> RunConfig:
         config = self._run_config.model_copy(deep=True)

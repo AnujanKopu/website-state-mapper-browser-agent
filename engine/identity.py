@@ -77,12 +77,12 @@ def _normalize_segment(segment: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    """Canonicalize a URL so cosmetically different URLs map to one identity.
+    """Canonicalize an exact URL without erasing entity identity.
 
     - lowercases scheme and host
     - drops the fragment
     - drops tracking query params, sorts the rest
-    - rewrites numeric / UUID / long-hex path segments to ``:id``
+    - preserves every path segment value; templates belong to family logic
     - strips the trailing slash (except for the root path)
     """
     scheme, netloc, path, query, _fragment = urlsplit(url)
@@ -93,7 +93,7 @@ def normalize_url(url: str) -> str:
         if not _is_tracking_param(name)
     )
 
-    segments = [_normalize_segment(s) for s in path.split("/") if s]
+    segments = [s for s in path.split("/") if s]
     normalized_path = "/" + "/".join(segments) if segments else "/"
 
     return urlunsplit(

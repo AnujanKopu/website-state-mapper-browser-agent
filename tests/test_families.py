@@ -1,6 +1,11 @@
 """Regression coverage for content-agnostic dynamic URL family inference."""
 
-from engine.families import FamilyRegistry, infer_template, matches_template
+from engine.families import (
+    FamilyRegistry,
+    infer_template,
+    matches_template,
+    structure_signature,
+)
 from engine.schemas import (
     AuthContext,
     BoundingBox,
@@ -208,7 +213,7 @@ def test_optional_inference_does_not_absorb_an_ancestor_back_link():
     assert registry.family_for_url("file:///site/directory.html") is None
 
 
-def test_two_compatible_samples_confirm_and_layout_variant_stays_sampled():
+def test_three_samples_required_and_layout_variant_stays_sampled():
     registry = FamilyRegistry()
     items = [
         _link(
@@ -224,10 +229,10 @@ def test_two_compatible_samples_confirm_and_layout_variant_stays_sampled():
     _, status = registry.record_sample(
         family, family.sample_targets[1], _observe(family.sample_targets[1])
     )
-    assert status == "confirmed"
+    assert status == "provisional"
 
     variant = family.sample_targets[2]
-    registry.record_sample(
+    _, status = registry.record_sample(
         family,
         variant,
         _observe(
@@ -237,8 +242,36 @@ def test_two_compatible_samples_confirm_and_layout_variant_stays_sampled():
             signals=PageSignals(form_count=1),
         ),
     )
-    assert family.status == "confirmed"
+    assert status == "confirmed"
     assert len(family.samples) == 3
+
+
+def test_compatible_collection_prefix_classifies_routes_as_page_variants():
+    registry = FamilyRegistry()
+    source = _observe("https://example.test/games")
+    items = [
+        _link(
+            f"#categories > a:nth-of-type({index})",
+            f"https://example.test/games/{value}",
+            label=value,
+        )
+        for index, value in enumerate(("trending", "new", "popular"), 1)
+    ]
+    family = registry.observe_surface(
+        source_key=f"{source.snapshot.url}|source",
+        source_structure=source.skeleton_hash,
+        source_signature=structure_signature(source),
+        base_url=source.snapshot.url,
+        items=items,
+    )[0]
+
+    for url in family.sample_targets:
+        registry.record_sample(family, url, _observe(url))
+
+    assert family.status == "confirmed"
+    assert family.family_kind == "collection_variant_family"
+    assert family.collection_anchor_urls == {"https://example.test/games"}
+    assert family.payload()["family_kind"] == "collection_variant_family"
 
 
 def test_conflicting_samples_reject_instead_of_authorizing_skips():

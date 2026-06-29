@@ -37,7 +37,8 @@ class CreateRunRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("url must not be empty")
-        # Bare hosts (example.com) default to https; explicit schemes pass through.
+        # Hosted-mode destination enforcement lives at the RunManager boundary
+        # so local development can continue using file:// and localhost.
         return value if _HAS_SCHEME.match(value) else f"https://{value}"
 
     @model_validator(mode="after")

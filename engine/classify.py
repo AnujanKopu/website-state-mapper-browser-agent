@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from engine.ranking import ActionCandidate, collapse_siblings
 from engine.safety import SafetyDecision, evaluate_action
@@ -114,6 +115,17 @@ def analyze_state(
         safe_candidates=len(safe),
         denied=denied,
     )
+    path = urlsplit(observation.snapshot.url).path.lower()
+    if re.search(r"/(sign-?up|register|create-account)(?:/|\.html?$|$)", path):
+        flags["auth_surface_kind"] = "registration"
+        if state_type == StateType.AUTH_WALL:
+            state_type = StateType.FORM
+    elif re.search(r"/(forgot|recover|reset-password)(?:/|\.html?$|$)", path):
+        flags["auth_surface_kind"] = "recovery"
+        if state_type == StateType.AUTH_WALL:
+            state_type = StateType.FORM
+    elif re.search(r"/(log-?in|sign-?in|auth)(?:/|\.html?$|$)", path):
+        flags["auth_surface_kind"] = "login"
     return StateAnalysis(
         candidates=candidates, safe=safe, denied=denied, state_type=state_type, flags=flags
     )

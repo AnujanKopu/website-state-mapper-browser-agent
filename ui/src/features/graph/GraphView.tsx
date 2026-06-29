@@ -16,45 +16,43 @@ import {
   collectNodeEdgeFocus,
   createGraphTopology,
   layoutTopology,
-  type GraphLayout,
-  type GraphTopology,
 } from "./graphElements";
 import { FamilyGroupView, type FamilyFlowNode } from "./FamilyGroup";
+import {
+  buildInteractionProjection,
+  INTERACTION_NODE_HEIGHT,
+  INTERACTION_NODE_WIDTH,
+  pageAncestorId,
+  projectPageGraph,
+  type PageProjection,
+} from "./graphLayers";
+import { InteractionNodeView, type InteractionFlowNode } from "./InteractionNode";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 import { StateNodeView, type StateFlowNode } from "./StateNode";
 
-type GraphFlowNode = StateFlowNode | FamilyFlowNode;
+type GraphFlowNode = StateFlowNode | FamilyFlowNode | InteractionFlowNode;
 
-const nodeTypes = { state: StateNodeView, family: FamilyGroupView };
+const nodeTypes = {
+  state: StateNodeView,
+  family: FamilyGroupView,
+  interaction: InteractionNodeView,
+};
 const FIT_PADDING = 0.18;
 
-function layoutBounds(layout: GraphLayout, topology: GraphTopology) {
+function nodeBounds(nodes: GraphFlowNode[]) {
+  if (!nodes.length) return null;
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  let hasBounds = false;
-
-  for (const family of layout.familyBoxes) {
-    hasBounds = true;
-    minX = Math.min(minX, family.position.x);
-    minY = Math.min(minY, family.position.y);
-    maxX = Math.max(maxX, family.position.x + family.width);
-    maxY = Math.max(maxY, family.position.y + family.height);
+  for (const node of nodes) {
+    const width = Number(node.width ?? node.measured?.width ?? NODE_WIDTH);
+    const height = Number(node.height ?? node.measured?.height ?? NODE_HEIGHT);
+    minX = Math.min(minX, node.position.x);
+    minY = Math.min(minY, node.position.y);
+    maxX = Math.max(maxX, node.position.x + width);
+    maxY = Math.max(maxY, node.position.y + height);
   }
-
-  for (const nodeId of topology.nodeIds) {
-    if (topology.ownerByNode[nodeId] !== nodeId) continue;
-    const position = layout.nodePositions[nodeId];
-    if (!position) continue;
-    hasBounds = true;
-    minX = Math.min(minX, position.x);
-    minY = Math.min(minY, position.y);
-    maxX = Math.max(maxX, position.x + NODE_WIDTH);
-    maxY = Math.max(maxY, position.y + NODE_HEIGHT);
-  }
-
-  if (!hasBounds) return null;
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
@@ -69,6 +67,7 @@ interface GraphViewProps {
 
 interface GraphCanvasProps extends GraphViewProps {
   displayTopology: ReturnType<typeof createGraphTopology>;
+  pageProjection: PageProjection;
   onInteractionChange: (active: boolean) => void;
 }
 
@@ -80,6 +79,7 @@ function GraphCanvas({
   isLive,
   onSelect,
   displayTopology,
+  pageProjection,
   onInteractionChange,
 }: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -89,6 +89,8 @@ function GraphCanvas({
   const [following, setFollowing] = useState(true);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(null);
+  const [selectedInteractionId, setSelectedInteractionId] = useState<string | null>(null);
+  const [nestedPageId, setNestedPageId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [interacting, setInteracting] = useState(false);
   const manualInteractionRef = useRef(false);
@@ -99,15 +101,84 @@ function GraphCanvas({
     () => layoutTopology(displayTopology),
     [displayTopology.layoutKey],
   );
+  const interactionProjection = useMemo(
+    () => nestedPageId
+      ? buildInteractionProjection(nodes, edges, nestedPageId)
+      : null,
+    [edges, nestedPageId, nodes],
+  );
+  const selectedPageProjection = useMemo(
+    () => selectedId && pageProjection.nodes[selectedId]
+      ? buildInteractionProjection(nodes, edges, selectedId)
+      : null,
+    [edges, nodes, pageProjection.nodes, selectedId],
+  );
 
   const normalizedQuery = query.trim().toLowerCase();
   const nodeEdgeFocus = useMemo(
-    () => collectNodeEdgeFocus(displayTopology, nodes, edges, selectedId),
-    [displayTopology, edges, nodes, selectedId],
+    () => nestedPageId
+      ? null
+      : collectNodeEdgeFocus(
+        displayTopology,
+        pageProjection.nodes,
+        pageProjection.edges,
+        selectedId,
+      ),
+    [displayTopology, nestedPageId, pageProjection, selectedId],
   );
+  const pageCurrentId = currentId ? pageProjection.ownerByState[currentId] : null;
+  const nestedCurrentId = currentId
+    && nestedPageId
+    && pageAncestorId(nodes, currentId) === nestedPageId
+    ? currentId
+    : nestedPageId;
 
   const rfNodes = useMemo<GraphFlowNode[]>(
-    () => [
+    () => interactionProjection
+      ? [
+        ...interactionProjection.stateIds.flatMap((id): StateFlowNode[] => {
+          const state = nodes[id];
+          const position = interactionProjection.positions[id];
+          if (!state || !position) return [];
+          return [{
+            id,
+            type: "state" as const,
+            position,
+            selected: id === selectedId,
+            zIndex: 1,
+            width: NODE_WIDTH,
+            height: NODE_HEIGHT,
+            measured: { width: NODE_WIDTH, height: NODE_HEIGHT },
+            data: { state, current: id === nestedCurrentId },
+            style: {
+              opacity: normalizedQuery
+                && !`${state.label ?? state.title} ${state.url}`.toLowerCase().includes(normalizedQuery)
+                ? 0.32
+                : 1,
+            },
+          }];
+        }),
+        ...Object.values(interactionProjection.capabilities).map(
+          (capability): InteractionFlowNode => ({
+            id: capability.id,
+            type: "interaction",
+            position: interactionProjection.positions[capability.id],
+            selected: capability.id === selectedInteractionId,
+            zIndex: 1,
+            width: INTERACTION_NODE_WIDTH,
+            height: INTERACTION_NODE_HEIGHT,
+            measured: { width: INTERACTION_NODE_WIDTH, height: INTERACTION_NODE_HEIGHT },
+            data: capability,
+            style: {
+              opacity: normalizedQuery
+                && !`${capability.label} ${capability.kind}`.toLowerCase().includes(normalizedQuery)
+                ? 0.32
+                : 1,
+            },
+          }),
+        ),
+      ]
+      : [
       ...layout.familyBoxes.map((family): FamilyFlowNode => ({
         id: family.id,
         type: "family",
@@ -140,7 +211,7 @@ function GraphCanvas({
         },
       })),
       ...displayTopology.nodeIds.flatMap((id): StateFlowNode[] => {
-        const state = nodes[id];
+        const state = pageProjection.nodes[id];
         const position = layout.nodePositions[id];
         if (!state || !position) return [];
         return [{
@@ -152,7 +223,7 @@ function GraphCanvas({
           width: NODE_WIDTH,
           height: NODE_HEIGHT,
           measured: { width: NODE_WIDTH, height: NODE_HEIGHT },
-          data: { state, current: id === currentId },
+          data: { state, current: id === pageCurrentId },
           style: {
             opacity:
               (normalizedQuery
@@ -164,19 +235,39 @@ function GraphCanvas({
         }];
       }),
     ],
-    [currentId, displayTopology.nodeIds, layout, nodeEdgeFocus, nodes, normalizedQuery, selectedFamilyId, selectedId],
+    [
+      displayTopology.nodeIds,
+      interactionProjection,
+      layout,
+      nestedCurrentId,
+      nodeEdgeFocus,
+      nodes,
+      normalizedQuery,
+      pageCurrentId,
+      pageProjection.nodes,
+      selectedFamilyId,
+      selectedId,
+      selectedInteractionId,
+    ],
   );
 
   const rfEdges = useMemo(
-    () => buildFlowEdges(
+    () => interactionProjection?.edges ?? buildFlowEdges(
       displayTopology,
-      edges,
+      pageProjection.edges,
       selectedEdgeId,
       selectedId,
-      nodes,
+      pageProjection.nodes,
       !interacting && !document.hidden,
     ),
-    [displayTopology, edges, interacting, nodes, selectedEdgeId, selectedId],
+    [
+      displayTopology,
+      interacting,
+      interactionProjection,
+      pageProjection,
+      selectedEdgeId,
+      selectedId,
+    ],
   );
 
   const canViewport = useCallback(() => {
@@ -195,23 +286,27 @@ function GraphCanvas({
       pendingFitRef.current = true;
       return;
     }
-    const bounds = layoutBounds(layout, displayTopology);
+    const bounds = nodeBounds(rfNodes);
     if (!bounds) {
       pendingFitRef.current = true;
       return;
     }
     pendingFitRef.current = false;
     void fitBounds(bounds, { duration, padding: FIT_PADDING });
-  }, [canViewport, displayTopology, fitBounds, layout]);
+  }, [canViewport, fitBounds, rfNodes]);
 
   const followCurrent = useCallback((duration: number) => {
     if (!canViewport()) {
       pendingFitRef.current = true;
       return;
     }
-    const targetId = currentId ?? displayTopology.nodeIds.at(-1);
+    const targetId = interactionProjection
+      ? nestedCurrentId
+      : pageCurrentId ?? displayTopology.nodeIds.at(-1);
     if (!targetId) return;
-    const position = layout.nodePositions[targetId];
+    const position = interactionProjection
+      ? interactionProjection.positions[targetId]
+      : layout.nodePositions[targetId];
     if (!position) {
       pendingFitRef.current = true;
       return;
@@ -221,7 +316,16 @@ function GraphCanvas({
       duration,
       zoom: getZoom(),
     });
-  }, [canViewport, currentId, displayTopology.nodeIds, getZoom, layout.nodePositions, setCenter]);
+  }, [
+    canViewport,
+    displayTopology.nodeIds,
+    getZoom,
+    interactionProjection,
+    layout.nodePositions,
+    nestedCurrentId,
+    pageCurrentId,
+    setCenter,
+  ]);
 
   const scheduleViewport = useCallback((mode: "fit" | "follow", duration = 0) => {
     if (fitFrameRef.current !== null) window.cancelAnimationFrame(fitFrameRef.current);
@@ -243,9 +347,9 @@ function GraphCanvas({
   }, [scheduleViewport]);
 
   const scheduleFollowingViewport = useCallback((duration = 0) => {
-    if (isLive && currentId) scheduleFollow(duration);
+    if (isLive && (pageCurrentId || nestedCurrentId)) scheduleFollow(duration);
     else scheduleFit(duration);
-  }, [currentId, isLive, scheduleFit, scheduleFollow]);
+  }, [isLive, nestedCurrentId, pageCurrentId, scheduleFit, scheduleFollow]);
 
   useEffect(() => {
     pendingFitRef.current = true;
@@ -257,6 +361,7 @@ function GraphCanvas({
   }, [
     currentId,
     displayTopology.layoutKey,
+    interactionProjection?.key,
     following,
     isLive,
     nodesInitialized,
@@ -317,11 +422,20 @@ function GraphCanvas({
     scheduleFit(250);
   };
 
+  const leaveNestedLayer = useCallback(() => {
+    const pageId = nestedPageId;
+    setNestedPageId(null);
+    setSelectedInteractionId(null);
+    setSelectedEdgeId(null);
+    if (pageId) onSelect(pageId);
+  }, [nestedPageId, onSelect]);
+
   const clearSelection = useCallback(() => {
     setSelectedEdgeId(null);
     setSelectedFamilyId(null);
-    onSelect(null);
-  }, [onSelect]);
+    setSelectedInteractionId(null);
+    if (!nestedPageId) onSelect(null);
+  }, [nestedPageId, onSelect]);
 
   const endInteraction = useCallback(() => {
     if (!manualInteractionRef.current) return;
@@ -353,12 +467,28 @@ function GraphCanvas({
       if (event.key !== "Escape") return;
       const target = event.target;
       if (target instanceof HTMLElement && target.closest(".graph-search")) return;
+      if (selectedInteractionId) {
+        setSelectedInteractionId(null);
+        return;
+      }
+      if (nestedPageId) {
+        leaveNestedLayer();
+        return;
+      }
       if (!selectedId && !selectedEdgeId && !selectedFamilyId) return;
       clearSelection();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [clearSelection, selectedEdgeId, selectedFamilyId, selectedId]);
+  }, [
+    clearSelection,
+    leaveNestedLayer,
+    nestedPageId,
+    selectedEdgeId,
+    selectedFamilyId,
+    selectedId,
+    selectedInteractionId,
+  ]);
 
   return (
     <div ref={containerRef} className="graph-view">
@@ -388,10 +518,14 @@ function GraphCanvas({
           if (node.type === "state") {
             setSelectedEdgeId(null);
             setSelectedFamilyId(null);
+            setSelectedInteractionId(null);
             onSelect(node.id);
           } else if (node.type === "family") {
             setSelectedEdgeId(null);
             setSelectedFamilyId(node.id);
+          } else if (node.type === "interaction") {
+            setSelectedEdgeId(null);
+            setSelectedInteractionId(node.id);
           }
         }}
         onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
@@ -403,12 +537,27 @@ function GraphCanvas({
         <Background color="#1f2228" gap={22} />
         <Controls showFitView={false} showInteractive={false} />
         <Panel position="top-left" className="graph-label">
-          <span>State topology</span>
+          {interactionProjection && (
+            <button type="button" className="graph-layer-back" onClick={leaveNestedLayer}>
+              {"\u2190"} Pages
+            </button>
+          )}
+          <span>{interactionProjection ? "Page interactions" : "Page topology"}</span>
           <strong>
-            {displayTopology.nodeIds.length} nodes · {Object.keys(edges).length} transitions
-            {rfEdges.length !== Object.keys(edges).length
+            {interactionProjection ? (
+              <>
+                {nodes[nestedPageId ?? ""]?.label || nodes[nestedPageId ?? ""]?.title}
+                {` \u00b7 ${Object.keys(interactionProjection.capabilities).length} interactions`}
+                {` \u00b7 ${interactionProjection.stateIds.length - 1} captured UI states`}
+              </>
+            ) : (
+              <>
+            {displayTopology.nodeIds.length} pages · {Object.keys(pageProjection.edges).length} transitions
+            {rfEdges.length !== Object.keys(pageProjection.edges).length
               ? ` · ${rfEdges.length} visible transition bundles`
               : ""}
+              </>
+            )}
           </strong>
         </Panel>
         <Panel position="bottom-left" className="graph-search">
@@ -416,11 +565,32 @@ function GraphCanvas({
             type="search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Find state, family, or URL"
-            aria-label="Find state, family, or URL"
+            placeholder={interactionProjection ? "Find interaction or UI state" : "Find page, family, or URL"}
+            aria-label={interactionProjection ? "Find interaction or UI state" : "Find page, family, or URL"}
           />
         </Panel>
-        <Panel position="top-right" className="graph-actions">
+        <Panel
+          position="top-right"
+          className="graph-actions"
+          style={{ right: selectedId ? "calc(min(360px, 36vw) + 12px)" : undefined }}
+        >
+          {!interactionProjection
+            && selectedPageProjection
+            && (Object.keys(selectedPageProjection.capabilities).length > 0
+              || selectedPageProjection.stateIds.length > 1)
+            && (
+            <button
+              type="button"
+              className="graph-follow graph-follow--active"
+              onClick={() => {
+                setNestedPageId(selectedPageProjection.pageId);
+                setSelectedInteractionId(null);
+                setSelectedEdgeId(null);
+              }}
+            >
+              View interactions ({Object.keys(selectedPageProjection.capabilities).length})
+            </button>
+          )}
           <button
             type="button"
             className="graph-follow"
@@ -453,9 +623,13 @@ function GraphCanvas({
 }
 
 export function GraphView(props: GraphViewProps) {
+  const pageProjection = useMemo(
+    () => projectPageGraph(props.nodes, props.edges),
+    [props.edges, props.nodes],
+  );
   const topology = useMemo(
-    () => createGraphTopology(props.nodes, props.edges),
-    [props.nodes, props.edges],
+    () => createGraphTopology(pageProjection.nodes, pageProjection.edges),
+    [pageProjection],
   );
   const [displayTopology, setDisplayTopology] = useState(topology);
   const [interacting, setInteracting] = useState(false);
@@ -487,6 +661,7 @@ export function GraphView(props: GraphViewProps) {
       <GraphCanvas
         {...props}
         displayTopology={displayTopology}
+        pageProjection={pageProjection}
         onInteractionChange={setInteracting}
       />
     </ReactFlowProvider>

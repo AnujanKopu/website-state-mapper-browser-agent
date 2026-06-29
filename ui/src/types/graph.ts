@@ -2,6 +2,7 @@
 
 export type StateType =
   | "page"
+  | "page_variant"
   | "modal"
   | "form"
   | "auth_wall"
@@ -39,9 +40,20 @@ export interface ActionStep {
   role?: string | null;
   href?: string | null;
   control_key?: string | null;
+  locator?: Record<string, unknown> | null;
 }
 
-export type SurfaceStatus = "pending" | "explored" | "blocked" | "noop" | "skipped_duplicate";
+export type SurfaceStatus =
+  | "pending"
+  | "explored"
+  | "blocked"
+  | "noop"
+  | "known_state"
+  | "stale"
+  | "failed"
+  | "replay_failed"
+  | "skipped_duplicate"
+  | "inventory_only";
 
 export interface SurfaceItem {
   item_id: string | null;
@@ -52,6 +64,8 @@ export interface SurfaceItem {
   group_id: string | null;
   status: SurfaceStatus;
   href?: string | null;
+  tag?: string | null;
+  role?: string | null;
   in_nav?: boolean;
   in_form?: boolean;
   in_modal?: boolean;
@@ -61,6 +75,9 @@ export interface SurfaceItem {
   aria_haspopup?: string | null;
   aria_pressed?: boolean | null;
   checked?: boolean | null;
+  placeholder?: string | null;
+  name?: string | null;
+  associated_label?: string | null;
   input_type?: string | null;
   required?: boolean;
   autocomplete?: string | null;
@@ -68,6 +85,19 @@ export interface SurfaceItem {
   form_method?: string | null;
   control_key?: string;
   container_key?: string | null;
+  container_type?: string | null;
+  controlled_surface?: {
+    id: string;
+    role?: string | null;
+    visible?: boolean | null;
+  } | null;
+  component_key?: string | null;
+  component_label?: string | null;
+  icon_label?: string | null;
+  probe_reason?: string | null;
+  interaction_scope?: "page_navigation" | "local_ui" | "external" | "unknown";
+  execution_policy?: "navigate" | "probe_local" | "inventory_only" | "blocked";
+  safety_category?: string | null;
 }
 
 export interface ExplorationSummary {
@@ -78,6 +108,12 @@ export interface ExplorationSummary {
   skipped_duplicate?: number;
   visit_status?: "fully_explored" | "partially_explored";
   route_family?: string;
+  route_surface_key?: string;
+  page_anchor_id?: string;
+  variant_kind?: string;
+  inherited_surface_state_id?: string;
+  family_variant_key?: string;
+  family_representative_state_id?: string;
   family_sampled?: number;
   family_skipped?: number;
   auth_context?: "guest" | "authenticated" | "unknown";
@@ -115,6 +151,12 @@ export interface FamilyMetadata {
   support_sources?: string[];
   variant_count?: number;
   dynamic_slots?: string[];
+  family_kind?: "entity_family" | "collection_variant_family" | string;
+  sample_state_ids?: string[];
+  variant_state_ids?: string[];
+  required_samples?: number;
+  completed_samples?: number;
+  deferred_samples?: number;
 }
 
 export interface NavCapability {

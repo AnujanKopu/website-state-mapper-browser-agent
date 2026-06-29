@@ -1,0 +1,10 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+.test-tmp
+data
+smoke-tmp-*
+ui/node_modules
+ui/dist
+*.log

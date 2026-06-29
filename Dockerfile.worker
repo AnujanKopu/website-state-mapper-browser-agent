@@ -1,0 +1,21 @@
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    HOME=/home/pwuser
+
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY engine ./engine
+COPY api ./api
+COPY worker ./worker
+COPY supervisor ./supervisor
+COPY config ./config
+RUN pip install --no-cache-dir . \
+    && mkdir -p /job /home/pwuser \
+    && chown -R pwuser:pwuser /job /home/pwuser
+
+USER pwuser
+ENTRYPOINT ["python", "-m", "worker.main"]

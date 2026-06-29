@@ -48,7 +48,12 @@ async def create_run(body: CreateRunRequest, manager: ManagerDep) -> CreateRunRe
             username=body.credentials.username,
             password=body.credentials.password,
         )
-    handle = manager.start_run(body.url, overrides=body.overrides(), credentials=credentials)
+    try:
+        handle = manager.start_run(
+            body.url, overrides=body.overrides(), credentials=credentials
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return CreateRunResponse(
         run_id=handle.run_id,
         url=handle.url,
@@ -128,7 +133,7 @@ async def get_graph(run_id: str, manager: ManagerDep, sessions: SessionsDep) -> 
         graph["run"]["status"] = RunStatus.PAUSED.value
     terminal = graph["run"]["status"] in {"done", "failed", "cancelled"}
     graph["sync"] = {
-        "schema_version": 2,
+        "schema_version": 4,
         "snapshot_sequence": snapshot_sequence,
         "authoritative": handle is None or handle.done or terminal,
         "latest_state_id": graph["states"][-1]["id"] if graph["states"] else None,

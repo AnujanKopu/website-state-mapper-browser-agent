@@ -114,11 +114,14 @@ class FamilyCandidate:
     urls: list[str]
     evidences: list[LinkEvidence]
     dynamic_slots: list[str]
+    family_kind: str = "entity_family"
     status: str = "provisional"
     sample_targets: list[str] = field(default_factory=list)
     samples: dict[str, StructureSignature] = field(default_factory=dict)
+    sample_state_ids: dict[str, str] = field(default_factory=dict)
     deferred_urls: set[str] = field(default_factory=set)
     skipped_urls: set[str] = field(default_factory=set)
+    collection_anchor_urls: set[str] = field(default_factory=set)
 
     @property
     def support_sources(self) -> list[str]:
@@ -130,6 +133,7 @@ class FamilyCandidate:
             "id": self.family_id,
             "label": self.label,
             "kind": "items",
+            "family_kind": self.family_kind,
             "pattern": self.pattern,
             "label_source": "heuristic",
             "confidence": 0.92 if self.status == "confirmed" else 0.72,
@@ -143,6 +147,11 @@ class FamilyCandidate:
             "dynamic_slots": list(self.dynamic_slots),
             "sample_labels": sample_labels,
             "sample_urls": list(self.samples)[:8],
+            "sample_state_ids": list(dict.fromkeys(self.sample_state_ids.values()))[:8],
+            "required_samples": min(3, len(self.urls)),
+            "completed_samples": len(self.samples),
+            "deferred_samples": len(self.deferred_urls),
+            "variant_state_ids": [],
         }
 
 
@@ -438,6 +447,7 @@ class FamilyRegistry:
         self._tokens: dict[str, UrlTokens] = {}
         self._candidates: dict[str, FamilyCandidate] = {}
         self._url_to_pattern: dict[str, str] = {}
+        self._source_signatures: dict[str, StructureSignature] = {}
         self._order = 0
 
     @property
@@ -449,16 +459,19 @@ class FamilyRegistry:
         *,
         source_key: str,
         source_structure: str,
+        source_signature: StructureSignature | None = None,
         base_url: str,
         items: list[Interactable],
     ) -> list[FamilyCandidate]:
+        if source_signature is not None:
+            self._source_signatures[source_key] = source_signature
         for item in items:
             if not item.href:
                 continue
             parsed = tokenize_url(item.href, base_url=base_url)
             if parsed is None:
                 continue
-            peripheral = item.in_nav or item.region in {"nav", "header", "footer"}
+            peripheral = item.in_nav or item.region in {"nav", "header", "aside", "footer"}
             evidence = LinkEvidence(
                 url=parsed.url,
                 source_key=source_key,
@@ -626,7 +639,10 @@ class FamilyRegistry:
                 existing.urls = urls
                 existing.evidences = evidences
                 existing.dynamic_slots = slots
-            target_count = min(self.sample_cap, len(urls))
+            # Three representatives are the minimum structural validation set
+            # for a dynamic family. The configured cap still controls retained
+            # graph variants, not whether we validate too early.
+            target_count = min(max(3, self.sample_cap), len(urls))
             if len(existing.sample_targets) < target_count:
                 existing.sample_targets = _pick_diverse_samples(
                     urls, evidences, pattern, target_count
@@ -697,15 +713,17 @@ class FamilyRegistry:
             candidate.status = "rejected"
             return old_status, candidate.status
         candidate.samples[parsed.url] = structure_signature(observation)
+        self._classify_family_kind(candidate)
         samples = list(candidate.samples.values())
+        required_samples = min(3, len(candidate.urls))
         compatible_pair = any(
             structures_compatible(samples[left], samples[right])
             for left in range(len(samples))
             for right in range(left + 1, len(samples))
         )
-        if compatible_pair:
+        if len(samples) >= required_samples and compatible_pair:
             candidate.status = "confirmed"
-        elif len(samples) >= min(len(candidate.urls), len(candidate.sample_targets)):
+        elif len(samples) >= len(candidate.sample_targets):
             next_count = min(self.validation_cap, len(candidate.urls))
             if len(candidate.sample_targets) < next_count:
                 candidate.sample_targets = _pick_diverse_samples(
@@ -717,6 +735,48 @@ class FamilyRegistry:
             else:
                 candidate.status = "rejected"
         return old_status, candidate.status
+
+    def _classify_family_kind(self, candidate: FamilyCandidate) -> None:
+        """Classify category/result routes only from validated shell evidence.
+
+        A path prefix alone is ambiguous (``/users/:id`` may be an entity
+        family).  Treat it as a collection variant only when the exact prefix
+        page was an observed source and its rendered shell is compatible with
+        at least one sampled destination. Query-driven cohorts are variants by
+        construction.
+        """
+        if any(slot.startswith("query:") for slot in candidate.dynamic_slots):
+            candidate.family_kind = "collection_variant_family"
+            return
+        pattern = tokenize_url(candidate.pattern)
+        if pattern is None:
+            return
+        prefix: list[str] = []
+        for segment in pattern.segments:
+            if _PLACEHOLDER.match(segment):
+                break
+            prefix.append(segment)
+        if not prefix or not candidate.samples:
+            return
+        compatible_anchors: set[str] = set()
+        for evidence in candidate.evidences:
+            source = self._source_signatures.get(evidence.source_key)
+            source_url = tokenize_url(source.url) if source is not None else None
+            if source is None or source_url is None or tuple(prefix) != source_url.segments:
+                continue
+            if any(structures_compatible(source, sample) for sample in candidate.samples.values()):
+                compatible_anchors.add(source_url.url)
+        if compatible_anchors:
+            candidate.family_kind = "collection_variant_family"
+            candidate.collection_anchor_urls.update(compatible_anchors)
+
+    def record_sample_state(
+        self, candidate: FamilyCandidate, url: str, state_id: str
+    ) -> None:
+        """Attach retained exact-state evidence to an observed representative."""
+        parsed = tokenize_url(url)
+        if parsed is not None and parsed.url in candidate.samples:
+            candidate.sample_state_ids[parsed.url] = state_id
 
     def reject_unresolved(self) -> list[FamilyCandidate]:
         rejected = []

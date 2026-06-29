@@ -51,15 +51,18 @@ class TestNormalizeUrl:
             "https://a.com/CaseSensitivePath"
         )
 
-    def test_numeric_segment_becomes_id(self):
-        assert normalize_url("https://a.com/users/12345/posts") == "https://a.com/users/:id/posts"
+    def test_numeric_segment_remains_exact_identity(self):
+        assert normalize_url("https://a.com/users/12345/posts") == (
+            "https://a.com/users/12345/posts"
+        )
 
-    def test_uuid_segment_becomes_id(self):
+    def test_uuid_segment_remains_exact_identity(self):
         url = "https://a.com/orders/123e4567-e89b-12d3-a456-426614174000"
-        assert normalize_url(url) == "https://a.com/orders/:id"
+        assert normalize_url(url) == url
 
-    def test_long_hex_segment_becomes_id(self):
-        assert normalize_url("https://a.com/t/9f86d081884c7d65") == "https://a.com/t/:id"
+    def test_long_hex_segment_remains_exact_identity(self):
+        url = "https://a.com/t/9f86d081884c7d65"
+        assert normalize_url(url) == url
 
     def test_short_word_segment_untouched(self):
         assert normalize_url("https://a.com/pricing") == "https://a.com/pricing"

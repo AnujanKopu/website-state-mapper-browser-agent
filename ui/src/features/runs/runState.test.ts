@@ -58,6 +58,76 @@ function resetState() {
 }
 
 describe("runReducer", () => {
+  it("replaces stale live entities with an authoritative snapshot", () => {
+    const live = runReducer(resetState(), {
+      type: "hydrate",
+      graph: graph([graphState("kept", 0), graphState("provisional", 1)]),
+    });
+    const authoritative = {
+      ...graph([graphState("kept", 0, { title: "Final" })], { status: "done" }),
+      sync: {
+        schema_version: 4,
+        snapshot_sequence: 5,
+        authoritative: true,
+        latest_state_id: "kept",
+      },
+    } satisfies GraphDocument;
+
+    const hydrated = runReducer(live, { type: "hydrate", graph: authoritative });
+
+    expect(Object.keys(hydrated.nodes)).toEqual(["kept"]);
+    expect(hydrated.nodes.kept.title).toBe("Final");
+    expect(hydrated.order).toEqual(["kept"]);
+  });
+
+  it("applies authoritative live surface status updates", () => {
+    const discovered = runReducer(resetState(), {
+      type: "sse",
+      envelope: event(1, "state_discovered", {
+        state_id: "s0",
+        index: 0,
+        url: "https://example.com",
+        url_normalized: "https://example.com",
+        title: "Home",
+        type: "page",
+        depth: 0,
+        parent_state_id: null,
+        screenshot: "",
+        flags: {},
+        denied_count: 0,
+        surface_items: [{
+          item_id: "chart",
+          label: "Chart",
+          kind: "button",
+          region: "main",
+          fold: 0,
+          group_id: null,
+          status: "pending",
+        }],
+      }),
+    });
+    const updated = runReducer(discovered, {
+      type: "sse",
+      envelope: event(2, "surface_items_discovered", {
+        state_id: "s0",
+        surface_items: [{
+          item_id: "chart",
+          label: "Chart",
+          kind: "button",
+          region: "main",
+          fold: 0,
+          group_id: null,
+          status: "explored",
+          execution_policy: "probe_local",
+        }],
+        exploration: { explored: 1, pending: 0 },
+      }),
+    });
+
+    expect(updated.nodes.s0.surface_items?.[0].status).toBe("explored");
+    expect(updated.nodes.s0.exploration?.pending).toBe(0);
+  });
+
   it("deduplicates replayed and out-of-order SSE envelopes", () => {
     const discovered = event(5, "state_discovered", {
       state_id: "s1",
@@ -156,7 +226,7 @@ describe("runReducer", () => {
     });
     const stale = graph([graphState("s1", 1, { title: "Stale title" }), graphState("s2", 2)]);
     stale.sync = {
-      schema_version: 2,
+      schema_version: 4,
       snapshot_sequence: 2,
       authoritative: false,
       latest_state_id: "s2",
@@ -188,7 +258,7 @@ describe("runReducer", () => {
     });
     const current = graph([graphState("s1", 1), graphState("s2", 2)]);
     current.sync = {
-      schema_version: 2,
+      schema_version: 4,
       snapshot_sequence: 3,
       authoritative: false,
       latest_state_id: "s2",

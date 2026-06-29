@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Navigation discovery</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    header, nav, main { padding: 16px; }
+    nav { width: 240px; }
+    a, button, [role="link"] { display: block; min-height: 28px; margin: 4px; }
+    .responsive-copy { position: relative; width: 180px; height: 32px; }
+    .responsive-copy > * { position: absolute; inset: 0; width: 180px; height: 32px; }
+    .responsive-copy [role="link"] { z-index: 2; background: white; cursor: pointer; }
+    #more-routes[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="guide" aria-label="Guide" aria-pressed="true">Guide</button>
+  </header>
+  <nav aria-label="Primary navigation">
+    <section>
+      <div id="items">
+        <a href="about.html">Home</a>
+        <div class="responsive-copy">
+          <a href="spa.html">Shorts</a>
+          <div role="link" aria-label="Shorts">Shorts</div>
+        </div>
+        <a href="docs.html">Subscriptions</a>
+      </div>
+    </section>
+    <section>
+      <div id="items">
+        <a href="family.html">Music</a>
+        <a href="pricing.html">Movies &amp; TV</a>
+        <a href="post1.html">Live</a>
+      </div>
+    </section>
+    <button id="show-more" type="button">Show more</button>
+    <div id="more-routes" hidden>
+      <a href="post2.html">Gaming</a>
+      <a href="post3.html">News</a>
+      <a href="recovery.html">Learning</a>
+    </div>
+  </nav>
+  <main><h1>Navigation fixture</h1></main>
+  <script>
+    document.querySelector('[role="link"]').addEventListener('click', () => {
+      location.href = 'spa.html';
+    });
+    document.querySelector('#show-more').addEventListener('click', (event) => {
+      document.querySelector('#more-routes').hidden = false;
+      event.currentTarget.textContent = 'Show less';
+    });
+  </script>
+</body>
+</html>

@@ -107,6 +107,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "playwright" },
     { name = "pydantic" },
@@ -130,8 +131,9 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "fastapi", specifier = ">=0.136.3" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pillow", specifier = ">=10.4" },
-    { name = "playwright", specifier = ">=1.49" },
+    { name = "playwright", specifier = "==1.60.0" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-settings", specifier = ">=2.6" },
     { name = "pyyaml", specifier = ">=6.0" },

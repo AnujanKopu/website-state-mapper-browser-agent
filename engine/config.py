@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///data/flowstate.db"
     data_dir: Path = Path("data")
     run_config_path: Path = Path("config/default_run.yaml")
+    # Hosted deployments reject private/file targets at the manager boundary.
+    # Local development keeps file:// fixtures and localhost available.
+    hosted_mode: bool = False
+    # The public API talks only to this private supervisor. The supervisor,
+    # not the API or crawl container, owns the rootless runtime socket.
+    supervisor_url: str | None = None
+    supervisor_token: str | None = None
+    worker_job_root: Path = Path("data/worker-jobs")
 
     model_config = SettingsConfigDict(
         env_prefix="FLOWSTATE_",

@@ -44,7 +44,10 @@ async def observe_page(
     """Stabilize and observe the current page; compute all identity signals."""
     await stabilize(page, config.browser.stabilize_quiet_ms)
     interactables = await discover_interactables(
-        page, config.capture.max_interactables, config.capture.max_scroll_steps
+        page,
+        config.capture.max_interactables,
+        config.capture.max_scroll_steps,
+        config.capture.max_inventory_controls,
     )
     # Discovery restores the page to the top. Capturing afterwards keeps the
     # DOM/screenshot aligned with any lazy content revealed by the scroll sweep.

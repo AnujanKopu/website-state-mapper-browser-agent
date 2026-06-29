@@ -6,7 +6,9 @@ asserts on the resulting graph structure.
 """
 
 import json
+from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 from engine.config import Settings
 from engine.db.session import create_db_engine, create_session_factory
@@ -34,6 +36,192 @@ async def _run_exploration(settings: Settings) -> dict:
     return graph
 
 
+async def test_broad_navigation_and_local_controls_use_separate_layers(
+    settings: Settings, tmp_path: Path
+):
+    explorer = Explorer(settings, _test_config())
+    run_id = await explorer.run((FIXTURE_SITE / "controls.html").as_uri())
+    engine = create_db_engine(settings.database_url)
+    sessions = create_session_factory(engine)
+    graph = await export_graph(sessions, run_id)
+    await engine.dispose()
+
+    root = next(state for state in graph["states"] if state["depth"] == 0)
+    urls = {state["url_normalized"] for state in graph["states"]}
+    for filename in (
+        "login.html",
+        "signup.html",
+        "pricing.html",
+        "docs.html",
+        "post1.html",
+        "spa.html",
+    ):
+        assert any(url.endswith(filename) for url in urls), filename
+    signup = next(
+        state for state in graph["states"] if state["url_normalized"].endswith("signup.html")
+    )
+    assert signup["type"] == "form"
+    assert signup["flags"]["auth_surface_kind"] == "registration"
+
+    by_label = {item["label"].lower(): item for item in root["surface_items"]}
+    for label in ("search", "all categories", "chart", "metrics (7/34)", "table"):
+        assert label in by_label
+    assert by_label["download"]["status"] == "blocked"
+    assert by_label["download"]["execution_policy"] == "blocked"
+    assert not list(tmp_path.rglob("games.csv"))
+    assert any(
+        item["label"].lower() == "search" and item["probe_reason"] == "focus_search"
+        for item in root["surface_items"]
+    )
+    assert graph["run"]["stats"]["local_probes"] > 0
+
+    nested = [
+        state for state in graph["states"] if state["parent_state_id"] == root["id"]
+    ]
+    assert nested
+    assert any(state["type"] in {"modal", "dropdown"} for state in nested)
+    assert any("?filter=" in state["url"] for state in nested)
+
+
+async def test_navigation_disclosure_reveals_primary_routes_once(settings: Settings):
+    config = RunConfig(
+        browser=BrowserConfig(stabilize_quiet_ms=50),
+        budgets=BudgetConfig(
+            max_states=30,
+            max_actions=40,
+            max_depth=1,
+            max_wall_seconds=120,
+        ),
+    )
+    explorer = Explorer(settings, config)
+    run_id = await explorer.run((FIXTURE_SITE / "navigation.html").as_uri())
+    engine = create_db_engine(settings.database_url)
+    sessions = create_session_factory(engine)
+    graph = await export_graph(sessions, run_id)
+    await engine.dispose()
+
+    root = next(state for state in graph["states"] if state["depth"] == 0)
+    by_label = {item["label"]: item for item in root["surface_items"]}
+    assert {"Music", "Movies & TV", "Live", "Gaming", "News", "Learning"} <= set(
+        by_label
+    )
+    assert by_label["Guide"]["status"] == "inventory_only"
+    assert by_label["Show more"]["status"] == "explored"
+    stats = graph["run"]["stats"]
+    assert stats["navigation_links_revealed"] == 3
+    assert stats["stale_actions"] == 0
+    assert stats["unresolved_discovery_obligations"] == 0
+
+
+async def test_required_navigation_failure_prevents_false_completion(settings: Settings):
+    config = RunConfig(
+        browser=BrowserConfig(stabilize_quiet_ms=50),
+        budgets=BudgetConfig(max_states=10, max_actions=10, max_depth=1, max_wall_seconds=60),
+    )
+    explorer = Explorer(settings, config)
+    run_id = await explorer.run((FIXTURE_SITE / "required-failure.html").as_uri())
+    engine = create_db_engine(settings.database_url)
+    sessions = create_session_factory(engine)
+    graph = await export_graph(sessions, run_id)
+    await engine.dispose()
+
+    stats = graph["run"]["stats"]
+    assert stats["completion_status"] == "partial"
+    assert stats["failed_actions"] == 1
+    assert stats["required_action_failures"] == 1
+
+
+async def test_semantic_edges_survive_legacy_selector_uniqueness(settings: Settings):
+    from sqlalchemy import select
+
+    from engine.db import models as db
+    from engine.db.session import init_db
+    from engine.explorer import Frontier, StateMeta
+    from engine.schemas import StateType
+
+    engine = create_db_engine(settings.database_url)
+    await init_db(engine)
+    sessions = create_session_factory(engine)
+    run_id = "selector-collision"
+
+    def row(state_id: str, fingerprint: str) -> db.StateNode:
+        return db.StateNode(
+            id=state_id,
+            run_id=run_id,
+            fingerprint=fingerprint,
+            url=f"https://app.test/{state_id}",
+            url_normalized=f"https://app.test/{state_id}",
+            screenshot_path="",
+            dom_snapshot_path="",
+            text_hash=fingerprint,
+        )
+
+    async with sessions() as session:
+        session.add(db.Run(id=run_id, url="https://app.test", status="running"))
+        session.add_all([row("source", "source-fp"), row("one", "one-fp"), row("two", "two-fp")])
+        await session.commit()
+
+    explorer = Explorer(settings, RunConfig(), session_factory=sessions)
+    explorer._run_id = run_id
+    explorer._sessions = sessions
+    explorer._edge_records = {}
+    explorer._stats = defaultdict(int)
+    explorer._timings = defaultdict(float)
+    explorer._budget = SimpleNamespace(actions=0)
+    explorer._frontier = Frontier()
+    source = StateMeta(
+        id="source", index=0, url="https://app.test/source",
+        url_normalized="https://app.test/source", depth=0, path=[], state_type=StateType.PAGE,
+    )
+    destinations = [
+        StateMeta(
+            id=state_id, index=index, url=f"https://app.test/{state_id}",
+            url_normalized=f"https://app.test/{state_id}", depth=1, path=[],
+            state_type=StateType.PAGE,
+        )
+        for index, state_id in enumerate(("one", "two"), 1)
+    ]
+    common = dict(
+        action_type="click",
+        label="Activate control",
+        selector="body > div > a",
+        element_text="Control",
+        confidence=1.0,
+        collapsed_count=1,
+        via="performed",
+        surface_item_id="control",
+        transition_kind="link",
+        scope="local",
+        reversible=False,
+        evidence={"mode": "performed", "validated": True},
+    )
+
+    await explorer._upsert_transition(source, destinations[0], capability_id="first", **common)
+    await explorer._upsert_transition(source, destinations[1], capability_id="second", **common)
+
+    async with sessions() as session:
+        edges = (
+            await session.execute(select(db.Edge).where(db.Edge.run_id == run_id))
+        ).scalars().all()
+    await engine.dispose()
+
+    assert len(edges) == 2
+    assert len({edge.transition_key for edge in edges}) == 2
+    assert len({edge.selector for edge in edges}) == 2
+    assert any("/*flowstate-edge:" in edge.selector for edge in edges)
+
+
+def test_active_budget_ignores_auth_wait_and_novelty_streaks():
+    from engine.explorer import Budget
+
+    budget = Budget(BudgetConfig(max_wall_seconds=10))
+    budget._started -= 100
+    budget._paused_total = 95
+
+    assert budget.active_elapsed_seconds < 10
+    assert budget.stop_reason(state_count=1, actions_since_new=10_000) is None
+
+
 async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path):
     graph = await _run_exploration(settings)
     states, edges = graph["states"], graph["edges"]
@@ -43,6 +231,9 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert graph["run"]["status"] == "done"
     stats = graph["run"]["stats"]
     assert stats["states"] == len(states)
+    assert stats["page_states"] == len([state for state in states if not state["parent_state_id"]])
+    assert stats["substates"] >= 1
+    assert stats["interaction_nodes"] > 0
     assert stats["edges"] == len(edges)
     assert stats["actions_denied"] > 0
     assert stats["completion_status"] == "complete"
@@ -58,31 +249,31 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
     assert any(u.endswith("docs.html") for u in urls)
     assert any(u.endswith("checkout.html") for u in urls)
 
-    # --- modal is a first-class state (same URL as root, different node) ---
-    modal_states = [s for s in states if s["type"] == "modal"]
-    assert modal_states
-    assert any(s["url_normalized"] == root["url_normalized"] for s in modal_states)
-
-    # --- modal Close loops back to root via dedup, not a duplicate node ---
-    modal_ids = {s["id"] for s in modal_states}
-    assert any(e["from"] in modal_ids and e["to"] == root["id"] for e in edges)
-
-    # --- tab switch is a state: another same-URL node beyond root/modals ---
-    same_url_states = [s for s in states if s["url_normalized"] == root["url_normalized"]]
-    assert len(same_url_states) >= 3  # root + modal + tab/dropdown variants
+    # --- structural local controls are probed into the nested layer ---
+    assert any(s["parent_state_id"] == root["id"] for s in states)
+    root_items = root["surface_items"]
+    assert any(item["kind"] == "tab" for item in root_items)
+    assert any(item["label"] == "Sign up" for item in root_items)
+    local_items = [item for item in root_items if item["interaction_scope"] == "local_ui"]
+    assert local_items
+    assert any(item["status"] == "explored" for item in local_items)
+    assert all(
+        item["status"] in {"explored", "noop", "inventory_only", "blocked", "skipped_duplicate"}
+        for item in local_items
+    )
 
     # --- payment-like terminal detected and not expanded ---
-    risky = [s for s in states if s["type"] == "risky_terminal"]
-    assert len(risky) == 1
-    checkout = risky[0]
+    payment_boundaries = [s for s in states if s["flags"].get("payment_required")]
+    assert len(payment_boundaries) == 1
+    checkout = payment_boundaries[0]
     assert checkout["url_normalized"].endswith("checkout.html")
     assert checkout["flags"]["payment_required"] is True
     denied_categories = {d["category"] for d in checkout["flags"]["denied_actions"]}
     assert "payment" in denied_categories
     checkout_out = [e for e in edges if e["from"] == checkout["id"]]
-    assert checkout_out
-    assert all(e["transition_kind"] == "back" for e in checkout_out)
-    assert all(e["reversible"] for e in checkout_out)
+    # Direct safe URL navigation does not synthesize browser Back/Forward
+    # observations, and a payment boundary is never expanded.
+    assert checkout_out == []
 
     # --- peripheral resources are recorded as skipped surface items instead
     # of consuming the main product-state budget.
@@ -161,38 +352,16 @@ async def test_exploration_builds_state_graph(settings: Settings, tmp_path: Path
         for e in history_edges
     )
 
-    # Tabs expose both directions because both controls are visible in each
-    # captured state; neither direction creates another canonical page.
-    tab_state = next(
-        s for s in states if s["type"] == "tab" and "Integrations" in (s["label"] or s["title"])
-    )
-    assert any(
-        e["from"] == home["id"] and e["to"] == tab_state["id"] and e["transition_kind"] == "tab"
-        for e in edges
-    )
-    assert any(
-        e["from"] == tab_state["id"] and e["to"] == home["id"] and e["transition_kind"] == "tab"
-        for e in edges
-    )
+    # Tabs are local transitions and their states stay out of page topology.
+    assert any(e["transition_kind"] == "tab" for e in edges)
 
     # Stable semantic keys prevent duplicate inferred/performed rows.
     assert len({e["transition_key"] for e in edges}) == len(edges)
 
-    # --- same-URL sub-states hang off their parent page ---
-    for modal in modal_states:
-        assert modal["parent_state_id"] == root["id"]
-    sub_states = [s for s in states if s["parent_state_id"]]
-    assert all(s["parent_state_id"] in by_id for s in sub_states)
-    # tab/dropdown variants are reclassified, not left as generic pages
-    assert any(s["type"] in {"tab", "dropdown"} for s in sub_states)
-
     # --- surface items + coverage are exported per state ---
     assert root["surface_items"], "root should expose surface items"
     assert all("status" in item and "item_id" in item for item in root["surface_items"])
-    assert root["exploration"].get("visit_status") in {
-        "fully_explored",
-        "partially_explored",
-    }
+    assert root["exploration"].get("visit_status") == "fully_explored"
     # the risky checkout's payment buttons surface as blocked items
     blocked_labels = {
         item["label"] for item in checkout["surface_items"] if item["status"] == "blocked"
@@ -265,10 +434,17 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
         for state in graph["states"]
         if "/profiles/" in state["url"] and state["parent_state_id"] is None
     ]
-    assert len(profile_states) == 2  # shared template + moderator structural variant
+    # All three exact representatives remain persisted. Projection may later
+    # collapse equivalent samples to one visible structural variant.
+    assert len(profile_states) == 3
+    assert max(
+        state["exploration"].get("family", {}).get("checked_count", 0)
+        for state in profile_states
+    ) == 3
     assert any(state["url"].endswith("alice.html") for state in profile_states)
+    assert any(state["url"].endswith("bob.html") for state in profile_states)
     assert any(state["url"].endswith("moderator.html") for state in profile_states)
-    assert not any(state["url"].endswith(("bob.html", "carol.html")) for state in profile_states)
+    assert not any(state["url"].endswith("carol.html") for state in profile_states)
 
     root = next(state for state in graph["states"] if state["depth"] == 0)
     family_items = [
@@ -282,7 +458,9 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
     )
 
     stats = graph["run"]["stats"]
-    assert stats["family_dedup_hits"] == 1
+    # All three required samples retain exact states; only later, unsampled
+    # equivalent members may be suppressed by the confirmed family.
+    assert stats["family_dedup_hits"] == 0
     assert stats["family_urls_skipped"] == 1
     assert stats["actions_performed"] <= 5
 
@@ -290,6 +468,7 @@ async def test_dynamic_route_family_merges_templates_and_preserves_variant(
     assert all(meta["route_family"] for meta in family_meta)
     assert all(meta["family_sampled"] == 3 for meta in family_meta)
     assert all(meta["family_skipped"] == 1 for meta in family_meta)
+    assert all(len(meta["family"]["sample_state_ids"]) == 3 for meta in family_meta)
     assert any(edge["collapsed_count"] == 4 for edge in graph["edges"])
 
 
@@ -374,6 +553,7 @@ def test_enqueue_actions_prefers_highest_scored():
     explorer = Explorer(Settings(), RunConfig())
     explorer._frontier = Frontier()
     explorer._visited_urls = set()
+    explorer._root_url = "https://app.test/"
     meta = StateMeta(
         id="root",
         index=0,
@@ -386,7 +566,14 @@ def test_enqueue_actions_prefers_highest_scored():
 
     def cand(label: str, score: float) -> ActionCandidate:
         return ActionCandidate(
-            interactable=Interactable(selector=f"#{label}", tag="a", text=label, bounding_box=box),
+            interactable=Interactable(
+                selector=f"#{label}",
+                tag="a",
+                text=label,
+                href=f"/{label}",
+                execution_policy="navigate",
+                bounding_box=box,
+            ),
             score=score,
         )
 
@@ -492,6 +679,47 @@ def test_same_url_substate_skips_url_dedup():
     )
     key = key_for(observation)
     assert explorer._resolve_existing_state(observation, source, key) is None
+
+
+def test_interaction_policy_probes_structural_controls_only():
+    from engine.explorer import Explorer
+    from engine.schemas import BoundingBox, Interactable, RunConfig
+
+    explorer = Explorer(Settings(), RunConfig())
+    explorer._root_url = "https://app.test/"
+    box = BoundingBox(x=0, y=0, width=20, height=20)
+    button = Interactable(selector="#filter", tag="button", text="Filter", bounding_box=box)
+    search = Interactable(
+        selector="#search",
+        tag="input",
+        input_type="search",
+        placeholder="Search",
+        bounding_box=box,
+    )
+    link = Interactable(
+        selector="#docs",
+        tag="a",
+        text="Docs",
+        href="https://app.test/docs",
+        bounding_box=box,
+    )
+    external = Interactable(
+        selector="#outside",
+        tag="a",
+        text="Outside",
+        href="https://outside.test/",
+        bounding_box=box,
+    )
+
+    for item in (button, search, link, external):
+        explorer._annotate_interaction_policy(item)
+
+    assert button.execution_policy == "probe_local"
+    assert button.probe_reason == "labelled_structural_button"
+    assert search.execution_policy == "probe_local"
+    assert search.probe_reason == "focus_search"
+    assert link.execution_policy == "navigate"
+    assert external.execution_policy == "blocked"
 
 
 async def test_browser_back_mismatch_does_not_create_reverse_edge(monkeypatch):

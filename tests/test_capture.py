@@ -63,6 +63,9 @@ async def test_single_capture_end_to_end(settings: Settings):
 
     submit = next(i for i in state.interactables if i.label == "Send message")
     assert submit.in_form
+    email = next(i for i in state.interactables if i.associated_label == "Email")
+    assert email.kind == "text_input"
+    assert email.text is None  # never capture the current field value
 
     # --- artifacts on disk ---
     store = LocalStorage(settings.data_dir)
@@ -108,7 +111,8 @@ async def test_viewport_grounded_surface_discovery(settings: Settings):
     # --- a link wrapping a button collapses to a single surface item ---
     wrapped = [i for i in items if i.label == "Wrapped action"]
     assert len(wrapped) == 1
-    assert wrapped[0].tag == "button"
+    assert wrapped[0].tag == "a"
+    assert wrapped[0].href and wrapped[0].href.endswith("/wrapped.html")
 
     # --- regions are tagged from the surrounding landmark ---
     assert by_label["Home"].region == "nav"
@@ -131,6 +135,47 @@ async def test_viewport_grounded_surface_discovery(settings: Settings):
 
     # --- every surface item carries a stable id and absolute geometry ---
     assert all(i.item_id and i.page_box is not None for i in items)
+
+
+async def test_composite_and_icon_controls_have_distinct_semantics(settings: Settings):
+    state = await run_single_capture((FIXTURE_SITE / "controls.html").as_uri(), settings)
+    items = state.interactables
+    labels = {item.label.lower() for item in items}
+
+    assert "chart" in labels
+    assert "metrics (7/34)" in labels
+    assert "search" in labels
+    assert "download" in labels
+    assert "table" in labels
+    assert any("all categories" in label for label in labels)
+
+    filters = [item for item in items if (item.icon_label or "").lower() == "filter"]
+    assert len(filters) == 2
+    assert len({item.item_id for item in filters}) == 2
+    assert len({item.component_key for item in filters}) == 2
+    assert {item.component_label for item in filters} == {"Visits", "Players"}
+
+    icon_buttons = [item for item in items if item.icon_label in {"download", "table"}]
+    assert len(icon_buttons) == 2
+    assert len({item.item_id for item in icon_buttons}) == 2
+
+
+async def test_duplicate_ancestor_ids_and_responsive_route_owners_are_preserved(
+    settings: Settings,
+):
+    state = await run_single_capture((FIXTURE_SITE / "navigation.html").as_uri(), settings)
+    items = state.interactables
+    labels = [item.label for item in items]
+
+    assert {"Home", "Subscriptions", "Music", "Movies & TV", "Live"} <= set(labels)
+    assert "Gaming" not in labels  # revealed only after the disclosure is probed
+    assert len({item.selector for item in items}) == len(items)
+    assert all(not item.selector.startswith("#items >") for item in items if item.label in labels)
+
+    shorts = [item for item in items if item.label == "Shorts"]
+    assert len(shorts) == 1
+    assert shorts[0].href and shorts[0].href.endswith("/spa.html")
+    assert shorts[0].locator["adopted_href"] is True
 
 
 async def test_failed_navigation_marks_run_failed(settings: Settings, tmp_path: Path):

@@ -136,6 +136,98 @@ def test_classify_login_page_as_auth_wall():
     assert analysis.flags["auth_required"] is True
 
 
+def test_registration_surface_is_not_a_login_gate():
+    """Registration can be mapped, but must never trigger credential autofill."""
+    from engine.schemas import BoundingBox
+
+    item = Interactable(
+        selector="#login",
+        tag="a",
+        text="Log in",
+        href="https://app.test/login",
+        bounding_box=BoundingBox(x=0, y=0, width=80, height=32),
+        item_id="login",
+    )
+    observation = Observation(
+        snapshot=PageSnapshot(
+            url="https://app.test/signup.html",
+            title="Sign up",
+            visible_text="Create your account Email Password Sign up",
+            html="<form></form>",
+            screenshot_png=b"",
+            dom_skeleton="<form><input type=password></form>",
+            signals=PageSignals(password_fields=1, form_count=1),
+        ),
+        interactables=[item],
+        url_normalized="https://app.test/signup.html",
+        text_digest="a",
+        text_simhash=1,
+        skeleton_hash="signup",
+        action_sig="signup-actions",
+        screenshot_dhash=2,
+        fingerprint="signup",
+    )
+
+    analysis = analyze_state(observation, base_url="https://app.test/")
+
+    assert analysis.state_type == StateType.FORM
+    assert analysis.flags["auth_surface_kind"] == "registration"
+
+
+def test_auth_discovery_schedules_signup_before_login():
+    from engine.classify import StateAnalysis
+    from engine.explorer import Frontier, StateMeta
+    from engine.ranking import ActionCandidate
+    from engine.schemas import BoundingBox
+
+    explorer = Explorer(Settings(), RunConfig())
+    explorer._root_url = "https://app.test/"
+    explorer._frontier = Frontier()
+    explorer._visited_urls = set()
+    meta = StateMeta(
+        id="root",
+        index=0,
+        url="https://app.test/",
+        url_normalized="https://app.test/",
+        depth=0,
+        path=[],
+        state_type=StateType.PAGE,
+    )
+    box = BoundingBox(x=0, y=0, width=80, height=32)
+
+    def candidate(label: str, href: str) -> ActionCandidate:
+        return ActionCandidate(
+            interactable=Interactable(
+                selector=f"#{label.lower().replace(' ', '-')}",
+                tag="a",
+                text=label,
+                href=href,
+                bounding_box=box,
+                item_id=label,
+                execution_policy="navigate",
+            )
+        )
+
+    signup = candidate("Sign up", "https://app.test/signup")
+    login = candidate("Log in", "https://app.test/login")
+    analysis = StateAnalysis(
+        candidates=[signup, login],
+        safe=[signup, login],
+        denied=[],
+        state_type=StateType.PAGE,
+        flags={},
+    )
+
+    explorer._enqueue_auth_discovery(meta, analysis)
+
+    first = explorer._frontier.pop()
+    second = explorer._frontier.pop()
+    assert first.candidate.interactable.label == "Sign up"
+    assert first.phase == 0
+    assert second.candidate.interactable.label == "Log in"
+    assert second.phase == 1
+
+
 # ---------------------------------------------------------------------------
 # Unit: AUTH_WALL actions are never enqueued without hook resolution
 # ---------------------------------------------------------------------------
@@ -185,7 +277,7 @@ def test_auth_wall_actions_not_enqueued_without_hook():
 # ---------------------------------------------------------------------------
 
 
-async def test_auth_gate_hook_skip_no_post_auth(settings: Settings):
+async def test_auth_gate_hook_skip_no_post_auth(settings: Settings, monkeypatch):
     """When hook returns 'skip', _handle_auth_wall must return None."""
     from engine.explorer import Explorer, StateMeta
 
@@ -203,7 +295,9 @@ async def test_auth_gate_hook_skip_no_post_auth(settings: Settings):
     # Minimal setup needed by _handle_auth_wall
     explorer._states = {}
     explorer._run_id = "test-run"
-    explorer._credentials = None
+    autofill = AsyncMock()
+    monkeypatch.setattr("engine.explorer.autofill_auth_form", autofill)
+    explorer._credentials = Credentials(username="user@test.com", password="secret")
     explorer._config = RunConfig(
         browser=BrowserConfig(stabilize_quiet_ms=50),
         budgets=BudgetConfig(),
@@ -242,6 +336,7 @@ async def test_auth_gate_hook_skip_no_post_auth(settings: Settings):
     assert payload["decision"] is None  # pending at emit time
     assert "resume" in payload["suggested_actions"]
     assert "skip" in payload["suggested_actions"]
+    autofill.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

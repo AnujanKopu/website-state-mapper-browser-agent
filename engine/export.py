@@ -44,15 +44,25 @@ def _visible_ctas(interactables: list[dict]) -> list[str]:
 
 
 def _label_of(item: dict) -> str:
-    return (
+    direct = (
         item.get("text")
         or item.get("aria_label")
+        or item.get("associated_label")
+        or item.get("placeholder")
         or item.get("title")
-        or item.get("context_label")
-        or item.get("test_id")
-        or item.get("href")
-        or f"<{item.get('tag', '?')}>"
+        or item.get("icon_label")
+        or item.get("component_label")
     )
+    if direct:
+        return direct
+    if item.get("context_label"):
+        verb = (
+            "Open"
+            if item.get("kind") in {"button", "menuitem", "disclosure"}
+            else "View"
+        )
+        return f"{verb} {item['context_label']}"
+    return item.get("test_id") or item.get("href") or f"<{item.get('tag', '?')}>"
 
 
 def _surface_items(interactables: list[dict]) -> list[dict]:
@@ -67,6 +77,8 @@ def _surface_items(interactables: list[dict]) -> list[dict]:
             "group_id": item.get("group_id"),
             "status": item.get("status", "pending"),
             "href": item.get("href"),
+            "tag": item.get("tag"),
+            "role": item.get("role"),
             "in_nav": item.get("in_nav", False),
             "in_form": item.get("in_form", False),
             "in_modal": item.get("in_modal", False),
@@ -76,6 +88,9 @@ def _surface_items(interactables: list[dict]) -> list[dict]:
             "aria_haspopup": item.get("aria_haspopup"),
             "aria_pressed": item.get("aria_pressed"),
             "checked": item.get("checked"),
+            "placeholder": item.get("placeholder"),
+            "name": item.get("name"),
+            "associated_label": item.get("associated_label"),
             "input_type": item.get("input_type"),
             "required": item.get("required", False),
             "autocomplete": item.get("autocomplete"),
@@ -83,6 +98,15 @@ def _surface_items(interactables: list[dict]) -> list[dict]:
             "form_method": item.get("form_method"),
             "control_key": item.get("control_key", ""),
             "container_key": item.get("container_key"),
+            "container_type": item.get("container_type"),
+            "controlled_surface": item.get("controlled_surface"),
+            "component_key": item.get("component_key"),
+            "component_label": item.get("component_label"),
+            "icon_label": item.get("icon_label"),
+            "probe_reason": item.get("probe_reason"),
+            "interaction_scope": item.get("interaction_scope", "unknown"),
+            "execution_policy": item.get("execution_policy", "inventory_only"),
+            "safety_category": item.get("safety_category"),
             "page_box": item.get("page_box"),
         }
         for item in interactables

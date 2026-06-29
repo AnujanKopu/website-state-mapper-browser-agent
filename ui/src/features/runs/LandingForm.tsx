@@ -161,7 +161,7 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
                   className="text-input text-input--small"
                   type="number"
                   min={1}
-                  placeholder="60"
+                  placeholder="250"
                   value={maxStates}
                   onChange={(e) => setMaxStates(e.target.value)}
                 />
@@ -172,7 +172,7 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
                   className="text-input text-input--small"
                   type="number"
                   min={1}
-                  placeholder="150"
+                  placeholder="1000"
                   value={maxActions}
                   onChange={(e) => setMaxActions(e.target.value)}
                 />
@@ -183,7 +183,7 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
                   className="text-input text-input--small"
                   type="number"
                   min={0}
-                  placeholder="4"
+                  placeholder="8"
                   value={maxDepth}
                   onChange={(e) => setMaxDepth(e.target.value)}
                 />

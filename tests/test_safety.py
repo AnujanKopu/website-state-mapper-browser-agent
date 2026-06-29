@@ -114,6 +114,11 @@ class TestNavigationRules:
     def test_aria_label_is_checked_too(self):
         _denied(_item(None, aria_label="Delete item"), SafetyCategory.DESTRUCTIVE)
 
+    def test_icon_only_download_is_denied(self):
+        item = _item(None)
+        item.icon_label = "download"
+        _denied(item, SafetyCategory.DOWNLOAD)
+
 
 class TestFormPolicy:
     def test_form_submit_button_denied(self):
@@ -141,3 +146,36 @@ class TestOrigin:
 
     def test_all_file_urls_are_one_origin(self):
         assert is_same_origin("file:///C:/site/a.html", "file:///C:/site/b.html")
+
+
+async def test_local_probe_guard_aborts_mutations_but_allows_reads():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from engine.browser.session import BrowserSession
+    from engine.schemas import BrowserConfig
+
+    session = BrowserSession(BrowserConfig())
+    session.set_probe_guard(True)
+    mutation_route = MagicMock(abort=AsyncMock(), continue_=AsyncMock())
+    mutation = MagicMock(url="https://app.test/update", method="POST")
+
+    await session._guard_request(mutation_route, mutation)
+
+    mutation_route.abort.assert_awaited_once_with("blockedbyclient")
+    mutation_route.continue_.assert_not_awaited()
+    assert session.blocked_mutations == [
+        {"method": "POST", "url": "https://app.test/update"}
+    ]
+
+    read_route = MagicMock(abort=AsyncMock(), continue_=AsyncMock())
+    read = MagicMock(url="https://app.test/data", method="GET")
+    await session._guard_request(read_route, read)
+    read_route.continue_.assert_awaited_once()
+
+    session.set_probe_guard(True, source_url="https://app.test/page")
+    external_route = MagicMock(abort=AsyncMock(), continue_=AsyncMock())
+    external = MagicMock(url="https://outside.test/", method="GET")
+    external.is_navigation_request.return_value = True
+    await session._guard_request(external_route, external)
+    external_route.abort.assert_awaited_once_with("blockedbyclient")
+    assert session.blocked_probe_navigations[-1]["url"] == "https://outside.test/"

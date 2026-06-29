@@ -15,6 +15,7 @@ import type {
   RunStartedPayload,
   SSEEnvelope,
   StateDiscoveredPayload,
+  SurfaceItemsDiscoveredPayload,
 } from "../../types/events";
 import type {
   GraphDocument,
@@ -168,6 +169,16 @@ function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPay
     exploration: {
       ...base.exploration,
       ...(p.route_family ? { route_family: p.route_family } : {}),
+      ...(p.route_surface_key ? { route_surface_key: p.route_surface_key } : {}),
+      ...(p.page_anchor_id ? { page_anchor_id: p.page_anchor_id } : {}),
+      ...(p.variant_kind ? { variant_kind: p.variant_kind } : {}),
+      ...(p.inherited_surface_state_id
+        ? { inherited_surface_state_id: p.inherited_surface_state_id }
+        : {}),
+      ...(p.family_variant_key ? { family_variant_key: p.family_variant_key } : {}),
+      ...(p.family_representative_state_id
+        ? { family_representative_state_id: p.family_representative_state_id }
+        : {}),
       ...(p.auth_context ? { auth_context: p.auth_context } : {}),
       ...(p.page_role ? { page_role: p.page_role } : {}),
       ...(typeof p.page_depth === "number" ? { page_depth: p.page_depth } : {}),
@@ -187,11 +198,16 @@ function countersFromStats(
   stats: Record<string, unknown>,
   nStates: number,
   nEdges: number,
+  nPages: number,
+  nInteractions: number,
 ): Counters {
   const num = (key: string, fallback: number): number =>
     typeof stats[key] === "number" ? (stats[key] as number) : fallback;
   return {
     states: num("states", nStates),
+    page_states: num("page_states", nPages),
+    substates: num("substates", nStates - nPages),
+    interaction_nodes: num("interaction_nodes", nInteractions),
     edges: num("edges", nEdges),
     inferred_edges: num("inferred_edges", 0),
     denied: num("actions_denied", 0),
@@ -266,6 +282,50 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
       };
       const existing = edges[p.edge_id];
       edges = { ...edges, [p.edge_id]: existing ? { ...existing, ...sseEdge } : sseEdge };
+      break;
+    }
+    case "state_updated": {
+      const p = env.payload as Partial<StateDiscoveredPayload> & { state_id: string };
+      const existing = nodes[p.state_id];
+      if (!existing) break;
+      nodes = {
+        ...nodes,
+        [p.state_id]: {
+          ...existing,
+          ...(p.type ? { type: p.type as StateType } : {}),
+          ...(p.parent_state_id !== undefined
+            ? { parent_state_id: p.parent_state_id }
+            : {}),
+          exploration: {
+            ...existing.exploration,
+            ...(p.route_family ? { route_family: p.route_family } : {}),
+            ...(p.page_role ? { page_role: p.page_role } : {}),
+            ...(p.page_anchor_id ? { page_anchor_id: p.page_anchor_id } : {}),
+            ...(p.variant_kind ? { variant_kind: p.variant_kind } : {}),
+            ...(p.family_variant_key ? { family_variant_key: p.family_variant_key } : {}),
+            ...(p.family_representative_state_id
+              ? { family_representative_state_id: p.family_representative_state_id }
+              : {}),
+            ...(p.family ? { family: p.family } : {}),
+            ...(p.surface_families ? { surface_families: p.surface_families } : {}),
+          },
+        },
+      };
+      break;
+    }
+    case "surface_items_discovered": {
+      const p = payload as unknown as SurfaceItemsDiscoveredPayload;
+      const existing = nodes[p.state_id];
+      if (existing) {
+        nodes = {
+          ...nodes,
+          [p.state_id]: {
+            ...existing,
+            surface_items: p.surface_items as unknown as SurfaceItem[],
+            exploration: { ...existing.exploration, ...(p.exploration ?? {}) },
+          },
+        };
+      }
       break;
     }
     case "action_started": {
@@ -393,8 +453,11 @@ export function runReducer(state: RunState, action: RunAction): RunState {
         || snapshotSequence === undefined
         || snapshotSequence === null
         || snapshotSequence >= state.lastEventSequence;
-      let nodes = snapshotIsCurrent ? { ...state.nodes } : state.nodes;
-      let order = snapshotIsCurrent ? [...state.order] : state.order;
+      // A terminal authoritative graph is a replacement snapshot.  Merging it
+      // leaves provisional family members and stale SSE-only edges visible.
+      const authoritative = graph.sync?.authoritative === true;
+      let nodes = authoritative ? {} : snapshotIsCurrent ? { ...state.nodes } : state.nodes;
+      let order = authoritative ? [] : snapshotIsCurrent ? [...state.order] : state.order;
       for (const s of graph.states) {
         if (!nodes[s.id]) {
           if (nodes === state.nodes) nodes = { ...state.nodes };
@@ -405,7 +468,7 @@ export function runReducer(state: RunState, action: RunAction): RunState {
           nodes[s.id] = { ...nodes[s.id], ...s };
         }
       }
-      let edges = snapshotIsCurrent ? { ...state.edges } : state.edges;
+      let edges = authoritative ? {} : snapshotIsCurrent ? { ...state.edges } : state.edges;
       for (const e of graph.edges) {
         if (!edges[e.id]) {
           if (edges === state.edges) edges = { ...state.edges };
@@ -427,7 +490,18 @@ export function runReducer(state: RunState, action: RunAction): RunState {
       }
       const counters = graph.run.stats
         && snapshotIsCurrent
-        ? countersFromStats(graph.run.stats, Object.keys(nodes).length, Object.keys(edges).length)
+        ? countersFromStats(
+          graph.run.stats,
+          Object.keys(nodes).length,
+          Object.keys(edges).length,
+          Object.values(nodes).filter((node) => !node.parent_state_id).length,
+          Object.values(nodes).reduce(
+            (total, node) => total + (node.surface_items ?? []).filter(
+              (item) => item.interaction_scope !== "page_navigation",
+            ).length,
+            0,
+          ),
+        )
         : state.counters;
       return {
         ...state,

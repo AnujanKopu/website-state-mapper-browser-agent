@@ -146,14 +146,24 @@ async def test_context_pack_describes_fixture_site(settings: Settings):
     md = pack["markdown"]
     data = pack["json"]
 
-    # describes the structural variety the fixture exercises
+    # Canonical topology stays page-only; local UI controls remain in each
+    # page's surface inventory for the nested interaction layer.
     inventory = data["site_summary"]["page_type_inventory"]
-    assert inventory.get("modal", 0) >= 1
     assert inventory.get("page", 0) >= 1
-    assert any(t in inventory for t in ("tab", "dropdown"))
+    surface_rows = [
+        item
+        for state in data["states"]
+        for rows in state["surface_groups"].values()
+        for item in rows
+    ]
+    assert any(item["kind"] == "tab" for item in surface_rows)
+    assert any(item["status"] == "inventory_only" for item in surface_rows)
 
     # the checkout is reported as a boundary
-    assert any(b["type"] == "risky_terminal" for b in data["site_summary"]["boundaries"])
+    assert any(
+        b["type"] in {"paywall", "risky_terminal"}
+        for b in data["site_summary"]["boundaries"]
+    )
 
     # markdown is non-trivial and mentions pricing + checkout
     assert "## States" in md

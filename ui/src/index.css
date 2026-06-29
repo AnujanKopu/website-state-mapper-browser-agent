@@ -1894,7 +1894,7 @@ code {
 }
 
 .graph-label {
-  z-index: 2;
+  z-index: 6;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -1903,7 +1903,7 @@ code {
   font: 9px var(--mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .graph-label strong {
@@ -2917,4 +2917,58 @@ code {
   .landing-hero .landing__input-row:focus-within::before {
     animation: spectrum-cycle 2.8s linear infinite !important;
   }
+}
+
+.interaction-node {
+  position: relative;
+  width: 190px;
+  min-height: 66px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 18%);
+}
+
+.interaction-node.is-selected {
+  border-color: var(--green);
+  box-shadow: 0 0 0 1px var(--green);
+}
+
+.interaction-node--blocked { border-color: var(--red); }
+.interaction-node--explored { border-color: var(--green); }
+
+.interaction-node__top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.interaction-node__title {
+  margin-top: 7px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.interaction-node__count {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.graph-layer-back {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  color: var(--green);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  pointer-events: auto;
 }

@@ -50,6 +50,7 @@ class StateType(StrEnum):
     """Classification of a captured state."""
 
     PAGE = "page"
+    PAGE_VARIANT = "page_variant"
     MODAL = "modal"
     FORM = "form"
     AUTH_WALL = "auth_wall"
@@ -85,11 +86,15 @@ class BrowserConfig(StrictModel):
     user_agent: str | None = None
     navigation_timeout_ms: int = 20_000
     stabilize_quiet_ms: int = 500
+    # Local fixture runs may use file/private targets. Hosted workers override
+    # this to False and validate every network destination.
+    allow_private_networks: bool = True
 
 
 class CaptureConfig(StrictModel):
     full_page_screenshot: bool = True
     max_interactables: int = 100
+    max_inventory_controls: int = 200
     max_visible_text_chars: int = 20_000
     # When False, the raw DOM HTML snapshot is not written to storage.
     # Screenshots and graph metadata are unaffected. Useful for UI-driven
@@ -102,15 +107,22 @@ class CaptureConfig(StrictModel):
 
 
 class BudgetConfig(StrictModel):
-    max_states: int = 60
-    max_actions: int = 150
-    max_depth: int = 4
-    max_wall_seconds: int = 300
+    max_states: int = 250
+    max_actions: int = 1_000
+    max_depth: int = 8
+    max_wall_seconds: int = 1_800
 
 
 class ExplorationConfig(StrictModel):
-    # Out-edges enqueued per state (top-K after ranking); keeps the graph clean.
-    max_actions_per_state: int = 12
+    # Optional emergency per-state ceiling. None means ranking controls order,
+    # never eligibility.
+    max_actions_per_state: int | None = None
+    # Local UI probes use a separate quota so menus and filters cannot crowd
+    # page navigation out of the frontier.
+    max_local_actions_per_state: int = 24
+    # Persistent header/sidebar destinations are valuable product surfaces,
+    # but still need a hard bound on unusually large application shells.
+    max_global_navigation_actions: int | None = None
     action_timeout_ms: int = 5_000
     # Cap on distinct states kept per loose URL family (e.g. /post/#) so blog
     # archives and card grids can't dominate the graph; further siblings fold
@@ -163,6 +175,11 @@ class SurfaceStatus(StrEnum):
     BLOCKED = "blocked"
     NOOP = "noop"
     SKIPPED_DUPLICATE = "skipped_duplicate"
+    INVENTORY_ONLY = "inventory_only"
+    KNOWN_STATE = "known_state"
+    STALE = "stale"
+    FAILED = "failed"
+    REPLAY_FAILED = "replay_failed"
 
 
 class Interactable(BaseModel):
@@ -175,6 +192,12 @@ class Interactable(BaseModel):
     """
 
     selector: str
+    # Locator mechanics are deliberately separate from semantic identity.
+    # ``dom_instance_path`` deduplicates one rendered element across scroll
+    # folds, while ``locator`` carries replay fallbacks. Neither participates
+    # directly in cross-state control-family identity.
+    dom_instance_path: str = ""
+    locator: dict = Field(default_factory=dict)
     tag: str
     role: str | None = None
     text: str | None = None
@@ -185,6 +208,9 @@ class Interactable(BaseModel):
     aria_haspopup: str | None = None
     aria_pressed: bool | None = None
     checked: bool | None = None
+    placeholder: str | None = None
+    name: str | None = None
+    associated_label: str | None = None
     input_type: str | None = None
     required: bool = False
     autocomplete: str | None = None
@@ -194,6 +220,7 @@ class Interactable(BaseModel):
     test_id: str | None = None
     context_label: str | None = None
     href: str | None = None
+    download: bool = False
     bounding_box: BoundingBox
     page_box: BoundingBox | None = None
     in_nav: bool = False
@@ -209,13 +236,46 @@ class Interactable(BaseModel):
     # capability across re-observations and persistent navigation surfaces.
     control_key: str = ""
     container_key: str | None = None
+    container_type: str | None = None
+    controlled_surface: dict | None = None
+    # A component groups one visible control with the nested states it opens.
+    # It is intentionally separate from group_id, which is only for repeated
+    # sibling/content-family collapse.
+    component_key: str | None = None
+    component_label: str | None = None
+    icon_label: str | None = None
+    probe_reason: str | None = None
+    interaction_scope: str = "unknown"
+    execution_policy: str = "inventory_only"
+    safety_category: str | None = None
+    # Controls revealed by a shell disclosure can depend on reopening that
+    # disclosure after a page restore. These are internal replay recipes and
+    # are not rendered as additional surface items.
+    dependencies: list[dict] = Field(default_factory=list)
     status: SurfaceStatus = SurfaceStatus.PENDING
 
     @property
     def label(self) -> str:
         """Best human-readable name for this element."""
-        if self.text or self.aria_label or self.title:
-            return self.text or self.aria_label or self.title or ""
+        if (
+            self.text
+            or self.aria_label
+            or self.associated_label
+            or self.placeholder
+            or self.title
+            or self.icon_label
+            or self.component_label
+        ):
+            return (
+                self.text
+                or self.aria_label
+                or self.associated_label
+                or self.placeholder
+                or self.title
+                or self.icon_label
+                or self.component_label
+                or ""
+            )
         if self.context_label:
             verb = "Open" if self.kind in {"button", "menuitem", "disclosure"} else "View"
             return f"{verb} {self.context_label}"
@@ -286,6 +346,7 @@ class ActionStep(BaseModel):
     role: str | None = None
     href: str | None = None
     control_key: str | None = None
+    locator: dict | None = None
 
 
 class CapturedState(BaseModel):

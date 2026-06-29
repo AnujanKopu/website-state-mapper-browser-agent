@@ -39,6 +39,10 @@ class ActionOutcome(StrEnum):
     NOOP = "noop"
     FAILED = "failed"
     BLOCKED = "blocked"
+    KNOWN_STATE = "known_state"
+    STALE = "stale"
+    REPLAY_FAILED = "replay_failed"
+    EXPLORED = "explored"
 
 
 # Terminal events close the SSE stream; no further events follow.

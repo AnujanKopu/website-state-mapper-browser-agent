@@ -131,6 +131,44 @@ describe("graph element derivation", () => {
     expect(layout.nodePositions.other.x).toBeLessThan(box.position.x);
   });
 
+  it("retains exact family samples as evidence but shows one node per structural variant", () => {
+    const family = "https://example.com/game/:param/:optional";
+    const nodes = {
+      first: state("first", 1),
+      second: state("second", 2),
+      third: state("third", 3),
+    };
+    for (const node of Object.values(nodes)) {
+      node.exploration = {
+        route_family: family,
+        family_variant_key: "same-shell",
+        family_representative_state_id: "first",
+        family: {
+          id: "games",
+          label: "Games",
+          kind: "items",
+          pattern: family,
+          label_source: "heuristic",
+          confidence: 0.92,
+          discovered_count: 127,
+          checked_count: 3,
+          represented_count: 1,
+          sample_state_ids: ["first", "second", "third"],
+          status: "confirmed",
+        },
+      };
+    }
+
+    const topology = createGraphTopology(nodes, {});
+
+    expect(topology.nodeIds).toEqual(["first"]);
+    expect(topology.families[0].memberIds).toEqual(["first"]);
+    expect(topology.families[0].checkedCount).toBe(3);
+    expect(topology.families[0].representedCount).toBe(1);
+    expect(topology.ownerByNode.second).toBe(topology.families[0].id);
+    expect(topology.ownerByNode.third).toBe(topology.families[0].id);
+  });
+
   it("canonicalizes placeholder names by position without inventing optional slots", () => {
     const nodes = {
       withSlug: state("withSlug", 1),

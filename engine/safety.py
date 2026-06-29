@@ -128,6 +128,9 @@ def evaluate_action(item: Interactable, *, base_url: str) -> SafetyDecision:
     """Decide whether clicking this element is safe for a mapping agent."""
     href = item.href or ""
 
+    if item.download:
+        return SafetyDecision.deny(SafetyCategory.DOWNLOAD, "download attribute")
+
     if href.startswith(("mailto:", "tel:", "sms:")):
         return SafetyDecision.deny(
             SafetyCategory.CONTACT_PROTOCOL, f"contact protocol link: {href.split(':')[0]}:"
@@ -143,7 +146,21 @@ def evaluate_action(item: Interactable, *, base_url: str) -> SafetyDecision:
         if _HREF_SESSION.search(href_path):
             return SafetyDecision.deny(SafetyCategory.SESSION, "logout link (ends the session)")
 
-    haystack = " ".join(filter(None, [item.text, item.aria_label]))
+    haystack = " ".join(
+        filter(
+            None,
+            [
+                item.text,
+                item.aria_label,
+                item.associated_label,
+                item.title,
+                item.icon_label,
+                item.context_label,
+            ],
+        )
+    )
+    if re.search(r"\b(download|export\s+(csv|xlsx|pdf))\b", haystack, re.I):
+        return SafetyDecision.deny(SafetyCategory.DOWNLOAD, "download control")
     for category, pattern in _TEXT_RULES:
         match = pattern.search(haystack)
         if match:
@@ -151,7 +168,16 @@ def evaluate_action(item: Interactable, *, base_url: str) -> SafetyDecision:
 
     # No form is submitted until safe synthetic-fill support lands (M2+).
     # Buttons inside forms default to type=submit, so deny them wholesale.
-    if item.in_form and item.tag in ("button", "input"):
+    if item.in_form and (
+        item.tag == "button"
+        or (
+            item.tag == "input"
+            and (
+                (item.input_type or "").lower() in {"submit", "button", "image"}
+                or (item.input_type is None and bool(item.text))
+            )
+        )
+    ):
         return SafetyDecision.deny(
             SafetyCategory.FORM_SUBMIT, "form submission (deferred until safe form-fill support)"
         )

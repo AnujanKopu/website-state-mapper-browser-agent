@@ -389,4 +389,41 @@ describe("GraphView viewport lifecycle", () => {
     });
     expect(nodes.filter((node) => node.type === "state")).toHaveLength(2);
   });
+
+  it("keeps child states off page topology and drills into captured interactions", () => {
+    const page = state("page", 0, {
+      surface_items: [{
+        item_id: "search",
+        label: "Search",
+        kind: "search",
+        region: "main",
+        fold: 0,
+        group_id: null,
+        status: "inventory_only",
+        interaction_scope: "local_ui",
+        execution_policy: "inventory_only",
+      }],
+    });
+    const child = state("child", 1, { parent_state_id: "page", type: "modal" });
+    render(
+      <GraphView
+        {...graphProps({ page, child }, {}, { selectedId: "page" })}
+      />,
+    );
+    act(() => vi.runAllTimers());
+
+    expect((renderedNodes() as Array<{ type: string }>).filter((node) => node.type === "state"))
+      .toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "View interactions (1)" }));
+    act(() => vi.runAllTimers());
+
+    const nested = renderedNodes() as Array<{ type: string }>;
+    expect(nested.filter((node) => node.type === "state")).toHaveLength(2);
+    expect(nested.filter((node) => node.type === "interaction")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "\u2190 Pages" }));
+    act(() => vi.runAllTimers());
+    expect((renderedNodes() as Array<{ type: string }>).filter((node) => node.type === "state"))
+      .toHaveLength(1);
+  });
 });

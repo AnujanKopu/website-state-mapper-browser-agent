@@ -2,6 +2,7 @@ import type { StateType } from "../types/graph";
 
 const STATE_TYPE_LABELS: Record<StateType, string> = {
   page: "Page",
+  page_variant: "Page variant",
   modal: "Modal",
   form: "Form",
   auth_wall: "Auth wall",
