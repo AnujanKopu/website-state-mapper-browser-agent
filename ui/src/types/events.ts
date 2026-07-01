@@ -1,6 +1,6 @@
 // Mirrors the backend SSE contract v1 (engine/events.py + api/manager.py).
 
-import type { FamilyMetadata, NameMetadata, NavCapability } from "./graph";
+import type { FamilyMetadata, NameMetadata, NavCapability, PageBox } from "./graph";
 
 export type EventType =
   | "run_started"
@@ -109,6 +109,8 @@ export interface SurfaceItemLite {
   interaction_scope?: "page_navigation" | "local_ui" | "external" | "unknown";
   execution_policy?: "navigate" | "probe_local" | "inventory_only" | "blocked";
   safety_category?: string | null;
+  /** Captured document-space geometry used by the screenshot-grounded surface map. */
+  page_box?: PageBox | null;
 }
 
 export interface BasePayload {

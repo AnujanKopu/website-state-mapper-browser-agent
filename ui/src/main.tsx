@@ -4,6 +4,7 @@ import "@xyflow/react/dist/style.css";
 
 import App from "./App";
 import "./index.css";
+import "./styles/redesign.css";
 
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root not found");

@@ -2445,6 +2445,9 @@ class Explorer:
                 "interaction_scope": item.interaction_scope,
                 "execution_policy": item.execution_policy,
                 "safety_category": item.safety_category,
+                "page_box": (
+                    item.page_box.model_dump() if item.page_box is not None else None
+                ),
                 "status": self._final_status(meta, item),
             }
             for item in meta.interactables

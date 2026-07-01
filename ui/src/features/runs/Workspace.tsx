@@ -17,6 +17,8 @@ interface WorkspaceProps {
 export function Workspace({ runId, onNewRun }: WorkspaceProps) {
   const { run, acknowledgeAuthResolved } = useRunStream(runId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [workspaceView, setWorkspaceView] = useState<"capture" | "map" | "details">("map");
+  const [surfaceMode, setSurfaceMode] = useState(false);
   const [expandedScreenshot, setExpandedScreenshot] = useState<ExpandedScreenshot | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exporting, setExporting] = useState<ExportKind | null>(null);
@@ -39,8 +41,13 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
   const selectedParent =
     selected?.parent_state_id ? (run.nodes[selected.parent_state_id] ?? null) : null;
 
+  const handleSelect = (stateId: string | null) => {
+    setSelectedId(stateId);
+    if (!stateId && workspaceView === "details") setWorkspaceView("map");
+  };
+
   return (
-    <div className="workspace">
+    <div className={`workspace workspace--view-${workspaceView}`}>
       <header className="topbar">
         <div className="topbar__left">
           <button className="button button--ghost" onClick={onNewRun}>
@@ -101,6 +108,34 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
         />
       )}
 
+      <nav className="workspace-tabs" aria-label="Workspace views">
+        <button
+          type="button"
+          className={workspaceView === "capture" ? "is-active" : ""}
+          aria-pressed={workspaceView === "capture"}
+          onClick={() => setWorkspaceView("capture")}
+        >
+          Capture
+        </button>
+        <button
+          type="button"
+          className={workspaceView === "map" ? "is-active" : ""}
+          aria-pressed={workspaceView === "map"}
+          onClick={() => setWorkspaceView("map")}
+        >
+          Map
+        </button>
+        <button
+          type="button"
+          className={workspaceView === "details" ? "is-active" : ""}
+          aria-pressed={workspaceView === "details"}
+          disabled={!selected}
+          onClick={() => setWorkspaceView("details")}
+        >
+          Details
+        </button>
+      </nav>
+
       <div className="panes">
         <div className="panes__left">
           <AgentView
@@ -116,15 +151,16 @@ export function Workspace({ runId, onNewRun }: WorkspaceProps) {
             selectedId={selectedId}
             currentId={run.viewportStateId}
             isLive={["queued", "running", "paused"].includes(run.runStatus)}
-            onSelect={setSelectedId}
+            onSelect={handleSelect}
+            onSurfaceModeChange={setSurfaceMode}
           />
-          {selected && (
+          {selected && !surfaceMode && (
             <NodePanel
               state={selected}
               parent={selectedParent}
               states={run.nodes}
               edges={run.edges}
-              onClose={() => setSelectedId(null)}
+              onClose={() => handleSelect(null)}
               onExpandScreenshot={setExpandedScreenshot}
             />
           )}

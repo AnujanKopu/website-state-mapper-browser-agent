@@ -9,7 +9,7 @@ from engine.db.session import create_db_engine, create_session_factory, init_db
 from engine.schemas import RunConfig
 
 
-async def test_worker_snapshot_is_committed_and_only_pngs_are_published(tmp_path: Path):
+async def test_worker_snapshot_is_committed_and_only_verified_images_are_published(tmp_path: Path):
     run_id = "a" * 32
     job_root = tmp_path / "jobs"
     job_dir = job_root / run_id
@@ -41,6 +41,10 @@ async def test_worker_snapshot_is_committed_and_only_pngs_are_published(tmp_path
     screenshots = job_dir / "artifacts" / "runs" / run_id / "screenshots"
     screenshots.mkdir(parents=True)
     Image.new("RGB", (2, 2), color="white").save(screenshots / "state.png")
+    Image.new("RGB", (2, 2), color="white").save(screenshots / "state.webp")
+    Image.new("RGB", (2, 2), color="white").save(
+        screenshots / "spoof.webp", format="PNG"
+    )
     dom = job_dir / "artifacts" / "runs" / run_id / "dom"
     dom.mkdir()
     (dom / "state.html").write_text("<html>private</html>")
@@ -67,6 +71,12 @@ async def test_worker_snapshot_is_committed_and_only_pngs_are_published(tmp_path
         assert await session.get(db.StateNode, "b" * 32) is not None
     assert (
         settings.data_dir / "runs" / run_id / "screenshots" / "state.png"
+    ).exists()
+    assert (
+        settings.data_dir / "runs" / run_id / "screenshots" / "state.webp"
+    ).exists()
+    assert not (
+        settings.data_dir / "runs" / run_id / "screenshots" / "spoof.webp"
     ).exists()
     assert not (settings.data_dir / "runs" / run_id / "dom" / "state.html").exists()
     await central_engine.dispose()

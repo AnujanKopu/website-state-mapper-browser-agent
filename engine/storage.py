@@ -50,8 +50,10 @@ class LocalStorage:
         return path
 
 
-def screenshot_key(run_id: str, state_id: str) -> str:
-    return f"runs/{run_id}/screenshots/{state_id}.png"
+def screenshot_key(run_id: str, state_id: str, extension: str = "png") -> str:
+    if extension not in {"png", "webp"}:
+        raise ValueError(f"Unsupported screenshot extension: {extension!r}")
+    return f"runs/{run_id}/screenshots/{state_id}.{extension}"
 
 
 def dom_snapshot_key(run_id: str, state_id: str) -> str:

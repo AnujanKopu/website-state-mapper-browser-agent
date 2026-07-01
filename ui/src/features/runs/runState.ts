@@ -147,12 +147,28 @@ function emptyNode(id: string): GraphState {
   };
 }
 
+function mergeSurfaceItems(
+  existing: SurfaceItem[] | undefined,
+  incoming: SurfaceItem[],
+): SurfaceItem[] {
+  if (!existing?.length) return incoming;
+  const byId = new Map(
+    existing
+      .filter((item) => item.item_id)
+      .map((item) => [item.item_id, item] as const),
+  );
+  return incoming.map((item) => {
+    const previous = item.item_id ? byId.get(item.item_id) : undefined;
+    return previous ? { ...previous, ...item } : item;
+  });
+}
+
 function applyDiscovered(existing: GraphState | undefined, p: StateDiscoveredPayload): GraphState {
   const base = existing ?? emptyNode(p.state_id);
   // Live surface items arrive with provisional statuses; the terminal /graph
   // hydrate later overwrites them with the final explored/blocked/skipped set.
   const surfaceItems = p.surface_items
-    ? (p.surface_items as unknown as SurfaceItem[])
+    ? mergeSurfaceItems(base.surface_items, p.surface_items as unknown as SurfaceItem[])
     : base.surface_items;
   return {
     ...base,
@@ -321,7 +337,10 @@ function applyEvent(state: RunState, env: SSEEnvelope): RunState {
           ...nodes,
           [p.state_id]: {
             ...existing,
-            surface_items: p.surface_items as unknown as SurfaceItem[],
+            surface_items: mergeSurfaceItems(
+              existing.surface_items,
+              p.surface_items as unknown as SurfaceItem[],
+            ),
             exploration: { ...existing.exploration, ...(p.exploration ?? {}) },
           },
         };
@@ -518,6 +537,10 @@ export function runReducer(state: RunState, action: RunAction): RunState {
         viewportStateId: snapshotIsCurrent && graph.sync?.latest_state_id
           ? graph.sync.latest_state_id
           : state.viewportStateId ?? (order.length ? order[order.length - 1] : null),
+        lastEventSequence:
+          snapshotIsCurrent && typeof snapshotSequence === "number"
+            ? Math.max(state.lastEventSequence, snapshotSequence)
+            : state.lastEventSequence,
       };
     }
     case "sse":

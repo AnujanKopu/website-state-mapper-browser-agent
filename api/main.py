@@ -23,6 +23,17 @@ from engine.schemas import RunConfig
 from engine.storage import LocalStorage
 
 
+class ArtifactStaticFiles(StaticFiles):
+    """Serve immutable screenshot artifacts with long-lived browser caching."""
+
+    async def get_response(self, path: str, scope: dict):
+        response = await super().get_response(path, scope)
+        normalized_path = path.replace("\\", "/")
+        if response.status_code == 200 and "/screenshots/" in f"/{normalized_path}":
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 def create_app(
     settings: Settings | None = None, run_config: RunConfig | None = None
 ) -> FastAPI:
@@ -70,8 +81,8 @@ def create_app(
     )
     app.include_router(router, prefix="/api")
     # Screenshots/DOM snapshots referenced by graph nodes (paths are data-dir
-    # relative): e.g. node.screenshot -> /artifacts/runs/<id>/screenshots/<x>.png
-    app.mount("/artifacts", StaticFiles(directory=settings.data_dir), name="artifacts")
+    # relative): e.g. node.screenshot -> /artifacts/runs/<id>/screenshots/<x>.webp
+    app.mount("/artifacts", ArtifactStaticFiles(directory=settings.data_dir), name="artifacts")
 
     @app.get("/health")
     async def health() -> dict:

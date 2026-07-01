@@ -484,12 +484,16 @@ class RunManager:
             return
         target = self._settings.data_dir / "runs" / run_id / "screenshots"
         target.mkdir(parents=True, exist_ok=True)
-        for image in source.glob("*.png"):
+        expected_formats = {".png": "PNG", ".webp": "WEBP"}
+        for image in source.iterdir():
+            expected_format = expected_formats.get(image.suffix.lower())
+            if expected_format is None or not image.is_file():
+                continue
             if source.resolve() not in image.resolve().parents:
                 continue
             try:
                 with Image.open(image) as candidate:
-                    if candidate.format != "PNG":
+                    if candidate.format != expected_format:
                         continue
                     candidate.verify()
             except (OSError, UnidentifiedImageError):

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphEdge, GraphState } from "../../types/graph";
-import { buildFlowEdges, collectNodeEdgeFocus, createGraphTopology, layoutTopology } from "./graphElements";
+import { buildFlowEdges, collectNodeEdgeFocus, configureFamilyExpansion, createGraphTopology, layoutTopology } from "./graphElements";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 
 function state(id: string, index: number, title = id): GraphState {
@@ -114,7 +114,7 @@ describe("graph element derivation", () => {
     };
 
     const topology = createGraphTopology(nodes, edges);
-    const layout = layoutTopology(topology);
+    const layout = layoutTopology(configureFamilyExpansion(topology, new Set([topology.families[0].id])));
 
     expect(topology.families).toHaveLength(1);
     expect(topology.families[0].memberIds).toEqual(["first", "second"]);
@@ -272,12 +272,13 @@ describe("graph element derivation", () => {
     const inbound = flowEdges.find((item) => item.id === "bundle:a>b");
     const outbound = flowEdges.find((item) => item.id === "bundle:b>c");
     const unrelated = flowEdges.find((item) => item.id === "bundle:a>c");
-    expect(inbound?.className).toBe("graph-edge--inbound");
+    expect(inbound?.className).toContain("graph-edge--inbound");
+    expect(inbound?.className).toContain("graph-edge--path");
     expect(outbound?.className).toBe("graph-edge--outbound");
     expect(inbound?.label).toBeTruthy();
     expect(outbound?.label).toBeTruthy();
     expect(unrelated?.className).toBe("graph-edge--dimmed");
-    expect(inbound?.style).toMatchObject({ stroke: "var(--edge-inbound)", strokeWidth: 2.5, opacity: 1 });
+    expect(inbound?.style).toMatchObject({ strokeWidth: 2.6, opacity: 1 });
   });
 
   it("treats child-target edges as inbound when the parent hub is selected", () => {

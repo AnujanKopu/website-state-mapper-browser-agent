@@ -11,14 +11,22 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import select
 
-from engine.capture import run_single_capture
+from engine.capture import encode_screenshot_artifact, run_single_capture
 from engine.config import Settings
 from engine.db import models as db
 from engine.db.session import create_db_engine, create_session_factory
 from engine.storage import LocalStorage
 from tests.conftest import FIXTURE_SITE
 
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+WEBP_RIFF_MAGIC = b"RIFF"
+
+
+def test_screenshot_compression_falls_back_to_png_for_invalid_input():
+    original = b"not-a-valid-image"
+    encoded, extension = encode_screenshot_artifact(original)
+
+    assert encoded == original
+    assert extension == "png"
 
 
 async def test_single_capture_end_to_end(settings: Settings):
@@ -71,7 +79,10 @@ async def test_single_capture_end_to_end(settings: Settings):
     store = LocalStorage(settings.data_dir)
     screenshot = store.path_for(state.screenshot_path)
     dom = store.path_for(state.dom_snapshot_path)
-    assert screenshot.read_bytes().startswith(PNG_MAGIC)
+    screenshot_bytes = screenshot.read_bytes()
+    assert screenshot.suffix == ".webp"
+    assert screenshot_bytes.startswith(WEBP_RIFF_MAGIC)
+    assert screenshot_bytes[8:12] == b"WEBP"
     assert "signup-modal" in dom.read_text(encoding="utf-8")
 
     # --- database rows ---

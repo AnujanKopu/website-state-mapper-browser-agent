@@ -42,7 +42,13 @@ export function useRunStream(runId: string | null): RunStreamResult {
       if (hydrateInFlight) return hydrateInFlight;
       hydrateInFlight = getGraph(activeRunId)
         .then((graph) => {
-          if (!cancelled) dispatch({ type: "hydrate", graph });
+          if (!cancelled) {
+            const snapshotSequence = graph.sync?.snapshot_sequence;
+            if (typeof snapshotSequence === "number") {
+              lastSequence = Math.max(lastSequence, snapshotSequence);
+            }
+            dispatch({ type: "hydrate", graph });
+          }
           return graph;
         })
         .finally(() => {

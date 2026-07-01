@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import type { FormEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 
 import { createRun } from "../../api/client";
 import { useMagneticHover } from "../../lib/pointerMotion";
@@ -8,6 +8,24 @@ import type { CreateRunInput } from "../../types/graph";
 interface LandingFormProps {
   onStarted: (runId: string) => void;
   inputId?: string;
+}
+
+function Collapsible({ open, children }: { open: boolean; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (ref.current) ref.current.inert = !open;
+  }, [open]);
+
+  return (
+    <div
+      ref={ref}
+      className={`landing__expander${open ? " is-open" : ""}`}
+      aria-hidden={!open}
+    >
+      <div className="landing__expander-inner">{children}</div>
+    </div>
+  );
 }
 
 export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormProps) {
@@ -67,7 +85,7 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
   return (
         <form className="landing__form" onSubmit={submit}>
           <div className="landing__input-row">
-            <span className="landing__protocol" aria-hidden>URL</span>
+            <label className="landing__protocol" htmlFor={inputId}>URL</label>
             <input
               id={inputId}
               className="text-input"
@@ -116,80 +134,81 @@ export function LandingForm({ onStarted, inputId = "target-url" }: LandingFormPr
             </label>
           </fieldset>
 
-          {authMode === "login" && (
-            <div className="landing__credentials">
-              <label>
-                Username or email
-                <input
-                  className="text-input text-input--small"
-                  type="text"
-                  autoComplete="username"
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                  required
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  className="text-input text-input--small"
-                  type="password"
-                  autoComplete="current-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  required
-                />
-              </label>
-              <p>Credentials are held in memory for this run and are never exported.</p>
-            </div>
-          )}
+          <Collapsible open={authMode === "login"}>
+              <div className="landing__credentials">
+                <label>
+                  Username or email
+                  <input
+                    className="text-input text-input--small"
+                    type="text"
+                    autoComplete="username"
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    required={authMode === "login"}
+                  />
+                </label>
+                <label>
+                  Password
+                  <input
+                    className="text-input text-input--small"
+                    type="password"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    required={authMode === "login"}
+                  />
+                </label>
+                <p>Credentials are held in memory for this run and are never exported.</p>
+              </div>
+          </Collapsible>
 
           <button
             type="button"
             className="landing__advanced-toggle"
             onClick={() => setShowAdvanced((v) => !v)}
+            aria-expanded={showAdvanced}
           >
             <span aria-hidden>{showAdvanced ? "−" : "+"}</span>
             {showAdvanced ? "Hide" : "Show"} exploration limits
           </button>
 
-          {showAdvanced && (
-            <div className="landing__advanced">
-              <label>
-                Max states
-                <input
-                  className="text-input text-input--small"
-                  type="number"
-                  min={1}
-                  placeholder="250"
-                  value={maxStates}
-                  onChange={(e) => setMaxStates(e.target.value)}
-                />
-              </label>
-              <label>
-                Max actions
-                <input
-                  className="text-input text-input--small"
-                  type="number"
-                  min={1}
-                  placeholder="1000"
-                  value={maxActions}
-                  onChange={(e) => setMaxActions(e.target.value)}
-                />
-              </label>
-              <label>
-                Max depth
-                <input
-                  className="text-input text-input--small"
-                  type="number"
-                  min={0}
-                  placeholder="8"
-                  value={maxDepth}
-                  onChange={(e) => setMaxDepth(e.target.value)}
-                />
-              </label>
-            </div>
-          )}
+          <Collapsible open={showAdvanced}>
+              <div className="landing__advanced">
+                <label>
+                  Max states
+                  <input
+                    className="text-input text-input--small"
+                    type="number"
+                    min={1}
+                    placeholder="250"
+                    value={maxStates}
+                    onChange={(e) => setMaxStates(e.target.value)}
+                  />
+                </label>
+                <label>
+                  Max actions
+                  <input
+                    className="text-input text-input--small"
+                    type="number"
+                    min={1}
+                    placeholder="1000"
+                    value={maxActions}
+                    onChange={(e) => setMaxActions(e.target.value)}
+                  />
+                </label>
+                <label>
+                  Max depth
+                  <input
+                    className="text-input text-input--small"
+                    type="number"
+                    min={0}
+                    placeholder="8"
+                    value={maxDepth}
+                    onChange={(e) => setMaxDepth(e.target.value)}
+                  />
+                </label>
+              </div>
+          </Collapsible>
 
           {error && <p className="landing__error">{error}</p>}
         </form>

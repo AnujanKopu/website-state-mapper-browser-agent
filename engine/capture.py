@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime
+from io import BytesIO
 
+from PIL import Image
 from playwright.async_api import Page
 
 from engine import identity, storage
@@ -33,6 +35,25 @@ from engine.storage import LocalStorage, StorageBackend
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def encode_screenshot_artifact(png_bytes: bytes) -> tuple[bytes, str]:
+    """Compress a captured PNG for storage, preserving PNG as a safe fallback."""
+    if not png_bytes:
+        return png_bytes, "png"
+    try:
+        with Image.open(BytesIO(png_bytes)) as image:
+            image.load()
+            output = BytesIO()
+            image.convert("RGB").save(
+                output,
+                format="WEBP",
+                quality=85,
+                method=2,
+            )
+            return output.getvalue(), "webp"
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return png_bytes, "png"
 
 
 async def observe_page(
@@ -110,8 +131,11 @@ def persist_state(
     and all graph metadata are still written).
     """
     snapshot = observation.snapshot
+    screenshot_bytes, screenshot_extension = encode_screenshot_artifact(
+        snapshot.screenshot_png
+    )
     screenshot_path = store.save_bytes(
-        storage.screenshot_key(run_id, state_id), snapshot.screenshot_png
+        storage.screenshot_key(run_id, state_id, screenshot_extension), screenshot_bytes
     )
     dom_snapshot_path = (
         store.save_text(storage.dom_snapshot_key(run_id, state_id), snapshot.html)

@@ -137,7 +137,7 @@ describe("GraphView viewport lifecycle", () => {
       height: 78,
       measured: { width: 210, height: 78 },
     });
-    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBeUndefined();
+    expect(flowMock.latestProps?.onlyRenderVisibleElements).toBe(true);
     expect(flowMock.latestProps?.nodesDraggable).toBe(false);
     expect(flowMock.latestProps?.panOnDrag).toBe(true);
     act(() => vi.runAllTimers());
@@ -378,7 +378,7 @@ describe("GraphView viewport lifecycle", () => {
     );
     act(() => vi.runAllTimers());
 
-    const nodes = renderedNodes() as Array<Record<string, unknown>>;
+    let nodes = renderedNodes() as Array<Record<string, unknown>>;
     expect(nodes).toHaveLength(3);
     const family = nodes.find((node) => node.type === "family");
     expect(family).toMatchObject({
@@ -387,10 +387,22 @@ describe("GraphView viewport lifecycle", () => {
       connectable: false,
       zIndex: 0,
     });
-    expect(nodes.filter((node) => node.type === "state")).toHaveLength(2);
+    expect(family?.data).toMatchObject({ expanded: true });
+
+    act(() => {
+      (flowMock.latestProps?.onNodeClick as (event: object, node: object) => void)({}, family!);
+    });
+    nodes = renderedNodes() as Array<Record<string, unknown>>;
+    expect(nodes).toHaveLength(1);
+    expect(nodes.filter((node) => node.type === "state")).toHaveLength(0);
+    expect(nodes.find((node) => node.type === "family")).toMatchObject({
+      selected: false,
+      data: { active: true, expanded: false },
+    });
   });
 
   it("keeps child states off page topology and drills into captured interactions", () => {
+    const onSurfaceModeChange = vi.fn();
     const page = state("page", 0, {
       surface_items: [{
         item_id: "search",
@@ -407,22 +419,28 @@ describe("GraphView viewport lifecycle", () => {
     const child = state("child", 1, { parent_state_id: "page", type: "modal" });
     render(
       <GraphView
-        {...graphProps({ page, child }, {}, { selectedId: "page" })}
+        {...graphProps(
+          { page, child },
+          {},
+          { selectedId: "page", onSurfaceModeChange },
+        )}
       />,
     );
     act(() => vi.runAllTimers());
 
     expect((renderedNodes() as Array<{ type: string }>).filter((node) => node.type === "state"))
       .toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: "View interactions (1)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Surface map 1" }));
     act(() => vi.runAllTimers());
+    expect(onSurfaceModeChange).toHaveBeenLastCalledWith(true);
 
-    const nested = renderedNodes() as Array<{ type: string }>;
-    expect(nested.filter((node) => node.type === "state")).toHaveLength(2);
-    expect(nested.filter((node) => node.type === "interaction")).toHaveLength(1);
+    expect(screen.getByRole("heading", { name: "page" })).toBeInTheDocument();
+    expect(screen.getByText("Screenshot-grounded interaction map")).toBeInTheDocument();
+    expect(screen.getByText("Region-only controls (1)")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "\u2190 Pages" }));
+    fireEvent.click(screen.getByRole("button", { name: "\u2190 Topology" }));
     act(() => vi.runAllTimers());
+    expect(onSurfaceModeChange).toHaveBeenLastCalledWith(false);
     expect((renderedNodes() as Array<{ type: string }>).filter((node) => node.type === "state"))
       .toHaveLength(1);
   });

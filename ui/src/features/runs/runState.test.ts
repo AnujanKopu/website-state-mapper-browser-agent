@@ -128,6 +128,49 @@ describe("runReducer", () => {
     expect(updated.nodes.s0.exploration?.pending).toBe(0);
   });
 
+  it("preserves hydrated control geometry across geometry-free live status updates", () => {
+    const hydratedGraph = graph([graphState("s0", 0, {
+      surface_items: [{
+        item_id: "chart",
+        label: "Chart",
+        kind: "button",
+        region: "main",
+        fold: 0,
+        group_id: null,
+        status: "pending",
+        page_box: { x: 12, y: 24, width: 160, height: 40 },
+      }],
+    })]);
+    hydratedGraph.sync = {
+      schema_version: 4,
+      snapshot_sequence: 4,
+      authoritative: false,
+      latest_state_id: "s0",
+    };
+    const hydrated = runReducer(resetState(), { type: "hydrate", graph: hydratedGraph });
+    const updated = runReducer(hydrated, {
+      type: "sse",
+      envelope: event(5, "surface_items_discovered", {
+        state_id: "s0",
+        surface_items: [{
+          item_id: "chart",
+          label: "Chart",
+          kind: "button",
+          region: "main",
+          fold: 0,
+          group_id: null,
+          status: "explored",
+        }],
+      }),
+    });
+
+    expect(hydrated.lastEventSequence).toBe(4);
+    expect(updated.nodes.s0.surface_items?.[0]).toMatchObject({
+      status: "explored",
+      page_box: { x: 12, y: 24, width: 160, height: 40 },
+    });
+  });
+
   it("deduplicates replayed and out-of-order SSE envelopes", () => {
     const discovered = event(5, "state_discovered", {
       state_id: "s1",

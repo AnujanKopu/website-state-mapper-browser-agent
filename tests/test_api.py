@@ -69,6 +69,20 @@ async def test_health(client: httpx.AsyncClient):
     assert response.json() == {"status": "ok"}
 
 
+async def test_screenshot_artifacts_are_immutable_cached(settings: Settings):
+    screenshot = settings.data_dir / "runs" / "run-1" / "screenshots" / "state.webp"
+    screenshot.parent.mkdir(parents=True)
+    screenshot.write_bytes(b"artifact")
+    app = create_app(settings=settings, run_config=_fast_config())
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            response = await http.get("/artifacts/runs/run-1/screenshots/state.webp")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
 async def test_startup_cancels_runs_that_cannot_be_resumed(settings: Settings):
     engine = create_db_engine(settings.database_url)
     await init_db(engine)
@@ -216,6 +230,7 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
         "interaction_scope",
         "execution_policy",
         "controlled_surface",
+        "page_box",
     ):
         assert live_inventory[field] == persisted_inventory[field]
     edge_events = [e["payload"] for e in events if e["type"] == "edge_discovered"]
@@ -253,6 +268,7 @@ async def test_sse_envelope_and_event_contract(client: httpx.AsyncClient):
                 "component_label",
                 "icon_label",
                 "probe_reason",
+                "page_box",
             ):
                 assert live[field] == terminal_item[field]
 

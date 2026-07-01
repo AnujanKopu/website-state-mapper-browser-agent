@@ -2,7 +2,7 @@ import { artifactUrl } from "../../lib/constants";
 import { stateTypeLabel } from "../../lib/format";
 import type { GraphEdge, GraphState, SurfaceItem, SurfaceStatus } from "../../types/graph";
 import type { ExpandedScreenshot } from "../agent-view/ScreenshotOverlay";
-import { accentFor } from "./nodeStyles";
+import { accentForState } from "./nodeStyles";
 
 interface NodePanelProps {
   state: GraphState | null;
@@ -86,7 +86,7 @@ function groupSurface(items: SurfaceItem[]): [string, SurfaceRow[]][] {
 
 export function NodePanel({ state, parent, states, edges, onClose, onExpandScreenshot }: NodePanelProps) {
   if (!state) return null;
-  const accent = accentFor(state.type);
+  const accent = accentForState(state);
   const screenshot = artifactUrl(state.screenshot);
   const activeFlags = Object.entries(FLAG_LABELS).filter(([key]) => Boolean(state.flags[key]));
   const denied = state.flags.denied_actions ?? [];
@@ -127,9 +127,9 @@ export function NodePanel({ state, parent, states, edges, onClose, onExpandScree
   );
 
   return (
-    <aside className="node-panel">
+    <aside className="node-panel" style={{ "--panel-accent": accent } as React.CSSProperties}>
       <header className="node-panel__header">
-        <span className="badge" style={{ color: accent, borderColor: accent }}>
+        <span className="node-panel__type">
           {stateTypeLabel(state.type)}
         </span>
         <button className="icon-button" onClick={onClose} aria-label="Close panel">

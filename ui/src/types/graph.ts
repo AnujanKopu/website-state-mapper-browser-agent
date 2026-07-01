@@ -55,6 +55,13 @@ export type SurfaceStatus =
   | "skipped_duplicate"
   | "inventory_only";
 
+export interface PageBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface SurfaceItem {
   item_id: string | null;
   label: string;
@@ -98,6 +105,8 @@ export interface SurfaceItem {
   interaction_scope?: "page_navigation" | "local_ui" | "external" | "unknown";
   execution_policy?: "navigate" | "probe_local" | "inventory_only" | "blocked";
   safety_category?: string | null;
+  /** Existing graph-export geometry in full-page screenshot coordinates. */
+  page_box?: PageBox | null;
 }
 
 export interface ExplorationSummary {

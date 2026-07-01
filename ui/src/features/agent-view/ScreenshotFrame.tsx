@@ -15,11 +15,7 @@ export function ScreenshotFrame({ state, onExpand }: ScreenshotFrameProps) {
   return (
     <div className="browser-frame">
       <div className="browser-frame__chrome">
-        <span className="browser-frame__dots" aria-hidden>
-          <i />
-          <i />
-          <i />
-        </span>
+        <span className="browser-frame__label">Captured surface</span>
         <span className="browser-frame__url" title={url}>
           {truncate(url, 70)}
         </span>
@@ -40,7 +36,11 @@ export function ScreenshotFrame({ state, onExpand }: ScreenshotFrameProps) {
       </div>
       <div className="browser-frame__viewport" key={state?.id ?? "empty"}>
         {screenshot ? (
-          <img src={screenshot} alt={state ? `Screenshot of ${state.title}` : "Agent viewport"} />
+          <img
+            src={screenshot}
+            alt={state ? `Screenshot of ${state.title}` : "Agent viewport"}
+            decoding="async"
+          />
         ) : (
           <div className="browser-frame__placeholder">No screenshot captured yet</div>
         )}

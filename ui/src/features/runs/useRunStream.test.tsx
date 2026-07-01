@@ -14,8 +14,12 @@ vi.mock("../../api/client", () => ({
 }));
 
 vi.mock("../../api/eventStream", () => ({
-  openRunStream: (runId: string, handlers: Record<string, (...args: never[]) => void>) => {
-    mocks.openRunStream(runId, handlers);
+  openRunStream: (
+    runId: string,
+    handlers: Record<string, (...args: never[]) => void>,
+    afterSequence: number,
+  ) => {
+    mocks.openRunStream(runId, handlers, afterSequence);
     mocks.handlers.push(handlers);
     return { close: vi.fn() };
   },
@@ -85,6 +89,22 @@ describe("useRunStream foreground reconciliation", () => {
     await waitFor(() => expect(screen.getByTestId("count")).toHaveTextContent("1"));
     expect(mocks.getGraph).toHaveBeenCalledTimes(1);
     expect(mocks.openRunStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts the live stream after the hydrated snapshot watermark", async () => {
+    const current = graph([state("a", 0)]);
+    current.sync = {
+      schema_version: 4,
+      snapshot_sequence: 7,
+      authoritative: false,
+      latest_state_id: "a",
+    };
+    mocks.getGraph.mockResolvedValue(current);
+
+    render(<Probe />);
+    await waitFor(() => expect(mocks.openRunStream).toHaveBeenCalledTimes(1));
+
+    expect(mocks.openRunStream).toHaveBeenCalledWith("run-1", expect.any(Object), 7);
   });
 
   it("hydrates and immediately reattaches a hard-closed live stream", async () => {
